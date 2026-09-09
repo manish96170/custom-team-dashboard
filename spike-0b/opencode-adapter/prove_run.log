@@ -1,0 +1,10 @@
+--- start() ---
+runId: http://127.0.0.1:48228::ses_f9260869fffeVidsAhhdFVcaQS
+approval.request: bash { command: 'echo ADAPTER_PROOF_OK' }
+-> replied "once" from code
+tool.result: bash ADAPTER_PROOF_OK
+
+sawDelta: true
+sawApprovalRequest: true
+sawToolResult: true
+turnEnd: { type: 'turn.end', status: 'completed' }

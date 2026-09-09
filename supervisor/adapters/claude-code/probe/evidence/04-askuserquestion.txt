@@ -1,0 +1,17 @@
++0.0s cwd /path/to/home/ctd-dialog-probe-WSxNto
++0.0s HOST->CLI {"type":"control_request","request_id":"init-1","request":{"subtype":"initialize","supportedDialogKinds":["refusal_fallback_prompt","ask_user_question","plan_approval"]}}
++0.3s EVT system/hook_started
++0.3s EVT system/hook_started
++1.5s HOST->CLI {"type":"user","message":{"role":"user","content":[{"type":"text","text":"Use the AskUserQuestion tool to ask me whether this project should use tabs or spaces. Ask, do not guess."}]}}
++1.6s EVT system/hook_response
++1.7s EVT system/hook_response
++2.1s CLI->HOST control_response success 
++5.4s EVT init, AskUserQuestion present: true
++11.5s EVT tool_use AskUserQuestion {"questions":[{"question":"Should this project use tabs or spaces for indentation?","header":"Indentation","multiSelect":false,"options":[{"label":"Spaces","description":"Indent with space characters. Most common default across JS/TS, Python, and most style guides (Prettier, PEP 8). Width still needs choosing (2 or 4)."},{"label":"Tabs","description":"Indent with tab characters. Lets each reader set their own display width, and is the Go/Make convention as well as the accessibility-friendly choi
++11.5s CLI->HOST control_request can_use_tool
++11.5s    FULL {"type":"control_request","request_id":"0ae3eb70-e566-4126-a0f0-cb5cee22b901","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","display_name":"AskUserQuestion","input":{"questions":[{"question":"Should this project use tabs or spaces for indentation?","header":"Indentation","options":[{"label":"Spaces","description":"Indent with space characters. Most common default across JS/TS, Python, and most style guides (Prettier, PEP 8). Width still needs choosing (2 or 4)."},{"label":"Tabs","description":"Indent with tab characters. Lets each reader set their own display width, and is the Go/Make convention as well as the accessibility-friendly choice."}],"multiSelect":false}]},"tool_use_id":"toolu_bdrk_01XYrLefobrqpaufcJj9UC2M","requires_user_interaction":true}}
++11.5s HOST->CLI {"type":"control_response","response":{"subtype":"success","request_id":"0ae3eb70-e566-4126-a0f0-cb5cee22b901","response":{"behavior":"allow"}}}
++11.5s EVT tool_result [{"type":"tool_result","content":"The user did not answer the questions.","tool_use_id":"toolu_bdrk_01XYrLefobrqpaufcJj9UC2M"}]
++15.2s EVT result success cost=$0.38651375
+
+control_request subtypes seen from the CLI: can_use_tool

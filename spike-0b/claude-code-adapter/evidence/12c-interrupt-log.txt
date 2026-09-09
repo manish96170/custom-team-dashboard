@@ -1,0 +1,4 @@
+Warning: no stdin data received in 3s, proceeding without it. If piping from a slow command, redirect stdin explicitly: < /dev/null to skip, or wait longer.
+
+[harness] t=6001ms Sending SIGINT after seeing 2 lines
+[harness] t=6032ms child exited: code=0 signal=null, total lines=4

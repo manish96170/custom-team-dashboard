@@ -1,0 +1,7 @@
+Tool list diff, same prompt and cwd shape, one flag apart.
+01 = with --permission-prompt-tool stdio, 02 = without.
+
+gained with the stdio host: ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode']
+lost with the stdio host  : []
+
+Both lists are otherwise identical (107 shared entries).

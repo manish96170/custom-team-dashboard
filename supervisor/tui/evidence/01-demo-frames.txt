@@ -1,0 +1,234 @@
+# TUI demo frames (Phase 4), captured headlessly at 118x30 from:
+#   node supervisor/tui/capture-frames.mjs
+# Real supervisor, real event pump, real socket, fake harness. No tokens.
+
+## default: first team (alphabetical), the Requests panel present because two requests are pending
+┌─ TEAMS ────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ [Biome Lint]  Vite Migration                                                                                       │
+├─ REQUESTS (2 pending) ─────────────────────────────────────────────────────────────────────────────────────────────┤
+│ [Accepted] [Declined] [Completed] [Team Requests]                                                                  │
+│  @nj in #your-mr-channel: "@you please review !4821 before standup"                                                │
+│  @asha in #team-planning: "can we pull the lint fix into this sprint?"                                             │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│>○ Fix biome rul…│ kimi (coder) — capture-                                                                          │
+│ └kimi           │ ------------------------                                                                         │
+│                 │  · session.init                                                                                  │
+│                 │  · turn.start                                                                                    │
+│                 │  echo:demo work for w-lint                                                                       │
+│                 │  — turn completed                                                                                │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ [1] rev1  [2] rev2  [p] parent  [r] hide revs  [f] fullscreen  [h/l] team  [d] direct  [/] chat  [q] quit          │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│  CTO:                                                                                                              │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+## after `l`: the Vite team, dev + reviewer split
+┌─ TEAMS ────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  Biome Lint  [Vite Migration]                                                                                      │
+├─ REQUESTS (2 pending) ─────────────────────────────────────────────────────────────────────────────────────────────┤
+│ [Accepted] [Declined] [Completed] [Team Requests]                                                                  │
+│  @nj in #your-mr-channel: "@you please review !4821 before standup"                                                │
+│  @asha in #team-planning: "can we pull the lint fix into this sprint?"                                             │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│>● Invert the Vi…│ purus (coder) — capture-                                                                         │
+│ ├luna           │ -------------------------                                                                        │
+│ ├purus          │  · session.init                                                                                  │
+│ └terra          │  · turn.start                                                                                    │
+│ ◆ Review the in…│  echo:demo work for w-coder                                                                      │
+│ └sol            │  — turn completed                                                                                │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ [1] rev1  [2] rev2  [p] parent  [r] hide revs  [f] fullscreen  [h/l] team  [d] direct  [/] chat  [q] quit          │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│  CTO:                                                                                                              │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+## the task under review: the REVIEW BAR says which of section 13's conditions is short
+┌─ TEAMS ────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  Biome Lint  [Vite Migration]                                                                                      │
+├─ REQUESTS (2 pending) ─────────────────────────────────────────────────────────────────────────────────────────────┤
+│ [Accepted] [Declined] [Completed] [Team Requests]                                                                  │
+│  @nj in #your-mr-channel: "@you please review !4821 before standup"                                                │
+│  @asha in #team-planning: "can we pull the lint fix into this sprint?"                                             │
+├─ REVIEW round 2 — blocked ─────────────────────────────────────────────────────────────────────────────────────────┤
+│ corr ok  ·  secu 1chg  ·  test -  ·  quorum 1/2  ·  1 finding(s)                                                   │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ ● Invert the Vi…│ sol (reviewer)                                                                                   │
+│ ├luna           │ ---------------                                                                                  │
+│ ├purus          │                                                                                                  │
+│ └terra          │  nothing has happened on this run yet                                                            │
+│>◆ Review the in…│                                                                                                  │
+│ └sol            │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ [1] rev1  [2] rev2  [p] parent  [r] hide revs  [f] fullscreen  [h/l] team  [d] direct  [/] chat  [q] quit          │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│  CTO:                                                                                                              │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+## click on the Requests panel at row 4 (hit: {"kind":"requests","requestId":"req-1"}) — focused, and the status line says how to hide it
+┌─ TEAMS ────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  Biome Lint  [Vite Migration]                                                                                      │
+├─ REQUESTS (2 pending) ─────────────────────────────────────────────────────────────────────────────────────────────┤
+│ [Accepted] [Declined] [Completed] [Team Requests]                                                                  │
+│> @nj in #your-mr-channel: "@you please review !4821 before standup"                                                │
+│  @asha in #team-planning: "can we pull the lint fix into this sprint?"                                             │
+├─ REVIEW round 2 — blocked ─────────────────────────────────────────────────────────────────────────────────────────┤
+│ corr ok  ·  secu 1chg  ·  test -  ·  quorum 1/2  ·  1 finding(s)                                                   │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ ● Invert the Vi…│ sol (reviewer)                                                                                   │
+│ ├luna           │ ---------------                                                                                  │
+│ ├purus          │                                                                                                  │
+│ └terra          │  nothing has happened on this run yet                                                            │
+│·◆ Review the in…│                                                                                                  │
+│ └sol            │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+├─ ! requests panel focused — h hides it ────────────────────────────────────────────────────────────────────────────┤
+│ [1] rev1  [2] rev2  [p] parent  [r] hide revs  [f] fullscreen  [h/l] team  [d] direct  [/] chat  [q] quit          │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│  CTO:                                                                                                              │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+## then `h`: the panel is hidden and the pane area grows — the same key that moves teams elsewhere
+┌─ TEAMS ────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  Biome Lint  [Vite Migration]                                                                                      │
+├─ REVIEW round 2 — blocked ─────────────────────────────────────────────────────────────────────────────────────────┤
+│ corr ok  ·  secu 1chg  ·  test -  ·  quorum 1/2  ·  1 finding(s)                                                   │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ ● Invert the Vi…│ sol (reviewer)                                                                                   │
+│ ├luna           │ ---------------                                                                                  │
+│ ├purus          │                                                                                                  │
+│ └terra          │  nothing has happened on this run yet                                                            │
+│>◆ Review the in…│                                                                                                  │
+│ └sol            │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+├─ ! requests panel hidden — it returns when a new request lands ────────────────────────────────────────────────────┤
+│ [1] rev1  [2] rev2  [p] parent  [r] hide revs  [f] fullscreen  [h/l] team  [d] direct  [/] chat  [q] quit          │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│  CTO:                                                                                                              │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+## `r`: all reviewer panes hidden, dev pane auto-expands (FLOWS section 5: no dead space)
+┌─ TEAMS ────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  Biome Lint  [Vite Migration]                                                                                      │
+├─ REVIEW round 2 — blocked ─────────────────────────────────────────────────────────────────────────────────────────┤
+│ corr ok  ·  secu 1chg  ·  test -  ·  quorum 1/2  ·  1 finding(s)                                                   │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ ● Invert the Vi…│ sol (reviewer)                                                                                   │
+│ ├luna           │ ---------------                                                                                  │
+│ ├purus          │                                                                                                  │
+│ └terra          │  nothing has happened on this run yet                                                            │
+│>◆ Review the in…│                                                                                                  │
+│ └sol            │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+├─ ! requests panel hidden — it returns when a new request lands ────────────────────────────────────────────────────┤
+│ [1] rev1  [2] rev2  [p] parent  [r] show revs  [f] fullscreen  [h/l] team  [d] direct  [/] chat  [q] quit          │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│  CTO:                                                                                                              │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+## `/` then typing: letters are TEXT in the chat bar, not commands
+┌─ TEAMS ────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  Biome Lint  [Vite Migration]                                                                                      │
+├─ REVIEW round 2 — blocked ─────────────────────────────────────────────────────────────────────────────────────────┤
+│ corr ok  ·  secu 1chg  ·  test -  ·  quorum 1/2  ·  1 finding(s)                                                   │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ ● Invert the Vi…│ sol (reviewer)                                                                                   │
+│ ├luna           │ ---------------                                                                                  │
+│ ├purus          │                                                                                                  │
+│ └terra          │  nothing has happened on this run yet                                                            │
+│·◆ Review the in…│                                                                                                  │
+│ └sol            │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+│                 │                                                                                                  │
+├─ ! requests panel hidden — it returns when a new request lands ────────────────────────────────────────────────────┤
+│ [1] rev1  [2] rev2  [p] parent  [r] show revs  [f] fullscreen  [h/l] team  [d] direct  [/] chat  [q] quit          │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│> CTO: hello_                                                                                                       │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+## accumulated transcript state (replay cursors)
+  capture-run-1: cursor=6 lines=4 provisional=null
+  capture-run-2: cursor=13 lines=4 provisional=null
+  capture-run-3: cursor=20 lines=4 provisional=null
+  capture-run-4: cursor=27 lines=4 provisional=null
+

@@ -1,0 +1,24 @@
+--- start() ---
+runId = db987807-84e3-4073-bfde-62e7f34409cf
+--- observe() until first turn.end ---
+..
+[turn.end] result="OK" terminalReason=completed isError=false
+--- sendInput() (same runId, same resident process) ---
+...
+[turn.end] result="KIWI" terminalReason=completed isError=false
+--- interrupt() mid-turn ---
+
+[turn.end] result=undefined terminalReason=aborted_streaming isError=true
+--- clearContext() ---
+clearContext ack: {
+  ack: true,
+  runId: 'db987807-84e3-4073-bfde-62e7f34409cf',
+  previousClaudeSessionId: '7bc39219-ca22-45e4-a2bf-f1bbfab5e3a0',
+  note: 'A new internal Claude session_id will be issued on the next init event; runId/process identity is preserved but conversation history is not.'
+}
+
+[turn.end] result="" terminalReason=undefined isError=false
+....
+[turn.end] result="I DO NOT KNOW." terminalReason=completed isError=false
+--- stop() ---
+done

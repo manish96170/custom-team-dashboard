@@ -1,0 +1,23 @@
+# What a Node server can learn about a Unix-socket peer (2026-09-09)
+#   node adapters/claude-code/probe/peercred-probe.mjs
+#
+# Run before designing PLAN.md section 14.5's `callerIdentity`, which asks for "a socket peer credential".
+# CONCLUSION: there is no such thing available from pure Node.
+
+socket own props: connecting, allowHalfOpen, server
+remoteAddress=undefined remotePort=undefined
+remoteFamily=undefined
+handle proto methods: bind, listen, connect, open, fchmod
+any peer-cred-looking API: NONE
+state dir mode: 0700
+
+# So a principal cannot be derived from the connection itself. What IS available:
+#   1. FILESYSTEM PERMISSIONS — the state dir is 0700 and the socket lives in it, so only the local user can
+#      connect at all. That authenticates the USER, and nothing finer.
+#   2. A TOKEN the supervisor mints — the supervisor spawns every worker, so it can hand each one a
+#      per-principal secret at spawn time (the same channel `CTD_ADOPT_WORKER_ID` already uses), and the TUI
+#      reads its own from a 0600 file only the owner can read.
+#
+# Neither is a peer credential. Both together are what an authenticated principal can honestly be built from
+# here, and the difference is worth stating: a token in an environment variable is visible to that process's
+# descendants, so a principal identifies a RUN and everything it spawns, not a single process.

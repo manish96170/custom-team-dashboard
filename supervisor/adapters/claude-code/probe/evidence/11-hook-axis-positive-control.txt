@@ -1,0 +1,9 @@
+inherit  hooks=2 mcp=6 tools=110 names=["SessionStart:startup"]
+project  hooks=0 mcp=0 tools=24 names=[]
+none     hooks=0 mcp=0 tools=24 names=[]
+
+# Positive control for the crash slice's "0 hooks fired" assertion (updated 2026-09-08).
+# 'inherit' loads the developer's global config, so hook events MUST appear; 'project' and 'none'
+# must show none. Without the 'inherit' row, hooks=0 is indistinguishable from 'the adapter never
+# maps hook events at all', and the assertion would be vacuous.
+# 'none' is the DEFAULT since 2026-09-08: repo config executes repo hooks, so it is opt-in.

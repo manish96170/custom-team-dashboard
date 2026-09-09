@@ -1,0 +1,108 @@
+### run A: empty scratch dir
+measuring baseline ... ok
+measuring setting-sources-empty ... ok
+measuring sources-project+strict ... ok
+measuring strict-mcp-only ... ok
+measuring sources-empty+strict ... ok
+measuring safe-mode ... ok
+measuring safe-mode+strict ... ok
+measuring bare ... ok
+measuring bare+strict ... ok
+measuring restricted+strict ... ok
+
+claude 2.1.263 (Claude Code)
+cwd /path/to/home/ctd-env-probe-UXZ2Zo (fresh empty dir -- anything a row shows came from global config)
+
+configuration          starts  hooks  mcp   tools  slash  agents 
+------------------------------------------------------------------
+baseline               yes     2      6     110    97     5      
+setting-sources-empty  yes     0      0     24     41     5      
+sources-project+strict yes     0      0     24     41     5      
+strict-mcp-only        yes     2      0     24     95     5      
+sources-empty+strict   yes     0      0     24     41     5      
+safe-mode              yes     0      0     24     41     4      
+safe-mode+strict       yes     0      0     24     41     4      
+bare                   yes     0      0     3      41     5      
+bare+strict            yes     0      0     3      41     5      
+restricted+strict      yes     0      0     22     41     5      
+
+baseline: argv=[(none)]
+  mcp: plugin:claude-mem:mcp-search:connected, gitnexus:connected, project-manager:needs-auth, agentmemory:connected, aws-mcp:pending, atlassian:connected
+  hooks: SessionStart:startup
+setting-sources-empty: argv=[--setting-sources ]
+  mcp: (none)
+sources-project+strict: argv=[--setting-sources project --strict-mcp-config]
+  mcp: (none)
+strict-mcp-only: argv=[--strict-mcp-config]
+  mcp: (none)
+  hooks: SessionStart:startup
+sources-empty+strict: argv=[--setting-sources  --strict-mcp-config]
+  mcp: (none)
+safe-mode: argv=[--safe-mode]
+  mcp: (none)
+safe-mode+strict: argv=[--safe-mode --strict-mcp-config]
+  mcp: (none)
+bare: argv=[--bare]
+  mcp: (none)
+bare+strict: argv=[--bare --strict-mcp-config]
+  mcp: (none)
+restricted+strict: argv=[--restricted --strict-mcp-config]
+  mcp: (none)
+
+leftover processes from this probe (self + descendants): 0 (expect 0)
+
+### run B: CTD_PROBE_CWD=a dir with a project .claude/settings.json
+measuring baseline ... ok
+measuring setting-sources-empty ... ok
+measuring sources-project+strict ... ok
+measuring strict-mcp-only ... ok
+measuring sources-empty+strict ... ok
+measuring safe-mode ... ok
+measuring safe-mode+strict ... ok
+measuring bare ... ok
+measuring bare+strict ... ok
+measuring restricted+strict ... ok
+
+claude 2.1.263 (Claude Code)
+cwd /path/to/home/ctd-evid-proj (CTD_PROBE_CWD -- whatever project/local config lives here is IN PLAY)
+
+configuration          starts  hooks  mcp   tools  slash  agents 
+------------------------------------------------------------------
+baseline               yes     3      6     110    97     5      
+setting-sources-empty  yes     0      0     24     41     5      
+sources-project+strict yes     1      0     24     41     5      
+strict-mcp-only        yes     3      0     24     95     5      
+sources-empty+strict   yes     0      0     24     41     5      
+safe-mode              yes     0      0     24     41     4      
+safe-mode+strict       yes     0      0     24     41     4      
+bare                   yes     0      0     3      41     5      
+bare+strict            yes     0      0     3      41     5      
+restricted+strict      yes     0      0     22     41     5      
+
+baseline: argv=[(none)]
+  mcp: plugin:claude-mem:mcp-search:connected, gitnexus:connected, project-manager:needs-auth, agentmemory:connected, aws-mcp:pending, atlassian:connected
+  hooks: SessionStart:startup
+setting-sources-empty: argv=[--setting-sources ]
+  mcp: (none)
+sources-project+strict: argv=[--setting-sources project --strict-mcp-config]
+  mcp: (none)
+  hooks: SessionStart:startup
+strict-mcp-only: argv=[--strict-mcp-config]
+  mcp: (none)
+  hooks: SessionStart:startup
+sources-empty+strict: argv=[--setting-sources  --strict-mcp-config]
+  mcp: (none)
+safe-mode: argv=[--safe-mode]
+  mcp: (none)
+safe-mode+strict: argv=[--safe-mode --strict-mcp-config]
+  mcp: (none)
+bare: argv=[--bare]
+  mcp: (none)
+bare+strict: argv=[--bare --strict-mcp-config]
+  mcp: (none)
+restricted+strict: argv=[--restricted --strict-mcp-config]
+  mcp: (none)
+
+leftover processes from this probe (self + descendants): 0 (expect 0)
+  (descendant scan SKIPPED: CTD_PROBE_CWD is a real repo, so matching on it would
+   catch unrelated processes working in that directory rather than only ours)

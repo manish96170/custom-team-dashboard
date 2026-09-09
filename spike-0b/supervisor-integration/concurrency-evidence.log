@@ -1,0 +1,77 @@
+2026-09-04T19:06:00.353Z [SUP] ensureSupervisorRunning -> {"spawned":true,"pid":58261}
+2026-09-04T19:06:00.355Z [SUP] supervisor pid=58261
+2026-09-04T19:06:00.375Z [CC] start -> runId=254541b3-dbe4-456c-adbf-eb89d69790fd
+2026-09-04T19:06:01.845Z [OC] start -> runId=http://127.0.0.1:49999::ses_f922fb737ffe175Pwo3IUEzEOo
+2026-09-04T19:06:08.508Z [CC] session.init {"type":"session.init","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","claudeSessionId":"9ac63960-f408-4dfc-a0ff-d38328b445c4"}
+2026-09-04T19:06:11.392Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"I"}
+2026-09-04T19:06:11.861Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"'ll list"}
+2026-09-04T19:06:11.862Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":" the direct"}
+2026-09-04T19:06:11.862Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"ory first."}
+2026-09-04T19:06:11.881Z [CC] tool.start {"type":"tool.start","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","toolName":"Bash","toolUseId":"toolu_bdrk_01XJiLYwrcFPC66aR2df2hoy"}
+2026-09-04T19:06:15.401Z [OC] assistant.delta {"type":"assistant.delta","text":"","partID":"prt_06dd07de0001kWtBv37K9bBE7f","messageID":"msg_06dd05013001BOtaKRckUGSy2D"}
+2026-09-04T19:06:15.401Z [OC] tool.start {"type":"tool.start","tool":"bash","callID":"tooluse_p5rtICJUJZKr7Aj4ua2whg","input":{}}
+2026-09-04T19:06:15.620Z [OC] tool.start {"type":"tool.start","tool":"bash","callID":"tooluse_p5rtICJUJZKr7Aj4ua2whg","input":{"command":"ls -la"}}
+2026-09-04T19:06:15.645Z [OC] approval.request {"type":"approval.request","approvalID":"per_06dd07edc001sSUjLnYCoPZqhO","permission":"bash","patterns":["ls -la"],"metadata":{"command":"ls -la"},"tool":{"messageID":"msg_06dd05013001BOtaKRckUGSy2D",
+2026-09-04T19:06:15.654Z [OC] answered approval per_06dd07edc001sSUjLnYCoPZqhO -> once
+2026-09-04T19:06:15.657Z [OC] tool.start {"type":"tool.start","tool":"bash","callID":"tooluse_p5rtICJUJZKr7Aj4ua2whg","input":{"command":"ls -la"}}
+2026-09-04T19:06:15.680Z [OC] tool.start {"type":"tool.start","tool":"bash","callID":"tooluse_p5rtICJUJZKr7Aj4ua2whg","input":{"command":"ls -la"}}
+2026-09-04T19:06:15.707Z [OC] tool.result {"type":"tool.result","tool":"bash","callID":"tooluse_p5rtICJUJZKr7Aj4ua2whg","output":"total 24\ndrwxr-xr-x@ 5 user  staff  160  5 Sep 00:24 .\ndrwxr-xr-x@ 8 user  staff  256  5 Sep
+2026-09-04T19:06:15.791Z [OC] usage {"type":"usage","tokensIn":2,"tokensOut":63,"cachedTokens":0,"cacheWriteTokens":96377,"costUsd":0.2415765}
+2026-09-04T19:06:17.450Z [CC] tool.result {"type":"tool.result","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","toolUseId":"toolu_bdrk_01XJiLYwrcFPC66aR2df2hoy","isError":false,"content":"       alpha.txt \n       beta.txt \n       gamma.t
+2026-09-04T19:06:18.683Z [OC] tool.start {"type":"tool.start","tool":"read","callID":"tooluse_T7qqXgk4185bwufqKzPON8","input":{}}
+2026-09-04T19:06:19.427Z [CC] tool.start {"type":"tool.start","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","toolName":"Read","toolUseId":"toolu_bdrk_01BrfPHR6agzsjGW8Nzwx15R"}
+2026-09-04T19:06:19.836Z [OC] tool.start {"type":"tool.start","tool":"read","callID":"tooluse_T7qqXgk4185bwufqKzPON8","input":{"filePath":"/path/to/custom-team-dashboard/spike-0b/supervisor-integration/testdir/alpha.tx
+2026-09-04T19:06:19.836Z [OC] tool.start {"type":"tool.start","tool":"read","callID":"tooluse_m0RSExo5476tsSeXKHXoxY","input":{}}
+2026-09-04T19:06:19.848Z [OC] tool.result {"type":"tool.result","tool":"read","callID":"tooluse_T7qqXgk4185bwufqKzPON8","output":"<path>/path/to/custom-team-dashboard/spike-0b/supervisor-integration/testdir/alpha.txt</p
+2026-09-04T19:06:20.198Z [OC] tool.start {"type":"tool.start","tool":"read","callID":"tooluse_m0RSExo5476tsSeXKHXoxY","input":{"filePath":"/path/to/custom-team-dashboard/spike-0b/supervisor-integration/testdir/beta.txt
+2026-09-04T19:06:20.198Z [OC] tool.start {"type":"tool.start","tool":"read","callID":"tooluse_YfuGW2knxRw1E97pZVkysq","input":{}}
+2026-09-04T19:06:20.203Z [OC] tool.result {"type":"tool.result","tool":"read","callID":"tooluse_m0RSExo5476tsSeXKHXoxY","output":"<path>/path/to/custom-team-dashboard/spike-0b/supervisor-integration/testdir/beta.txt</pa
+2026-09-04T19:06:20.424Z [CC] tool.start {"type":"tool.start","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","toolName":"Read","toolUseId":"toolu_bdrk_01GvQQdWqJcDs4g4DxWHpp6i"}
+2026-09-04T19:06:20.444Z [CC] tool.result {"type":"tool.result","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","toolUseId":"toolu_bdrk_01BrfPHR6agzsjGW8Nzwx15R","isError":false,"content":"1\talpha file for concurrency test\n2\t"}
+2026-09-04T19:06:20.604Z [OC] tool.start {"type":"tool.start","tool":"read","callID":"tooluse_YfuGW2knxRw1E97pZVkysq","input":{"filePath":"/path/to/custom-team-dashboard/spike-0b/supervisor-integration/testdir/gamma.tx
+2026-09-04T19:06:20.617Z [OC] tool.result {"type":"tool.result","tool":"read","callID":"tooluse_YfuGW2knxRw1E97pZVkysq","output":"<path>/path/to/custom-team-dashboard/spike-0b/supervisor-integration/testdir/gamma.txt</p
+2026-09-04T19:06:20.716Z [OC] usage {"type":"usage","tokensIn":2,"tokensOut":287,"cachedTokens":96377,"cacheWriteTokens":284,"costUsd":0.0228594}
+2026-09-04T19:06:20.875Z [CC] tool.start {"type":"tool.start","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","toolName":"Read","toolUseId":"toolu_bdrk_01MEUm5u4SQgNjfEed6b87Gz"}
+2026-09-04T19:06:20.882Z [CC] tool.result {"type":"tool.result","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","toolUseId":"toolu_bdrk_01GvQQdWqJcDs4g4DxWHpp6i","isError":false,"content":"1\tbeta file for concurrency test\n2\t"}
+2026-09-04T19:06:21.521Z [CC] tool.result {"type":"tool.result","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","toolUseId":"toolu_bdrk_01MEUm5u4SQgNjfEed6b87Gz","isError":false,"content":"1\tgamma file for concurrency test\n2\t"}
+2026-09-04T19:06:23.180Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"al"}
+2026-09-04T19:06:23.513Z [OC] assistant.delta {"type":"assistant.delta","text":"al","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:23.658Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"pha.txt"}
+2026-09-04T19:06:23.658Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"\nbeta.txt\ngam"}
+2026-09-04T19:06:23.659Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"ma.txt\n\n- alp"}
+2026-09-04T19:06:23.659Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"ha.txt —"}
+2026-09-04T19:06:23.659Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":" a single line re"}
+2026-09-04T19:06:23.659Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"ading \""}
+2026-09-04T19:06:23.659Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"alpha file for concurr"}
+2026-09-04T19:06:23.659Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"ency test\".\n- beta."}
+2026-09-04T19:06:23.902Z [OC] assistant.delta {"type":"assistant.delta","text":"p","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:23.902Z [OC] assistant.delta {"type":"assistant.delta","text":"ha.txt\nbeta.","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:23.902Z [OC] assistant.delta {"type":"assistant.delta","text":"txt\ngamma.tx","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:23.902Z [OC] assistant.delta {"type":"assistant.delta","text":"t\n\n- alpha.tx","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:23.902Z [OC] assistant.delta {"type":"assistant.delta","text":"t cont","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:23.902Z [OC] assistant.delta {"type":"assistant.delta","text":"ains the single line","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:23.902Z [OC] assistant.delta {"type":"assistant.delta","text":" \"","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:23.902Z [OC] assistant.delta {"type":"assistant.delta","text":"alpha file for concurr","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:24.110Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"txt — a single line reading"}
+2026-09-04T19:06:24.114Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":" \"beta file for concurr"}
+2026-09-04T19:06:24.114Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"ency test\".\n- gamma"}
+2026-09-04T19:06:24.121Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":".txt — a single line re"}
+2026-09-04T19:06:24.121Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"ading \"gamma file for conc"}
+2026-09-04T19:06:24.121Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"urrency test\".\n\nFIN"}
+2026-09-04T19:06:24.121Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"ISHED_C"}
+2026-09-04T19:06:24.121Z [CC] assistant.delta {"type":"assistant.delta","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","text":"C"}
+2026-09-04T19:06:24.210Z [CC] turn.end {"type":"turn.end","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","result":"alpha.txt\nbeta.txt\ngamma.txt\n\n- alpha.txt — a single line reading \"alpha file for concurrency test\".\n- beta.txt — a s
+2026-09-04T19:06:24.231Z [OC] assistant.delta {"type":"assistant.delta","text":"ency test\".\n- beta.","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:24.231Z [OC] assistant.delta {"type":"assistant.delta","text":"txt contains the single line \"","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:24.235Z [OC] assistant.delta {"type":"assistant.delta","text":"beta file for concurrency","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:24.235Z [OC] assistant.delta {"type":"assistant.delta","text":" test\".\n- gamma.","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:24.235Z [OC] assistant.delta {"type":"assistant.delta","text":"txt contains the single line \"","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:24.244Z [OC] assistant.delta {"type":"assistant.delta","text":"gamma file for concurr","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:24.244Z [OC] assistant.delta {"type":"assistant.delta","text":"ency test\".\n\nFINISH","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:24.244Z [OC] assistant.delta {"type":"assistant.delta","text":"ED_OC","partID":"prt_06dd09d97001f58PeQT0iMzY7k","messageID":"msg_06dd092f2001BJ2IORe2uwZKsV"}
+2026-09-04T19:06:24.352Z [OC] usage {"type":"usage","tokensIn":2,"tokensOut":103,"cachedTokens":96661,"cacheWriteTokens":654,"costUsd":0.0220012}
+2026-09-04T19:06:24.437Z [OC] turn.end {"type":"turn.end","status":"completed"}
+2026-09-04T19:06:24.439Z [OC] stream done
+2026-09-04T19:07:04.701Z [CC] process.exit {"type":"process.exit","runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","code":null,"signal":"SIGKILL"}
+2026-09-04T19:07:04.701Z [CC] stream done
+2026-09-04T19:07:04.705Z [SUP] final list: [{"runId":"254541b3-dbe4-456c-adbf-eb89d69790fd","harness":"claude-code","status":"idle","turns":[{"ts":"2026-09-04T19:06:24.210Z","tokensIn":6,"tokensOut":527,"cachedTokens":64019,"cacheCreationTokens":11244}]},{"runId":"http://127.0.0.1:49999::ses_f922fb737ffe175Pwo3IUEzEOo","harness":"opencode","status":"idle","turns":[{"ts":"2026-09-04T19:06:15.790Z","tokensIn":2,"tokensOut":63,"cachedTokens":0,"cacheWriteTokens":96377,"costUsd":0.2415765},{"ts":"2026-09-04T19:06:20.716Z","tokensIn":2,"tokensOut":287,"cachedTokens":96377,"cacheWriteTokens":284,"costUsd":0.0228594},{"ts":"2026-09-04T19:06:24.352Z","tokensIn":2,"tokensOut":103,"cachedTokens":96661,"cacheWriteTokens":654,"costUsd":0.0220012}]}]

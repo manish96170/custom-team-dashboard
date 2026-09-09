@@ -1,0 +1,12 @@
++0.1s CLI session files before: 747
++5.7s verdict: {"reachable":true,"errorClass":"ok","detail":null,"latencyMs":5617,"harnessId":"claude-code","cleanup":{"deleted":true,"events":4,"asks":0,"sightings":0,"sessionDiscarded":null}}
+  PASS 1. a real preflight against `claude` reports reachable
+  PASS 2. it left no rows behind
++6.3s CLI session files after: 747 (unchanged)
+  PASS 3. it left no session in the CLI's own store
+  PASS 4. the verdict survived the deleted session
++11.8s bad-model verdict: {"reachable":false,"errorClass":"harness-error","detail":"turn.end status=error isError=true","latencyMs":5507,"harnessId":"claude-code","cleanup":{"deleted":true,"events":4,"asks":0,"sightings":0,"sessionDiscarded":null}}
+  PASS 5. an unreachable model is recorded as such, and still cleans up
+  PASS 6. nothing is left running
+
+All 6 case(s) passed — a real `claude` preflight leaves no rows and no harness-side session.

@@ -1,0 +1,19 @@
+  sup: [supervisor] rehydrated routing for 0 open run(s) from persisted rows
++0.0s supervisor listening on /path/to/home/ctd-adopt-state-kEILQY/supervisor.sock
+  sup: [supervisor] adopted claude-code session 89fefc75-3aaf-4e71-83d5-fe0d2d01d85b as adopted_a16451f2-8655-4719-851d-c47380f4b81c (pid 76780)
++0.6s adopted: run adopted_a16451f2-8655-4719-851d-c47380f4b81c, session 89fefc75-3aaf-4e71-83d5-fe0d2d01d85b, pid 76780
+  PASS 1. a real `claude` session adopted itself through the hook
++0.7s verified pid 76780 is: claude -p --input-format stream-json --output-format stream-json --verbose --permission-mo
+  PASS 2. the pid the hook reported IS the real claude process
+  sup: [supervisor] rehydrated routing for 1 open run(s) from persisted rows
+  PASS 3. reconciliation leaves the live adopted session alone
++0.7s reap refused; the session is untouched
+  PASS 4. reap refuses to kill it, and the session is still running
++2.7s transcript appeared (11411 bytes): /path/to/home/.claude/projects/-path-to-home-ctd-adopt-work-8hYCvO/89fefc75-3aaf-4e71-83d5-fe0d2d01d85b.jsonl
+  PASS 5. the reported transcript path is where the session's transcript APPEARS
+  sup: [supervisor] rehydrated routing for 1 open run(s) from persisted rows
+  PASS 6. the session ends, and reconciliation closes the row as lost
+  PASS 7. nothing is left running
+
+All 7 case(s) passed — a real `claude` session adopted itself via the hook,
+and the supervisor sees it without owning it or being able to kill it.

@@ -1,0 +1,25 @@
+opencode 1.18.29
+each row: a FRESH EMPTY cwd, so anything shown came from global config
+
+(nothing -- today's behaviour)                             mcp=8  agents_in_config=13  plugins=2  /agent=20  ['agentmemory', 'atlassian', 'aws-mcp', 'chrome-devtools', 'claude-mem', 'datadog', 'orbit-local', 'project-manager']
+OPENCODE_DISABLE_PROJECT_CONFIG=1                          mcp=8  agents_in_config=13  plugins=2  /agent=20  ['agentmemory', 'atlassian', 'aws-mcp', 'chrome-devtools', 'claude-mem', 'datadog', 'orbit-local', 'project-manager']
+OPENCODE_CONFIG={}                                         mcp=8  agents_in_config=13  plugins=2  /agent=20  ['agentmemory', 'atlassian', 'aws-mcp', 'chrome-devtools', 'claude-mem', 'datadog', 'orbit-local', 'project-manager']
+OPENCODE_CONFIG={mcp:{},agent:{},plugin:[]}                mcp=8  agents_in_config=13  plugins=2  /agent=20  ['agentmemory', 'atlassian', 'aws-mcp', 'chrome-devtools', 'claude-mem', 'datadog', 'orbit-local', 'project-manager']
+OPENCODE_CONFIG_CONTENT={}                                 mcp=8  agents_in_config=13  plugins=2  /agent=20  ['agentmemory', 'atlassian', 'aws-mcp', 'chrome-devtools', 'claude-mem', 'datadog', 'orbit-local', 'project-manager']
+OPENCODE_CONFIG_DIR=<empty>                                mcp=8  agents_in_config=13  plugins=2  /agent=20  ['agentmemory', 'atlassian', 'aws-mcp', 'chrome-devtools', 'claude-mem', 'datadog', 'orbit-local', 'project-manager']
+OPENCODE_PURE=1                                            mcp=8  agents_in_config=13  plugins=2  /agent=20  ['agentmemory', 'atlassian', 'aws-mcp', 'chrome-devtools', 'claude-mem', 'datadog', 'orbit-local', 'project-manager']
+DISABLE_DEFAULT_PLUGINS + EXTERNAL_SKILLS                  mcp=8  agents_in_config=13  plugins=2  /agent=20  ['agentmemory', 'atlassian', 'aws-mcp', 'chrome-devtools', 'claude-mem', 'datadog', 'orbit-local', 'project-manager']
+XDG_CONFIG_HOME=<empty>   <-- the only lever               mcp=0  agents_in_config=0   plugins=0  /agent=7   []
+XDG_CONFIG_HOME=<empty>   (re-verify)                      mcp=0  agents_in_config=0   plugins=0  /agent=7   []
+XDG_CONFIG_HOME=<curated: agent+provider, no mcp>          mcp=0  agents_in_config=13  plugins=0  /agent=20  []
+
+REQUIREMENT: luna / sol / terra / opus and the other amazon-bedrock agents must ALWAYS be
+reachable through this adapter (cross-model review, and sometimes coding). An EMPTY config
+dir removes them; the CURATED row above keeps all 13 while still reporting mcp=0. If a pin
+is ever added, it takes the curated shape -- never the empty one.
+
+Auth is NOT under XDG_CONFIG_HOME -- it lives in ~/.local/share/opencode/auth.json
+(XDG_DATA_HOME), so pinning config this way does not break credentials. What it DOES
+remove is the model-agent roster (luna/sol/terra/opus) defined in the global config.
+
+leftover probe servers (expect 0): 0

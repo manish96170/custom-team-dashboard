@@ -1,0 +1,10 @@
+[INIT] session_id: bfa4f682-bd24-4451-b0c8-327fa491814a
+[SYSTEM] status {"type":"system","subtype":"status","status":"requesting","session_id":"bfa4f682-bd24-4451-b0c8-327fa491814a","uuid":"aa7d2c85-7fea-462f-be16-373e07af56c3"}
+[RESULT] OK | session_id: bfa4f682-bd24-4451-b0c8-327fa491814a
+[harness] trying control_request subtype=clear ...
+[CTRL_RESP] {"type":"control_response","response":{"subtype":"error","request_id":"c1","error":"Unsupported control request subtype: clear"}}
+[harness] asking if it remembers MANGO after clear attempt...
+[INIT] session_id: bfa4f682-bd24-4451-b0c8-327fa491814a
+[SYSTEM] status {"type":"system","subtype":"status","status":"requesting","session_id":"bfa4f682-bd24-4451-b0c8-327fa491814a","uuid":"cef5edb1-4420-4d69-9bef-8bf46aa7e2ff"}
+[RESULT] MANGO | session_id: bfa4f682-bd24-4451-b0c8-327fa491814a
+[harness] exited code=0 signal=null

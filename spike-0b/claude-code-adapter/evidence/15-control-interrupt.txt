@@ -1,0 +1,20 @@
+[RAW] {"type":"system","subtype":"init","cwd":"/path/to/custom-team-dashboard/spike-0b/claude-code-adapter/sandbox","session_id":"253c1a77-a75e-4de2-8310-cc228789e7ab","tools":["Bash"
+[RAW] {"type":"system","subtype":"status","status":"requesting","session_id":"253c1a77-a75e-4de2-8310-cc228789e7ab","uuid":"eddee0eb-b081-4a55-b794-d0f85904d0f6"}
+[harness] sending control_request interrupt over stdin...
+[RAW] {"type":"control_response","response":{"subtype":"success","request_id":"req1","response":{"still_queued":[]}}}
+[RAW] {"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null,"session_id":"253c1a77-a75e-4de2-8310-cc228789e7ab","uuid":"e9d2af
+[RAW] {"duration_api_ms":0,"stop_reason":null,"session_id":"253c1a77-a75e-4de2-8310-cc228789e7ab","total_cost_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creation_i
+[harness] sending follow-up message on same stdin...
+[RAW] {"type":"system","subtype":"init","cwd":"/path/to/custom-team-dashboard/spike-0b/claude-code-adapter/sandbox","session_id":"253c1a77-a75e-4de2-8310-cc228789e7ab","tools":["Bash"
+[RAW] {"type":"system","subtype":"status","status":"requesting","session_id":"253c1a77-a75e-4de2-8310-cc228789e7ab","uuid":"992b52cd-5e5e-4eb3-97f8-a144d2141bc6"}
+[RAW] {"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-sonnet-5","id":"msg_bdrk_bcu77karhu32dtlmo7frrpj7d2h2jwabtkc7jkez7vq2q5ef7o7a","type":"message","role":"assistant","co
+[RAW] {"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"253c1a77-a75e-4de2-8310-cc228789e7ab","parent_tool_use_id":null,"uuid":"
+[RAW] {"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"P"}},"session_id":"253c1a77-a75e-4de2-8310-cc228789e7ab","parent_tool_use_id":null,"uuid":"4
+[RAW] {"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ONG"}},"session_id":"253c1a77-a75e-4de2-8310-cc228789e7ab","parent_tool_use_id":null,"uuid":
+[RAW] {"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_bdrk_bcu77karhu32dtlmo7frrpj7d2h2jwabtkc7jkez7vq2q5ef7o7a","type":"message","role":"assistant","content":[{"type":"text","text":"PONG
+[RAW] {"type":"stream_event","event":{"type":"content_block_stop","index":0},"session_id":"253c1a77-a75e-4de2-8310-cc228789e7ab","parent_tool_use_id":null,"uuid":"106431c9-ad7a-4c8f-acaf-7ecea0317597"}
+[RAW] {"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null,"stop_details":null},"usage":{"input_tokens":2,"cache_creation_input_tokens":211,"cache_re
+[RAW] {"type":"stream_event","event":{"type":"message_stop","amazon-bedrock-invocationMetrics":{"inputTokenCount":2,"outputTokenCount":5,"invocationLatency":1708,"firstByteLatency":1663,"cacheReadInputToken
+[RAW] {"duration_api_ms":4253,"stop_reason":"end_turn","session_id":"253c1a77-a75e-4de2-8310-cc228789e7ab","total_cost_usd":0.0018489000000000001,"usage":{"input_tokens":2,"cache_creation_input_tokens":211,
+[harness] closing stdin
+[harness] child exited: code=0 signal=null

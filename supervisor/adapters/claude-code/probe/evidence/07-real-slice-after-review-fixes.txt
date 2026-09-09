@@ -1,0 +1,17 @@
++0.0s preflight ok: 2.1.263 (Claude Code)
+[supervisor] rehydrated routing for 0 open run(s) from persisted rows
++0.0s started run 18cc4d46-ceda-4890-9de8-a72bb94b8e97, verified pgid 36301
+[supervisor] run 18cc4d46-ceda-4890-9de8-a72bb94b8e97 is blocked on WebFetch (ask ask_c24208d8-72e0-4769-9bee-b11bcf8aef6e)
++13.1s ask raised: {"kind":"tool-approval","question":"WebFetch: https://example.com","answerable":true}
++13.1s operator answered WebFetch: allow (delivered=true)
++18.6s model said: "The page title is **\"Example Domain\"**.\n\nThe page itself is a short placeholder: it explains that the domain is reserved for use in documentation and examples without needing prior permission, warns against using it operationally, and links to IANA's"
++18.6s 1/3 allow: the parked tool call ran once approved, and returned a result
+[supervisor] run 18cc4d46-ceda-4890-9de8-a72bb94b8e97 is blocked on WebFetch (ask ask_2ce6e628-e91a-406f-9676-640fde4da8ff)
++22.3s operator answered WebFetch: deny (delivered=true)
++22.4s 2/3 sendInput on the same resident process parked a second, distinct request
++25.7s model said: "The fetch was refused — WebFetch returned \"Not permitted for this worker\" for `https://example.org`, so I couldn't retrieve the title. Per the error's instruction, I didn't try an alternative method.\n\nIf you want that page fetched, the permission for"
++25.7s 3/3 deny: the operator's reason reached the model (2 request(s) answered in total)
++25.8s audit trail: 2 asks, all answered-then-delivered, attributed to the operator
++26.6s teardown: the process group is gone
+
+PASS: real-claude approval slice — allow ran the tool, sendInput, deny carried the reason, audit trail, clean teardown

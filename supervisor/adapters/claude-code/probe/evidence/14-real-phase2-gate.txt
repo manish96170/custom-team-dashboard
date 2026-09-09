@@ -1,0 +1,55 @@
++23.7s preflight: reachable=true in 23634ms
+  PASS 1. preflight says the model is reachable, and leaves no trace
++23.7s worker started: 907f7626-e83b-45b0-b934-532f01b7b615
++34.3s blocked on: tool-approval — WebFetch: https://example.com
+  PASS 2. a worker starts on the task and blocks on a tool it may not use
++34.3s environment: 24 tools, 0 MCP servers, 0 hooks
+  PASS 3. the environment pin held on the real CLI, on both axes
++34.3s handoff: 1105 chars, truncated=false
+  PASS 4. the tier-3 handoff reports the live block as a blocker
++34.3s answered: allow
++37.8s second turn landed on the same process
+  PASS 5. a human answers; the tool runs and a second turn lands
+  PASS 6. the task moves state and the final handoff says nothing is blocked
+  PASS 7. nothing survives, and no preflight or orphan rows are left
+
+  ── the final tier-3 handoff for this task ─────────────────────────────
+  | # Task handoff — Fetch the example.com title
+  | 
+  | _tier 3 (PLAN.md section 8, Rule 4). Generated 2026-09-07T06:09:40.415Z. Read this instead of any transcript._
+  | 
+  | ## Goal
+  | 
+  | **Fetch the example.com title** — a feature, currently `in-review`.
+  | 
+  | ## Decisions
+  | 
+  | - `in-progress` → `in-review` by **gate-coder** at 2026-09-07T06:09:40.414Z
+  | - `created` → `in-progress` by **gate-coder** at 2026-09-07T06:09:26.280Z
+  | - `created` → `created` by **operator** at 2026-09-07T06:09:26.279Z
+  | 
+  | ## Assumptions
+  | 
+  | _None recorded. Nothing in the schema captures an assumption yet; this section is populated once tier-2 per-turn digests exist (Rule 4), which is where a worker's stated assumptions would be extracted from. Left empty rather than inferred — a handoff that invents an assumption is worse than one that admits it has none._
+  | 
+  | ## Artifacts
+  | 
+  | - Workers on this task: **gate-coder** (coder)
+  | - Runs: 1 total, 0 still open
+  | - Recorded activity: 19 tier-1 event(s)
+  | 
+  | ## Blockers
+  | 
+  | _Nothing is blocked._
+  | 
+  | ## Current diff shape
+  | 
+  | ```
+  | no diff information: no worktree recorded for this task
+  | ```
+  | 
+  ──────────────────────────────────────────────────────────────────────
+
+All 7 gate case(s) passed — Phase 2's vertical slice holds together end-to-end
+against the real `claude` CLI. Crash recovery is proven separately by
+real-claude-crash.slice.mjs and is deliberately not re-run here.

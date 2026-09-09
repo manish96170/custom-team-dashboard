@@ -1,0 +1,9 @@
+[SYSTEM] init session_id= 90c1bbe3-bc94-443d-9e94-9a85d1dd2045
+[SYSTEM] status session_id= 90c1bbe3-bc94-443d-9e94-9a85d1dd2045
+[RESULT] OK | session_id: 90c1bbe3-bc94-443d-9e94-9a85d1dd2045
+[SYSTEM] init session_id= 8c4f8e51-f8bb-49ea-9262-98aa1732b2c2
+[RESULT]  | session_id: 8c4f8e51-f8bb-49ea-9262-98aa1732b2c2
+[SYSTEM] init session_id= 8c4f8e51-f8bb-49ea-9262-98aa1732b2c2
+[SYSTEM] status session_id= 8c4f8e51-f8bb-49ea-9262-98aa1732b2c2
+[RESULT] I DO NOT KNOW. | session_id: 8c4f8e51-f8bb-49ea-9262-98aa1732b2c2
+[harness] exited code=0 signal=null

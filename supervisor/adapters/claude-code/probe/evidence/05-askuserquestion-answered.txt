@@ -1,0 +1,18 @@
++0.0s cwd /path/to/home/ctd-dialog-probe-IOd7zH
++0.0s HOST->CLI {"type":"control_request","request_id":"init-1","request":{"subtype":"initialize","supportedDialogKinds":["refusal_fallback_prompt","ask_user_question","plan_approval"]}}
++0.3s EVT system/hook_started
++0.3s EVT system/hook_started
++1.5s HOST->CLI {"type":"user","message":{"role":"user","content":[{"type":"text","text":"Use the AskUserQuestion tool to ask me whether this project should use tabs or spaces. Ask, do not guess."}]}}
++1.6s EVT system/hook_response
++1.6s EVT system/hook_response
++1.8s CLI->HOST control_response success 
++5.1s EVT init, AskUserQuestion present: true
++12.2s EVT tool_use AskUserQuestion {"questions":[{"question":"Should this project use tabs or spaces for indentation?","header":"Indentation","multiSelect":false,"options":[{"label":"Spaces","description":"Indent with space characters. Most common default across JS/TS, Python, and web tooling (Prettier, Black, EditorConfig defaults).","preview":"function example() {\n    const value = 1;\n    if (value) {\n        return value;\n    }\n}\n// leading whitespace = space characters"},{"label":"Tabs","description":"Indent with tab ch
++12.2s CLI->HOST control_request can_use_tool
++12.2s    FULL {"type":"control_request","request_id":"d4af5257-9da7-4c80-a749-1a3dead3bfda","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","display_name":"AskUserQuestion","input":{"questions":[{"question":"Should this project use tabs or spaces for indentation?","header":"Indentation","options":[{"label":"Spaces","description":"Indent with space characters. Most common default across JS/TS, Python, and web tooling (Prettier, Black, EditorConfig defaults).","preview":"function example() {\n    const value = 1;\n    if (value) {\n        return value;\n    }\n}\n// leading whitespace = space characters"},{"label":"Tabs","description":"Indent with tab characters. Width is reader-configurable, which helps accessibility; the Go standard and common in some C/kernel styles.","preview":"function example() {\n\tconst value = 1;\n\tif (value) {\n\t\treturn value;\n\t}\n}\n// leading whitespace = tab characters"}],"multiSelect":false}]},"tool_use_id":"toolu_bdrk_01LvDWNnvTz9RSye7WJEYDKz","requires_user_interaction":true}}
++12.2s    *** requires_user_interaction — parking 3s, then answering {"Should this project use tabs or spaces for indentation?":"Spaces"}
++15.2s HOST->CLI {"type":"control_response","response":{"subtype":"success","request_id":"d4af5257-9da7-4c80-a749-1a3dead3bfda","response":{"behavior":"allow","updatedInput":{"questions":[{"question":"Should this project use tabs or spaces for indentation?","header":"Indentation","options":[{"label":"Spaces","description":"Indent with space characters. Most common default across JS/TS, Python, and web tooling (Prettier, Black, EditorConfig defaults).","preview":"function example() {\n    const value = 1;\n    if
++15.2s EVT tool_result [{"type":"tool_result","content":"Your questions have been answered: \"Should this project use tabs or spaces for indentation?\"=\"Spaces\". You can now continue with these answers in mind.","tool_use_id":"toolu_bdrk_01LvDWNnvTz9RSye7WJEYDKz"}]
++20.3s EVT result success cost=$0.25658525
+
+control_request subtypes seen from the CLI: can_use_tool

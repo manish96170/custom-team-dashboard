@@ -1,0 +1,40 @@
+
+=== claude-code ===
+conformance: claude-code -> ACTIVE
+  declared:
+    residentProcess: "per-run"
+    resumableTurns: true
+    structuredOutput: "stream-json"
+    interrupt: "turn"
+    clearContext: "erase"
+    approvalProtocol: "host"
+    modelDiscovery: false
+  checks:
+    [ok  ] matrix:declared — a complete, well-formed capability matrix
+    [ok  ] matrix:methods — every method the declaration requires exists
+    [ok  ] start — returned runId 53ddf442-a58e-4c42-9c63-af9f55e5ff4c
+    [ok  ] stream — observe() yielded worker.env
+    [ok  ] exit-detection — a terminal event arrived (turn.end or process.exit)
+    [ok  ] interrupt — interrupt ended the turn and the run is still usable
+    [ok  ] clear — clearContext acknowledged; declared semantics: erase
+
+=== opencode ===
+conformance: opencode -> ACTIVE
+  declared:
+    residentProcess: "pooled"
+    resumableTurns: true
+    structuredOutput: "sse"
+    interrupt: "turn"
+    clearContext: "compact"
+    approvalProtocol: "observe-only"
+    modelDiscovery: false
+  checks:
+    [ok  ] matrix:declared — a complete, well-formed capability matrix
+    [ok  ] matrix:methods — every method the declaration requires exists
+    [ok  ] start — returned runId http://127.0.0.1:42701::ses_f839615dcffeGndTdm455qQSfy
+    [ok  ] stream — observe() yielded worker.env
+    [ok  ] exit-detection — a terminal event arrived (turn.end or process.exit)
+    [ok  ] interrupt — interrupt ended the turn and the run is still usable
+    [ok  ] clear — clearContext acknowledged; declared semantics: compact
+
+every harness checked reached the active tier.

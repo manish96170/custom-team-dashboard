@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# macOS
+.DS_Store
+
+# Independent-model review transcripts and prompts. Excluded from the public repo
+# deliberately: they quote internal repo names and workflow detail that is not this
+# project's to publish. The FINDINGS records keep every conclusion they produced.
+review-*/
+arch-reviews-now-not-needed/
+consolidated-review-*.md
+
+# Runtime state never belongs in the repo — it lives in the state dir (0700) — but this
+# is here so a stray copy cannot be committed by accident.
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+owner.token
+*.token
+.env
+.env.*
+!.env.example
+
+# Local scratch
+*.tar.gz
+.obsidian/

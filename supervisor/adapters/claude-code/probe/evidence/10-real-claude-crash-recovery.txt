@@ -1,0 +1,18 @@
++0.0s starting a real supervisor with a real `claude` worker, in its own OS process
++9.8s worker parked: run=d8eb7e1b-62cb-40da-b77d-bbf6465c32b7 pid=71689 pgid=71689 ask=ask_f1ba5f6b-3622-4f8d-9c85-337e4192b90d (tool-approval)
++10.4s SIGKILL the supervisor — no finally, no closeDb, no adapter disposal, no lock release
+  PASS 1. the real worker parked a request, and the crash left an un-checkpointed WAL
+  PASS 2. the real `claude` process survived its supervisor's SIGKILL
++10.5s reconciliation: {"examined":1,"lost":[],"orphaned":["d8eb7e1b-62cb-40da-b77d-bbf6465c32b7"],"stillOrphaned":[],"alive":[],"details":[{"runId":"d8eb7e1b-62cb-40da-b77d-bbf6465c32b7","outcome":"orphaned-unmanaged","reason":"process verified alive (pid + pgid + start time all match) but no adapter handle is bound to it","pid":71689,"observed":{"alive":true,"pid":71689,"pgid":71689,"lstart":"Mon Sep  7 05:32:43 2026"}}]}
+  PASS 3. a fresh supervisor classifies it `orphaned-unmanaged` and leaves the row OPEN
+  PASS 4. the parked ask is closed as unanswerable-by-anyone, not as an answer
++10.5s hook axis: 0 hooks fired (developer global config defines 2)
++10.5s real session loaded: 24 tools, 41 commands, 0 MCP servers
+  PASS 5. the environment pin held on the real CLI
++12.6s reap: {"runId":"d8eb7e1b-62cb-40da-b77d-bbf6465c32b7","harnessId":"claude-code","reaped":true,"pgid":71689,"escalated":true,"runClosed":true,"alreadyClosed":false,"collateralRisk":[],"hadHandle":false}
+  PASS 6. reaping the orphan kills the real CLI and closes the row as `reaped`
++12.6s second reconciliation: {"examined":0,"lost":[],"orphaned":[],"stillOrphaned":[],"alive":[],"details":[]}
++13.1s teardown: disposeAll stopped 0 run(s), 0 survivors
+  PASS 7. a second reconciliation is a no-op, and nothing survives
+
+All 7 case(s) passed — supervisor crash, restart and recovery work against the real `claude` CLI.

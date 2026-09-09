@@ -1,0 +1,5 @@
+[RESULT] OK | terminal_reason: completed
+[harness] sending second message on same process/stdin...
+[RESULT] BANANA | terminal_reason: completed
+[harness] closing stdin
+[harness] child exited: code=0 signal=null
