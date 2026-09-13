@@ -99,6 +99,7 @@ export function capabilities() {
     clearContext: false,
     approvalProtocol: false,
     modelDiscovery: false,
+    mcpConfigDelivery: false,
   };
 }
 

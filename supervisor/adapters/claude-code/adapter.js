@@ -157,6 +157,15 @@ export function capabilities() {
     // discover them. Declaring `true` for a capability the supervisor cannot reach would be exactly
     // the unverifiable claim section 9 exists to prevent.
     modelDiscovery: false,
+    // MEASURED directly against the installed `claude` CLI (`claude mcp add --help` / `claude mcp
+    // add-json --help`, 2026-09-14, review-sol-2026-09-13.md finding 13): `--mcp-config` accepts either
+    // a real JSON file path OR a literal JSON string, each describing one of exactly three transport
+    // types (stdio, sse, http). `'file-or-json-string'` names which of those two forms this adapter's
+    // own `settingSourcesArgv()` actually uses (a bare argv value per `spec.mcpConfig` entry, no
+    // additional escaping) — `runtime/supervisor.js`'s `start()` checks this before ever building an
+    // mcpConfig entry for a utility-task role's pooled MCP server, rather than assuming every harness can
+    // honour one (the opencode adapter cannot — see its own capabilities()).
+    mcpConfigDelivery: 'file-or-json-string',
   };
 }
 

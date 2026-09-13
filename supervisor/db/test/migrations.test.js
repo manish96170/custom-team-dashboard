@@ -29,6 +29,9 @@ const EXPECTED_TABLES = [
   // migration 0011: resource leases (PLAN.md section 20) and MCP server pooling (section 21).
   "resource_leases",
   "mcp_pool",
+  // review-sol-2026-09-13.md finding 47: migration 0013 added a whole new TABLE this list never
+  // named — the per-attachment refcount table `mcp_pool.status`/`.pgid` alone can't derive from.
+  "mcp_pool_attachments",
 ];
 
 await runTest("migrations", async () => {

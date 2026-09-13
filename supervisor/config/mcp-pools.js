@@ -7,24 +7,26 @@
 // THE ONE BUILT-IN ENTRY, AND THE HONEST LIMIT ON WHAT ITS CONFIG PATH CAN ACTUALLY DO
 //
 // `leo-mcp` (`../leo-mcp/`, a sibling repo, PLAN.md §16.1) is the first real pooled config: spawned via
-// `node mcp/server.js` at a path resolved relative to THIS repo (overridable via `LEO_MCP_PATH` for an
-// install where the sibling isn't at the default location). If that directory doesn't exist, `attach()`
-// will fail loudly when actually invoked — this file does not verify the path exists, the same
-// "declare, don't validate on load" contract `resources.js` already keeps.
+// `node mcp/server-socket.js` (the Unix-socket transport, not the stdio one — see below) at a path
+// resolved relative to THIS repo (overridable via `LEO_MCP_PATH` for an install where the sibling isn't
+// at the default location). If that directory doesn't exist, `attach()` will fail loudly when actually
+// invoked — this file does not verify the path exists, the same "declare, don't validate on load"
+// contract `resources.js` already keeps.
 //
-// CORRECTED 2026-09-11 (`codexdoc/review-luna-2026-09-11.md` finding 2) — an earlier version of this
-// comment described a `configPathFor(name)` that a role's `spec.mcpConfig` would point at. That
-// function was never actually built, and `runtime/supervisor.js` no longer sets `spec.mcpConfig` for a
-// utility-task role at all, on purpose: `adapters/claude-code/adapter.js`'s own `StartSpec` typedef
-// declares `mcpConfig` as `string | string[]` — a config FILE PATH the adapter spawns — and no path
-// naming leo-mcp's pooled process would actually connect a worker's OWN MCP client to that SAME
-// process rather than spawning a second copy. leo-mcp DOES now have a non-stdio transport
-// (`mcp/server-socket.js`, a Unix socket, added the same day as this correction) — but that alone
-// doesn't answer whether Claude Code's `--mcp-config` accepts anything other than a stdio-command or an
-// SSE/HTTP url entry, and nothing in this repo has measured that. Until it is actually measured, this
-// module's job stays SUPERVISOR-SIDE bookkeeping only (attach/detach, one pool row, N attachments — see
-// `runtime/supervisor.js`'s utility-task start/end path, and `runtime/mcp-pool.js`), not a claim that a
-// spawned worker session shares the pooled process today.
+// CORRECTED 2026-09-14 (review-sol-2026-09-13.md finding 13, real transport delivery built) — an earlier
+// version of this comment (itself correcting a still-earlier, never-built `configPathFor(name)`) left
+// this at "no path naming leo-mcp's pooled process would actually connect a worker's OWN MCP client to
+// that SAME process" because nothing in this repo had measured what `claude --mcp-config` actually
+// accepts. That has now been measured directly against the installed `claude` CLI (`claude mcp add
+// --help` / `claude mcp add-json --help`): exactly three transport types (`stdio`, `sse`, `http`), none
+// of which describe a raw Unix socket. So the fix is not "point `--mcp-config` at the socket" — it is
+// `runtime/mcp-stdio-proxy.js`: a tiny script `--mcp-config` spawns as an ORDINARY stdio server (fully
+// within the one transport type this repo can actually rely on) that does nothing but relay bytes to and
+// from THIS pool's real socket. `runtime/mcp-pool.js`'s `spawnOne` now spawns every registered pool
+// config as a socket-transport server BY CONVENTION (passing `LEO_MCP_SOCKET_PATH` and waiting for the
+// socket file to exist before marking the row ready) — this module's registered configs are assumed to
+// speak that convention, which is true of the one real entry below; a hypothetical future stdio-only
+// pool config is out of scope until one is actually needed.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -42,7 +44,7 @@ function defaultLeoMcpPath() {
 
 export const BUILT_IN_DEFAULTS = Object.freeze({
   pools: Object.freeze({
-    "leo-mcp": Object.freeze({ command: "node", args: Object.freeze(["mcp/server.js"]), cwd: defaultLeoMcpPath() }),
+    "leo-mcp": Object.freeze({ command: "node", args: Object.freeze(["mcp/server-socket.js"]), cwd: defaultLeoMcpPath() }),
   }),
 });
 

@@ -33,6 +33,9 @@ import {
   getPool, listLivePoolRows,
 } from "../db/index.js";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 /**
  * Deterministically stringify a value with every object's keys sorted, AT EVERY NESTING LEVEL — not
@@ -71,15 +74,22 @@ export function createMcpPool({ db, logger = console } = {}) {
 
   /**
    * Attach to (or spawn) the pooled process for `name`+`config`. Returns
-   * `{ attachmentId, poolId, spawned: boolean }` on success, or throws if spawning failed and no
-   * existing process could be joined either.
+   * `{ attachmentId, poolId, spawned: boolean, socketPath: string }` on success, or throws if spawning
+   * failed and no existing process could be joined either.
+   *
+   * `socketPath` (review-sol-2026-09-13.md finding 13) is what makes this attachment actually USABLE by
+   * a worker, not just bookkeeping: every registered pool config is spawned as a socket-transport MCP
+   * server (see `spawnOne` below) precisely so N attachers can share ONE resident process, and the caller
+   * (`runtime/supervisor.js`'s `start()`) points a real, verified `--mcp-config` stdio entry — a tiny
+   * proxy script, `mcp-stdio-proxy.js`, since no MCP client contract this repo has actually checked
+   * supports a raw Unix socket as a transport type — at this exact path.
    */
   async function attach(name, config, { principalId = null, runId = null } = {}) {
     const configHash = hashPoolConfig(config);
 
     // First, try to join something already starting/ready — the common case once a pool is warm.
     const joined = attachToPool(db, { name, configHash, principalId, runId });
-    if (joined.attached) return { attachmentId: joined.attachmentId, poolId: joined.pool.id, spawned: false };
+    if (joined.attached) return { attachmentId: joined.attachmentId, poolId: joined.pool.id, spawned: false, socketPath: joined.pool.socketPath };
 
     // Not joinable (no row, or it's draining/stopped/failed). Claim the slot to spawn — or discover a
     // concurrent caller already claimed it first, in which case wait briefly and retry the join. This
@@ -99,7 +109,7 @@ export function createMcpPool({ db, logger = console } = {}) {
             // this function is the only writer of 'ready', but fail loudly rather than silently swallow.
             throw new Error(`mcp-pool: spawned ${name} but could not attach immediately after: ${retryJoin.reason}`);
           }
-          return { attachmentId: retryJoin.attachmentId, poolId: claim.pool.id, spawned: true };
+          return { attachmentId: retryJoin.attachmentId, poolId: claim.pool.id, spawned: true, socketPath: retryJoin.pool.socketPath };
         } catch (err) {
           // review-sol-2026-09-13.md finding 15: a real, verified process was spawned and marked 'ready'
           // above — if anything AFTER that (the attach insert, a DB error) fails, the process must be
@@ -121,21 +131,60 @@ export function createMcpPool({ db, logger = console } = {}) {
       // Someone else claimed it (or a joinable row appeared between our failed join and now) — check
       // once more before waiting, then retry the whole loop.
       const retry = attachToPool(db, { name, configHash, principalId, runId });
-      if (retry.attached) return { attachmentId: retry.attachmentId, poolId: retry.pool.id, spawned: false };
+      if (retry.attached) return { attachmentId: retry.attachmentId, poolId: retry.pool.id, spawned: false, socketPath: retry.pool.socketPath };
       await new Promise((r) => setTimeout(r, 20));
     }
     throw new Error(`mcp-pool: attach(${name}) timed out waiting for a joinable or spawnable slot`);
   }
 
+  // review-sol-2026-09-13.md finding 13: every registered pool config is spawned as a socket-transport
+  // MCP server (leo-mcp's `mcp/server-socket.js`, the one real config this repo has) — that is the whole
+  // point of pooling: N attachers sharing ONE resident process needs a transport that is not 1:1 stdio.
+  // A short, flat filename (no subdirectory) matters here, not just for tidiness: `os.tmpdir()` can
+  // already be a long path on macOS, and AF_UNIX socket paths have a real, low length limit
+  // (~104 bytes on macOS/BSD) — a nested path would risk `bind: File name too long` on exactly the
+  // platform this project targets.
+  const SOCKET_WAIT_ATTEMPTS = 100;
+  const SOCKET_WAIT_INTERVAL_MS = 50;
+
+  function socketPathFor(poolId) {
+    return path.join(os.tmpdir(), `${poolId}.sock`);
+  }
+
   async function spawnOne(poolId, config) {
     const { command, args = [], env = {}, cwd } = config;
-    const spawned = spawnManaged({ command, args, cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+    const socketPath = socketPathFor(poolId);
+    // Best-effort: a stale socket file from a process this same poolId never actually reused (pool rows
+    // are per (name, configHash) forever, so a resurrection reuses the same id) would make the new
+    // server's own `listen()` fail with EADDRINUSE. leo-mcp's `server-socket.js` already removes a stale
+    // file itself before listening — this is only a defensive belt-and-braces remove for a config that
+    // might not.
+    try { fs.rmSync(socketPath, { force: true }); } catch { /* best effort */ }
+    const spawned = spawnManaged({
+      command, args, cwd, env: { ...env, LEO_MCP_SOCKET_PATH: socketPath }, stdio: ["pipe", "pipe", "pipe"],
+    });
     const identity = await spawned.identity;
     if (!identity.verified) {
       try { spawned.child.kill("SIGKILL"); } catch { /* already gone */ }
       throw new Error(`mcp-pool: spawn of ${command} for pool ${poolId} could not be verified: ${identity.reason}`);
     }
-    const ready = markPoolReady(db, poolId, { pid: identity.pid, pgid: identity.pgid, lstart: identity.lstart, socketPath: null });
+
+    // Verify the socket is ACTUALLY listening before ever telling a caller it can connect to it — same
+    // "verify against the real OS, don't trust a fixed delay" discipline this codebase applies to git
+    // worktree claims and process identity elsewhere. A crashed/misbehaving server that never binds is a
+    // genuine, distinguishable failure, not something to guess past.
+    let socketReady = false;
+    for (let attempt = 0; attempt < SOCKET_WAIT_ATTEMPTS; attempt += 1) {
+      if (fs.existsSync(socketPath)) { socketReady = true; break; }
+      if (spawned.child.exitCode !== null) break; // the process already died — no point waiting further
+      await new Promise((r) => setTimeout(r, SOCKET_WAIT_INTERVAL_MS));
+    }
+    if (!socketReady) {
+      try { spawned.child.kill("SIGKILL"); } catch { /* already gone */ }
+      throw new Error(`mcp-pool: ${command} for pool ${poolId} never created its socket at ${socketPath} within ${SOCKET_WAIT_ATTEMPTS * SOCKET_WAIT_INTERVAL_MS}ms`);
+    }
+
+    const ready = markPoolReady(db, poolId, { pid: identity.pid, pgid: identity.pgid, lstart: identity.lstart, socketPath });
     if (!ready.updated) {
       // Someone else already marked this pool row past 'starting' — shouldn't happen (this function is
       // only reached by the caller that won the claim), but a spawned-and-orphaned process is worse than
@@ -206,6 +255,10 @@ export function createMcpPool({ db, logger = console } = {}) {
         liveChildren.delete(result.poolId);
       }
       markPoolStopped(db, result.poolId);
+      // Best-effort tidiness: a genuinely torn-down pool has no reason to leave its socket file behind
+      // in `os.tmpdir()` — `spawnOne`'s own stale-file removal already tolerates this being skipped, so
+      // a failure here is never allowed to affect the (already-committed) teardown result.
+      try { fs.rmSync(socketPathFor(result.poolId), { force: true }); } catch { /* best effort */ }
     }
     return result;
   }

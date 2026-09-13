@@ -153,9 +153,19 @@ granularity, not just same-user liveness.
 
 Building a native addon (real node-gyp compilation, real per-platform code — `SO_PEERCRED` is a
 Linux `getsockopt`, macOS/BSD use `getpeereid`, different APIs) would add real maintenance surface
-to close a gap the two mechanisms above already close for this project's stated threat model. The
-ONE thing it would add that neither mechanism above provides — telling apart two DIFFERENT
-processes owned by the SAME OS user — is explicitly out of scope for "a local single-user tool"
-(`runtime/supervisor.js`'s own words) and would only matter on a shared multi-user host, which is
-not this project's current design target. That limitation is written down, not hidden: "an honest
-boundary for a local single-user tool... would not be one on a shared host."
+to close a gap the two mechanisms above already close for this project's stated threat model.
+
+**CORRECTED 2026-09-13 (review-sol-2026-09-13.md finding 49) — the two platform APIs are NOT
+equivalent, and the paragraph this replaces implied they were.** Linux's `SO_PEERCRED` exposes the
+peer's **pid**, uid, and gid; macOS/BSD's `getpeereid` exposes ONLY the effective **uid/gid** — no
+pid. So "the one thing a native addon would add — telling apart two DIFFERENT processes owned by
+the SAME OS user" is true on Linux (a real pid distinguishes them), but **not actually available on
+macOS/BSD at all** — `getpeereid` alone cannot tell two same-user processes apart any more than the
+`0700` state-directory check already does. On macOS/BSD specifically, a native addon would add
+`getpeereid`'s uid/gid check, which is REDUNDANT with the `0700` directory permission (both answer
+"same OS user," nothing finer); only on Linux would it add genuine pid-level information beyond what
+this project already has. Either way, that finer-grained same-user disambiguation is explicitly out
+of scope for "a local single-user tool" (`runtime/supervisor.js`'s own words) and would only matter
+on a shared multi-user host, which is not this project's current design target. That limitation is
+written down, not hidden: "an honest boundary for a local single-user tool... would not be one on a
+shared host."

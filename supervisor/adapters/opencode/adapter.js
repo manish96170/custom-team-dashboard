@@ -586,6 +586,12 @@ export function capabilities() {
     approvalProtocol: 'observe-only',
     // The server exposes its config and model list over HTTP, but this adapter does not surface it.
     modelDiscovery: false,
+    // MEASURED as `false`, not merely absent (review-sol-2026-09-13.md finding 13): `start()` below
+    // throws on any `spec.mcpConfig` at all (residentProcess: 'pooled' means the environment — and any
+    // per-run MCP wiring — belongs to a shared process, not this run alone), so a caller building an
+    // mcpConfig entry for a utility-task role's pooled MCP server must check this first rather than
+    // finding out via a thrown error.
+    mcpConfigDelivery: false,
   };
 }
 

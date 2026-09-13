@@ -130,6 +130,7 @@ import { isTerminal, autoBlockTarget } from "../domain/task-states.js";
 import { instructionForRole } from "../domain/utility-instructions.js";
 import { rolesFor } from "../domain/workflow-profiles.js";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { extractiveDigest, DIGEST_BUDGET_CHARS } from "../domain/turn-digest.js";
 import { runConformance, formatReport } from "../conformance/suite.js";
 import { reconcileOnBoot, reap as reapRun } from "./reconcile.js";
@@ -162,6 +163,12 @@ const UTILITY_TASK_PRESETS = Object.freeze({
   "awsquery-runner": "utility:awsquery",
   "slack-runner": "utility:slack",
 });
+
+// The stdio<->socket bridge `start()` points a pooled MCP server's `--mcp-config` entry at
+// (review-sol-2026-09-13.md finding 13) — see `mcp-stdio-proxy.js`'s own header for why this exists
+// instead of naming the socket directly. Exported so a test can assert against it directly rather than
+// re-deriving the same path a second, independent way.
+export const MCP_STDIO_PROXY_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "mcp-stdio-proxy.js");
 
 /**
  * @param {{
@@ -1146,27 +1153,22 @@ export function createSupervisor({
     // spawns — the attach/detach LIFECYCLE bookkeeping is real and tested (`mcp-pool.js`,
     // `mcp-pool-wiring.test.js`).
     //
-    // CORRECTED 2026-09-11 (`codexdoc/review-luna-2026-09-11.md` finding 2) — this used to also put the
-    // pool-attachment marker (`{name, poolId}` objects) onto `spec.mcpConfig` and hand THAT to the real
-    // adapter. Checked against the adapter's own contract before this fix, not assumed: both
-    // `adapters/claude-code/adapter.js`'s `StartSpec` typedef and `worker-env.js`'s
-    // `settingSourcesArgv()` (`for (const cfg of spec.mcpConfig ...) args.push('--mcp-config', cfg)`)
-    // declare `mcpConfig` as `string | string[]` — a real config FILE PATH per entry, spawned by the
-    // adapter itself. Handing it a plain object instead would push a non-string into a real `spawn()`
-    // argv array the moment a utility-task role ever ran through the REAL Claude Code adapter (the
-    // existing tests never caught this because they only exercise the fake harness, which doesn't
-    // validate argv shape). OpenCode's adapter is stricter and simply THROWS on any `spec.mcpConfig` at
-    // all (`adapters/opencode/adapter.js`), so it would have failed loudly there instead — but "silently
-    // malformed on one harness, hard failure on the other" is not a state to ship either way.
-    // No probe in this repo has ever measured what a genuinely valid `--mcp-config` VALUE looks like for
-    // a pooled server with no on-disk config file (leo-mcp's socket transport, added the same day, is
-    // not something the MCP spec's own transport types — stdio command, or an SSE/HTTP url — describe a
-    // raw Unix socket as), so building a real one here would be guessing at a CLI contract rather than
-    // verifying it, which this project does not do. Until that is actually measured, `spec.mcpConfig` is
-    // simply never set here — the attach/detach bookkeeping below still runs for real (proving the pool
-    // manager itself, and keeping the lifecycle groundwork PLAN.md §21.1 is actually built on), but a
-    // utility-task run gets no MCP tool from it yet. `manifest.missing`'s diagnostic value is unaffected.
+    // CORRECTED 2026-09-14 (review-sol-2026-09-13.md finding 13, real transport delivery built) — this
+    // used to stop at the bookkeeping above, deliberately never setting `spec.mcpConfig`, because no
+    // probe in this repo had measured what a genuinely valid `--mcp-config` VALUE looks like for a
+    // pooled server with no on-disk config file. That has now been measured directly against the
+    // installed `claude` CLI: `--mcp-config` accepts a real JSON string (not just a file path), and only
+    // three transport types (stdio/sse/http) — none of which describe a raw Unix socket. So this does
+    // NOT point `--mcp-config` at the pool's socket; it points a `--mcp-config` stdio entry at
+    // `mcp-stdio-proxy.js`, a tiny script THIS repo controls that does nothing but relay bytes to that
+    // socket — a claim fully within the one transport type actually verified, not a guess at what the
+    // pooled server's own transport means to the harness. Gated on `adapter.capabilities?.().
+    // mcpConfigDelivery` (`conformance/matrix.js`) so a harness that cannot honour this (opencode: its
+    // shared process has no notion of a per-run environment at all) is never handed one, exactly as
+    // `worker-env.js` already refuses `mcpConfig` combined with `envProfile: 'inherit'` for the same
+    // reason — declare the limit, don't silently drop or crash on it.
     const mcpAttachmentIds = [];
+    const mcpServersForConfig = {};
     const workerRow = database.prepare(`SELECT role FROM workers WHERE worker_id = ?`).get(workerId);
     const declaredMcpNeeds = ROLE_MCP_NEEDS[workerRow?.role] ?? [];
     if (declaredMcpNeeds.length) {
@@ -1178,18 +1180,27 @@ export function createSupervisor({
       if (manifest.missing.length) {
         logger.warn?.(`[supervisor] role "${workerRow.role}" declares MCP need(s) [${manifest.missing.join(", ")}] with no registered pool config`);
       }
+      const canDeliverMcpConfig = adapter.capabilities?.()?.mcpConfigDelivery === "file-or-json-string";
       for (const poolName of manifest.pools) {
         const poolConfig = poolConfigFor(poolName, { stateDir: stateDirOf() });
         if (!poolConfig) continue; // already warned above via `manifest.missing`
         try {
           const attached = await mcpPool.attach(poolName, poolConfig, { principalId: workerPrincipal?.id ?? null, runId: null });
           mcpAttachmentIds.push(attached.attachmentId);
+          if (canDeliverMcpConfig && attached.socketPath) {
+            mcpServersForConfig[poolName] = { command: process.execPath, args: [MCP_STDIO_PROXY_PATH, "--socket", attached.socketPath] };
+          } else if (!canDeliverMcpConfig) {
+            logger.warn?.(`[supervisor] harness ${harnessId} cannot deliver an mcpConfig (mcpConfigDelivery: ${JSON.stringify(adapter.capabilities?.()?.mcpConfigDelivery)}) — run for ${workerId} attaches to pool "${poolName}" for bookkeeping only, with no usable tool`);
+          }
         } catch (err) {
           // Non-fatal, same posture as a missing principal above: a utility-task run that can't attach
           // to its declared pool still starts (it just won't have that tool), logged rather than
           // failing the whole run over a pooling concern.
           logger.warn?.(`[supervisor] run for ${workerId} could not attach to mcp pool "${poolName}": ${err.message}`);
         }
+      }
+      if (Object.keys(mcpServersForConfig).length) {
+        spec = { ...spec, mcpConfig: [...(spec.mcpConfig ? [].concat(spec.mcpConfig) : []), JSON.stringify({ mcpServers: mcpServersForConfig })] };
       }
     }
 
@@ -1304,6 +1315,26 @@ export function createSupervisor({
 
   async function resume(runId) {
     const { harnessId, adapter } = routeOrThrow(runId);
+    // review-sol-2026-09-13.md finding 8's remaining half: `resume` had NO task-state awareness at all —
+    // it would happily reopen a CLOSED run whose task is already terminal, putting a `merged`/`cancelled`
+    // task back into "has an open run" with no coordination against `discardTaskWorktree`'s own
+    // terminal-task-only-with-zero-open-runs invariant (and, worse, against a worktree that may already
+    // have been discarded out from under it). `assignTask` already refuses a terminal task outright for
+    // a NEW run (finding 13/luna); this closes the same door for reopening an OLD one. A run with no task
+    // at all (a preflight, or a worker row that predates this join) is unaffected — there is no terminal
+    // state to conflict with.
+    const taskId = taskIdForRun(database, runId);
+    if (taskId) {
+      const task = database.prepare(`SELECT state FROM tasks WHERE id = ?`).get(taskId);
+      if (task && isTerminal(task.state)) {
+        return {
+          ok: false, refused: "task-terminal",
+          error: `run ${runId}'s task ${taskId} is "${task.state}" — resume refuses to reopen a run whose `
+            + "task is already terminal; there is no reopen-task transition, so a resumed run here would be "
+            + "invisible to every check that assumes a terminal task has no open runs",
+        };
+      }
+    }
     if (!adapter.resume) return { runId, harnessId, resumed: false, result: "unsupported" };
     const result = await adapter.resume(runId);
     if (result === "unsupported") return { runId, harnessId, resumed: false, result };
@@ -3370,7 +3401,9 @@ export function createSupervisor({
         };
       }
     }
-    const task = database.prepare(`SELECT id, state, worktree_id FROM tasks WHERE id = ?`).get(taskId);
+    const task = database
+      .prepare(`SELECT id, state, worktree_id, branch, worktree_repo_path FROM tasks WHERE id = ?`)
+      .get(taskId);
     if (!task) throw new Error(`discardTaskWorktree: no such task ${taskId}`);
     if (!isTerminal(task.state)) {
       return {
@@ -3379,6 +3412,41 @@ export function createSupervisor({
       };
     }
     if (!task.worktree_id) return { taskId, discarded: false, reason: "no worktree to discard" };
+    // Someone else (a concurrent createTaskWorktree redo/adoption, or another discard that landed the
+    // instant before this read) already holds the slot — `claimTaskWorktreeSlot`'s CAS is keyed on
+    // `previousValue` matching the CURRENT row, so passing the pending marker itself through as
+    // `previousValue` would incorrectly "succeed" at re-claiming an already-claimed slot and mint a
+    // second, competing token. Refuse instead of racing it.
+    if (task.worktree_id === WORKTREE_CLAIM_PENDING) {
+      return {
+        ok: false, refused: "worktree-claim-conflict",
+        error: `task ${taskId}'s worktree slot is already claimed by another in-flight create/discard — retry shortly`,
+      };
+    }
+
+    // review-sol-2026-09-13.md finding 8: everything below used to be a plain check-then-act against
+    // `task.worktree_id` with no reservation of its own — the open-run check, the clean/dirty check, and
+    // `git worktree remove` could all observe a safe state and still race a CONCURRENT
+    // `createTaskWorktree`/`assignTask` call landing in the same window, which uses `task.worktree_id`
+    // (including mid-removal) as a spawn `cwd`. Claiming the slot with the SAME CAS `createTaskWorktree`
+    // itself uses closes that: it flips `worktree_id` to the pending marker atomically, so a concurrent
+    // `createTaskWorktree` sees `WORKTREE_CLAIM_PENDING` and polls (never a half-removed directory), and
+    // `assignTask`'s `cwd: task.worktree_id` resolution — which cannot itself hold this claim — spawns
+    // against the marker string and fails loudly instead of writing into a directory about to be deleted.
+    const claim = claimTaskWorktreeSlot(database, taskId, {
+      previousValue: task.worktree_id, repoPath: task.worktree_repo_path ?? null, branch: task.branch ?? null,
+    });
+    if (!claim.claimed) {
+      return {
+        ok: false, refused: "worktree-claim-conflict",
+        error: `task ${taskId}'s worktree slot changed before discard could claim it (now: ${claim.currentValue ?? "(none)"}) `
+          + "— another create/discard is in progress for this task, retry",
+      };
+    }
+    const releaseClaim = () => releaseTaskWorktreeClaim(database, taskId, {
+      previousValue: task.worktree_id, previousBranch: task.branch, previousRepoPath: task.worktree_repo_path,
+      claimToken: claim.claimToken,
+    });
 
     // TASK STATE AND RUN TERMINATION ARE SEPARATE MECHANISMS — `mergeTask` itself moves a task to
     // `merged` without stopping any run using it, so "terminal task state" was never actually the safety
@@ -3392,6 +3460,7 @@ export function createSupervisor({
         WHERE w.task_id = ? AND r.ended_at IS NULL`,
     ).all(taskId);
     if (openRuns.length > 0) {
+      releaseClaim();
       return {
         ok: false, refused: "open-run",
         error: `task ${taskId} has ${openRuns.length} open run(s) still assigned (${openRuns.map((r) => r.runId).join(", ")}) — `
@@ -3408,6 +3477,7 @@ export function createSupervisor({
     if (!force) {
       const status = await worktreeStatus(task.worktree_id);
       if (status.state !== "clean") {
+        releaseClaim();
         return {
           ok: false, refused: status.state === "dirty" ? "worktree-dirty" : "worktree-status-unknown",
           error: status.state === "dirty"
@@ -3420,6 +3490,7 @@ export function createSupervisor({
 
     const repoRoot = await repoRootFromWorktree(task.worktree_id);
     if (!repoRoot) {
+      releaseClaim();
       return { ok: false, refused: "git-error", error: `could not resolve the repo root for ${task.worktree_id}` };
     }
     try {
@@ -3427,12 +3498,23 @@ export function createSupervisor({
         cwd: repoRoot, timeout: 30_000,
       });
     } catch (err) {
+      releaseClaim();
       return { ok: false, error: err.message, refused: "git-worktree-remove-failed" };
     }
 
-    database
-      .prepare(`UPDATE tasks SET worktree_id = NULL, branch = NULL, worktree_repo_path = NULL, updated_at = ? WHERE id = ?`)
-      .run(new Date().toISOString(), taskId);
+    const finalized = finalizeTaskWorktreeSlot(database, taskId, {
+      worktreeId: null, branch: null, repoPath: null, claimToken: claim.claimToken,
+    });
+    if (!finalized.finalized) {
+      // The claim sat unfinalized long enough (or was otherwise superseded) that this write did not
+      // land — the git-level removal already happened, but reporting `discarded: true` here would claim
+      // a database write that did not take effect.
+      return {
+        ok: false, refused: "worktree-claim-superseded",
+        error: `task ${taskId}'s worktree was removed on disk, but the claim was superseded before the database `
+          + "could be finalized — the task row may still show a stale worktree_id; investigate manually",
+      };
+    }
 
     return { taskId, discarded: true, actor };
   }

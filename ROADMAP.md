@@ -1,11 +1,12 @@
 # Build Roadmap
 
-> **STATUS 2026-09-13, updated after item 39 — read `HANDOFF.md`'s top header for the full current
-> picture, this is just a pointer.** Phases 0a-6 complete and reviewed. Phase 7 (utility framework,
-> resource leases, MCP pooling, the utility-task lane) has its LIFECYCLE/FRAMEWORK complete — the
-> git-push utility path is genuinely complete end to end, but Jira/Slack/awsquery utility roles have NO
-> worker-side MCP tool transport yet (`spec.mcpConfig` is deliberately unset — review-sol-2026-09-13.md
-> finding 13/35, corrected 2026-09-13; see HANDOFF.md's top header) — and has had 24 real
+> **STATUS 2026-09-14 — read `HANDOFF.md`'s top header for the full current picture, this is just a
+> pointer.** Phases 0a-6 complete and reviewed. Phase 7 (utility framework, resource leases, MCP pooling,
+> the utility-task lane) has its LIFECYCLE/FRAMEWORK complete, AND worker-side MCP tool transport is now
+> real (review-sol-2026-09-13.md finding 13, fixed 2026-09-14 — `spec.mcpConfig` is genuinely built and
+> delivered for any harness that declares `mcpConfigDelivery`, via `runtime/mcp-stdio-proxy.js`; see
+> HANDOFF.md's top header for the full mechanism and what's still honestly unverified) — Phase 7 has had
+> 24 real
 > findings fixed across four independent-review passes (two codex, two `opencode luna` after codex hit a
 > multi-day quota wall — see `HANDOFF.md` items 22/24/25 and both `codexdoc/` review files). **All 9
 > findings from the `luna` review, and all remaining should-fix findings from the codex review, are now
@@ -21,27 +22,46 @@
 > schema-only step started** (item 39): `config/harness-defaults.js` now declares the `clearPolicy`
 > vocabulary and validates it on load; no decision module reads it yet (that's this checkbox's
 > remaining half, not started). `cd supervisor
-> && npm test` -> **127 suites, exit 0**, re-verified repeatedly, zero leaked processes each
-> time. Nothing in this repo (or `../leo-mcp/`) has been committed or pushed
-> this session.
+> && npm test` -> **127 suites, exit 0** at the time, re-verified repeatedly, zero leaked processes each
+> time.
 >
 > **UPDATE, same day — a full review of every uncommitted change, from `opencode`'s `sol` agent
 > (GPT-5.6 Sol via Bedrock), found real defects the test suite does not catch: `codexdoc/review-sol-2026-09-13.md`,
-> 50 findings (1 critical, 18 high, 15 medium, 12 doc-consistency, 4 low). **The critical finding, 15 of the
-> 18 high findings, 1 of the 4 low findings, ALL 15 of 15 medium findings, and ALL 12 doc-consistency
-> findings are FIXED** (HANDOFF.md's top header has the full list, including two additive migrations —
-> `0015_mcp_pool_lstart.sql`, `0016_worktree_claim_token.sql` — and every CODE fix independently verified
-> to fail against the pre-fix code first; every DOC fix corrected directly in its own file, cross-checked
-> against current code). One finding (12, workers holding `git:identity`) was explicitly reverted after
-> confirming it contradicts ~10 pre-existing, deliberately-tested cases — flagged as needing a real design
-> decision, not fixed unilaterally. **Two high findings remain OPEN BY DELIBERATE DEFERRAL, not oversight**
-> (8: worktree-removal races with start/resume/reassignment, needs a cross-cutting redesign of
-> run/task/worktree attribution together, not a patch; 13: MCP pooling has no real tool-delivery transport
-> to utility workers yet, a capability gap not a bug). **Only 3 of 4 low findings remain open** (47/49/50,
-> all minor/cosmetic) — read the review file directly before picking the next item. `npm test`:
-> exit 0, all suites, throughout (several standalone flakes in real-OS-process suites hit across this
-> session, all pre-existing and unrelated, all confirmed clean
-> on immediate re-run).
+> 50 findings (1 critical, 18 high, 15 medium, 12 doc-consistency, 4 low). **The critical finding, 15 of
+> the 18 high findings, and ALL 15 medium / 12 doc-consistency / 4 low findings are FIXED** (HANDOFF.md's
+> top header has the full list, including two additive migrations — `0015_mcp_pool_lstart.sql`,
+> `0016_worktree_claim_token.sql` — and every CODE fix independently verified to fail against the pre-fix
+> code first; every DOC fix corrected directly in its own file, cross-checked against current code). One
+> finding (12, workers holding `git:identity`) was explicitly reverted after confirming it contradicts
+> ~10 pre-existing, deliberately-tested cases — flagged as needing a real design decision, not fixed
+> unilaterally. **RESOLVED 2026-09-14 — owner decision: leave finding 12 as-is, no code change.** A plain
+> worker acquiring `git:identity` remains intended behavior; the tradeoff the review flagged (nothing
+> stops a worker from acquiring `host:heavy-job` or a future sensitive lease kind) is accepted, not fixed.
+> **UPDATE, same day, after `7b6af0a` — finding 8 now FULLY closed, across two
+> continuations.** Investigated fully first: this codebase has no worker-reassignment mechanism at all
+> (confirmed by exhaustive grep), so the review's "reassignment hides an older run" sub-case doesn't apply
+> to code that exists today; the wire-`start`-for-a-terminal-task sub-case needs a caller to explicitly
+> pass a terminal task's own worktree path, narrower than first assumed. Two real, always-reachable gaps
+> WERE found and fixed: (1) `discardTaskWorktree` checked-then-acted with no reservation of its own, so
+> two concurrent discards of the same task both passed every check and both ran `git worktree remove
+> --force` on the identical directory — fixed by having it claim the worktree slot with the same CAS
+> `createTaskWorktree` already uses, releasing on every refusal path (verified against
+> `runtime/test/worktree.test.js` case 20, fails pre-fix, passes post-fix); (2) `resume(runId)` had zero
+> task-state awareness — it would reopen ANY run regardless of whether its task was already terminal,
+> silently reopening a `merged`/`cancelled` task — fixed by refusing with `task-terminal` before ever
+> reaching the adapter (verified against case 21, fails pre-fix with the fake harness throwing `Unknown
+> runId`, passes post-fix). **UPDATE, same day — finding 13 now FIXED too, owner decision: build the real
+> transport rather than deferring.** MEASURED against the installed `claude` CLI first (`claude mcp add
+> --help`/`add-json --help`): `--mcp-config` takes a file path or JSON string, three transport types
+> (stdio/sse/http), none a Unix socket — so new `runtime/mcp-stdio-proxy.js` is a plain stdio server
+> `--mcp-config` spawns that relays bytes to the real pooled server's socket. `mcp-pool.js` now spawns
+> every pool as a socket server and returns the real `socketPath`; a new `mcpConfigDelivery` capability
+> field gates whether `start()` builds a real `spec.mcpConfig` entry. Verified at three levels including
+> a genuine end-to-end round trip (a real leo-mcp process, reached through the exact command `start()`
+> built, returning a real `tools/list` result) — full detail in HANDOFF.md. **Every finding from the
+> entire 50-finding review is now resolved** — 12 by explicit owner decision (leave as-is), everything
+> else fixed. `npm test`: exit 0, twice in a row, no flake. This latest batch (findings 8 and 13) is not
+> yet committed — check `git status` for current state.
 
 
 Order matters here — each phase either de-risks an unknown or is a hard dependency for

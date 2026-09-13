@@ -100,6 +100,22 @@ export const CAPABILITY_FIELDS = {
 
   /** Can the adapter enumerate the models available to it, or must they be configured by hand? */
   modelDiscovery: [true, false],
+
+  /**
+   * Can a caller hand this adapter a per-run MCP server declaration (`spec.mcpConfig`) and expect it
+   * to actually reach the harness — and if so, in what form?
+   *
+   *   'file-or-json-string' : the adapter forwards each `spec.mcpConfig` entry as a bare `--mcp-config`
+   *                            argv value, unmodified — MEASURED against the real CLI (claude-code:
+   *                            `claude mcp add-json --help` confirms both a file path and a literal
+   *                            JSON string are accepted, review-sol-2026-09-13.md finding 13).
+   *   false                  : `spec.mcpConfig` is refused outright (opencode: its shared/pooled
+   *                            process has no notion of a per-run environment at all).
+   *
+   * Added alongside `runtime/mcp-stdio-proxy.js` — the piece that makes this field's `true`-shaped
+   * value (`'file-or-json-string'`) actually usable for a pooled MCP server, not just declared.
+   */
+  mcpConfigDelivery: ["file-or-json-string", false],
 };
 
 /** Section 9's two tiers. `wrapper` is the canonical degraded mode, and is always marked as such. */

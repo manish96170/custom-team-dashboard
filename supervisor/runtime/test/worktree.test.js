@@ -644,6 +644,62 @@ await runTest("shared per-task worktree lifecycle", async () => {
         `the event loop must keep servicing timers while a slow git worktree call runs (only ${ticks} ticks across ~1s of delay -- looks blocked)`);
       console.log(`  19. the event loop kept servicing timers (${ticks} ticks) while a slow git worktree call ran — createTaskWorktree no longer blocks it`);
     }
+
+    // ── 20 ───────────────────────────────────────────────────────────────────────────
+    // review-sol-2026-09-13.md finding 8: discardTaskWorktree used to be a plain check-then-act against
+    // `task.worktree_id` with no reservation of its own. Two concurrent discards of the SAME task (an
+    // operator double-click, or a retried request) would both pass the open-run/clean checks and both
+    // reach `git worktree remove --force` on the exact same directory with no coordination between them
+    // — racing git's own worktree metadata. Claiming the slot (the same CAS `createTaskWorktree` uses)
+    // before any of those checks means the second caller is refused deterministically, before it ever
+    // touches the filesystem, instead of racing the first caller's git call.
+    {
+      createTask(db, { id: "t-double-discard", title: "double discard race", type: "feature" });
+      const created = await supervisor.createTaskWorktree("t-double-discard", { repoPath: repoDir });
+      assert.equal(created.created, true, `expected createTaskWorktree to succeed, got ${JSON.stringify(created)}`);
+      db.prepare("UPDATE tasks SET state = 'merged' WHERE id = 't-double-discard'").run();
+
+      const [first, second] = await Promise.all([
+        supervisor.discardTaskWorktree("t-double-discard", { actor: "owner" }),
+        supervisor.discardTaskWorktree("t-double-discard", { actor: "owner" }),
+      ]);
+      const outcomes = [first, second];
+      const winners = outcomes.filter((o) => o.discarded === true);
+      const losers = outcomes.filter((o) => o.discarded !== true);
+      assert.equal(winners.length, 1, `expected exactly one concurrent discard to win, got: ${JSON.stringify(outcomes)}`);
+      assert.equal(losers.length, 1, `expected exactly one concurrent discard to lose, got: ${JSON.stringify(outcomes)}`);
+      assert.equal(losers[0].refused, "worktree-claim-conflict",
+        `the losing concurrent discard must be refused by the claim CAS, not race the winner's git call — got: ${JSON.stringify(losers[0])}`);
+      const rowAfter = db.prepare("SELECT worktree_id, worktree_claim_token FROM tasks WHERE id = 't-double-discard'").get();
+      assert.equal(rowAfter.worktree_id, null, "the winning discard must have actually cleared worktree_id");
+      assert.equal(rowAfter.worktree_claim_token, null, "no claim must be left dangling after both calls settle");
+      console.log("  20. two concurrent discardTaskWorktree calls on the same task: exactly one wins, the other is refused by the claim CAS rather than racing its git call");
+    }
+
+    // ── 21 ───────────────────────────────────────────────────────────────────────────
+    // review-sol-2026-09-13.md finding 8's remaining half: `resume` had no task-state awareness at all —
+    // it would reopen a run whose task is already terminal, silently giving a `merged`/`cancelled` task
+    // a fresh open run with no coordination against `discardTaskWorktree`'s own "terminal + zero open
+    // runs" invariant. Fixed by refusing before ever reaching the adapter.
+    {
+      createTask(db, { id: "t-resume-terminal", title: "resume after terminal", type: "feature" });
+      createWorker(db, { workerId: "w-resume-terminal", nickname: "resume-terminal", role: "coder", taskId: "t-resume-terminal" });
+      createRun(db, { runId: "r-resume-terminal", workerId: "w-resume-terminal", harnessId: "fake", prompt: "closed run" });
+      endRun(db, "r-resume-terminal", { exitReason: "finished" });
+      db.prepare("UPDATE tasks SET state = 'merged' WHERE id = 't-resume-terminal'").run();
+
+      const beforeRow = db.prepare("SELECT ended_at FROM runs WHERE run_id = 'r-resume-terminal'").get();
+      assert.ok(beforeRow.ended_at, "precondition: the run is genuinely closed before resume is attempted");
+
+      const refused = await supervisor.resume("r-resume-terminal");
+      assert.equal(refused.ok, false, `expected resume to refuse a terminal task's run, got ${JSON.stringify(refused)}`);
+      assert.equal(refused.refused, "task-terminal");
+      assert.match(refused.error, /r-resume-terminal/);
+
+      const afterRow = db.prepare("SELECT ended_at FROM runs WHERE run_id = 'r-resume-terminal'").get();
+      assert.ok(afterRow.ended_at, "a refused resume must not have reopened the run row");
+      console.log("  21. resume refuses to reopen a run whose task is already terminal, without ever reaching the adapter");
+    }
   } finally {
     try { await supervisor?.shutdown({ timeoutMs: 3000 }); } catch { /* best effort */ }
     try { if (db) closeDb(db); } catch { /* best effort */ }

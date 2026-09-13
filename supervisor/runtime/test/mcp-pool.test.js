@@ -46,7 +46,13 @@ const isReallyDead = async (pid) => !(await isProcessGroupLive(pid));
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CHILD_SCRIPT = path.join(__dirname, "_mcp-pool-race-child.js");
 const quiet = { log() {}, warn() {}, error(...a) { console.error(...a); } };
-const LONG_LIVED = { command: process.execPath, args: ["-e", "setInterval(() => {}, 60000)"] };
+// `spawnOne` (review-sol-2026-09-13.md finding 13) now waits for the spawned process to actually create
+// a Unix socket at `process.env.LEO_MCP_SOCKET_PATH` before marking the pool row ready — the whole point
+// of pooling being N attachers sharing one socket-transport server. This fixture is a real one: it opens
+// a real `net.createServer()` on that exact env var and idles, matching the convention every registered
+// pool config (leo-mcp's `server-socket.js`) actually follows.
+const SOCKET_SERVER_SCRIPT = "require('net').createServer(() => {}).listen(process.env.LEO_MCP_SOCKET_PATH, () => setInterval(() => {}, 60000))";
+const LONG_LIVED = { command: process.execPath, args: ["-e", SOCKET_SERVER_SCRIPT] };
 
 function runRaceChild(stateDir, index, barrierPath, name, configHash) {
   return new Promise((resolve) => {
@@ -398,7 +404,7 @@ await runTest("mcp server pooling", async () => {
       const pool = createMcpPool({ db, logger: quiet });
 
       const a = await pool.attach("dispose-all-a", LONG_LIVED);
-      const b = await pool.attach("dispose-all-b", { command: process.execPath, args: ["-e", "setInterval(() => {}, 60000)"] });
+      const b = await pool.attach("dispose-all-b", { command: process.execPath, args: ["-e", SOCKET_SERVER_SCRIPT] });
       const pidA = getPool(db, a.poolId).pid;
       const pidB = getPool(db, b.poolId).pid;
       assert.ok(isPidAlive(pidA) && isPidAlive(pidB), "precondition: both real pooled processes are alive");

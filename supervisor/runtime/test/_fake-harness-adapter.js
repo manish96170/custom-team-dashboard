@@ -24,7 +24,7 @@ const CHILD = path.join(__dirname, "_fake-harness-child.js");
 
 let seq = 0;
 
-export function createFakeHarness({ label = "fake" } = {}) {
+export function createFakeHarness({ label = "fake", mcpConfigDelivery = false } = {}) {
   const runs = new Map();
 
   function get(runId) {
@@ -286,6 +286,10 @@ export function createFakeHarness({ label = "fake" } = {}) {
       clearContext: "erase",
       approvalProtocol: "host",
       modelDiscovery: false,
+      // Overridable per-instance (default `false`, matching every existing caller's assumption) so a
+      // test can exercise `runtime/supervisor.js`'s `start()`-side mcpConfig-building logic
+      // (review-sol-2026-09-13.md finding 13) without needing the real claude-code adapter installed.
+      mcpConfigDelivery,
     };
   }
 

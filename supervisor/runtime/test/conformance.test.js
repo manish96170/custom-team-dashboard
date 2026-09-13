@@ -124,7 +124,7 @@ await runTest("conformance / harness onboarding", async () => {
           residentProcess: "per-run", resumableTurns: true, structuredOutput: "stream-json",
           interrupt: "turn", clearContext: "erase",
           approvalProtocol: "host", // claims the host protocol...
-          modelDiscovery: false,
+          modelDiscovery: false, mcpConfigDelivery: false,
         }),
         answerApproval: undefined,   // ...but cannot answer
         pendingApprovals: undefined,
@@ -145,7 +145,7 @@ await runTest("conformance / harness onboarding", async () => {
       const broken = harnessWith({
         capabilities: () => ({
           residentProcess: "per-run", resumableTurns: true, structuredOutput: "stream-json",
-          interrupt: "turn", clearContext: "erase", approvalProtocol: "host", modelDiscovery: false,
+          interrupt: "turn", clearContext: "erase", approvalProtocol: "host", modelDiscovery: false, mcpConfigDelivery: false,
         }),
         // Acknowledges nothing: the shape a clear that silently does nothing would have.
         clearContext: () => ({}),
@@ -168,7 +168,7 @@ await runTest("conformance / harness onboarding", async () => {
           residentProcess: "per-run", resumableTurns: true, structuredOutput: "stream-json",
           interrupt: "turn", clearContext: "erase",
           approvalProtocol: "observe-only", // understates itself: it DOES have answerApproval
-          modelDiscovery: false,
+          modelDiscovery: false, mcpConfigDelivery: false,
         }),
       });
       const report = await runConformance(modest, { harnessId: "modest", spec: { cwd: stateDir, prompt: "hi" }, timeoutMs: 15_000 });

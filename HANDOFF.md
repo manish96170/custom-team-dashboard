@@ -1,14 +1,17 @@
 # Handoff — custom-team-dashboard (updated 2026-09-13, forty-sixth pass — read this
 whole header before doing anything else in a fresh session).
 
-**Forty-sixth pass, same day (2026-09-13) — a full review of every uncommitted/untracked change (nothing
-in this repo is committed or pushed this session, per the standing owner instruction below), commissioned
-from `opencode`'s `sol` agent (GPT-5.6 Sol via Bedrock — see `~/.config/opencode/opencode.json`), full
-report at `codexdoc/review-sol-2026-09-13.md` (50 findings, 1 critical + 18 high + 15 medium + 12
-doc-consistency + 4 low). **This pass fixed the critical finding, 15 of the 18 high findings, 1 of the
-4 low findings, ALL 15 of the 15 medium findings, and all 12 doc-consistency findings** — every CODE fix
-verified to fail against the pre-fix code before the fix was restored (this file's own standing rule);
-every DOC fix is a text correction, cross-checked against the actual current code before being written.
+**Forty-sixth pass, same day (2026-09-13) — a full review of every uncommitted/untracked change,
+commissioned from `opencode`'s `sol` agent (GPT-5.6 Sol via Bedrock — see
+`~/.config/opencode/opencode.json`), full report at `codexdoc/review-sol-2026-09-13.md` (50 findings, 1
+critical + 18 high + 15 medium + 12 doc-consistency + 4 low). **This pass fixed the critical finding, 15
+of the 18 high findings, ALL 15 medium findings, ALL 12 doc-consistency findings, and ALL 4 low
+findings** — every CODE fix verified to fail against the pre-fix code before the fix was restored (this
+file's own standing rule); every DOC fix is a text correction, cross-checked against the actual current
+code before being written. **This entire body of work (everything since the initial commit — Phase 7,
+Phase 8's schema step, and this whole review response) was committed and pushed to `origin/main` the
+same day** (`7b6af0a`) — the repo's long-standing "nothing committed this session" note from earlier
+passes no longer applies as of this commit.
 `npm test`: exit 0, all suites, throughout and after every fix below. Several `FAIL`s were hit mid-session
 in `runtime/test/concurrency.test.js` and `runtime/test/mcp-pool.test.js` — both real-OS-process suites
 already documented elsewhere in this file as occasionally flaky under load; every one passed clean
@@ -303,48 +306,120 @@ look in a future pass.
   request with an honest failure on `close`/`error`. New case in `ipc/test/teardown.test.js` (reusing
   that file's own already-in-flight `observe` request, which used to hang this exact way).
 
-**Explicitly reverted, not fixed — finding 12 ("workers can acquire and indefinitely renew the global git
+**Explicitly decided, not a bug — finding 12 ("workers can acquire and indefinitely renew the global git
 identity lease").** The suggested fix (block a plain `kind: "worker"` principal from acquiring anything
 but `host:heavy-job`) was implemented, then reverted after it broke ~10 pre-existing, deliberately-written
 cases in `runtime/test/leases.test.js` that exercise a plain worker acquiring `git:identity` as INTENDED
-behavior (not an oversight the review discovered — a documented, tested design tradeoff). Fixing this
-correctly needs a real design decision (a resource-specific capability model, per the review's own
-alternate suggestion) that would touch already-settled test contracts, not a unilateral change — same
-"flag rather than fix" call this file already made once for `db/`'s redaction gap. Flagged, not built.
+behavior (not an oversight the review discovered — a documented, tested design tradeoff). This needed a
+real product/design decision (a resource-specific capability model, per the review's own alternate
+suggestion, would touch already-settled test contracts) rather than a unilateral change — so it was
+escalated. **Decision (2026-09-14, owner): leave as-is, no code change.** A plain worker acquiring
+`git:identity` remains intended behavior; the review's concern (nothing stops a worker from acquiring
+`host:heavy-job` or a future sensitive lease kind it shouldn't need) is accepted as a known, deliberate
+tradeoff rather than something to fix now — revisit only if a real incident or a new lease kind makes the
+blanket "any worker can acquire any lease" rule actually costly.
 
-**Not yet actioned — 2 high findings (both deliberately deferred, not overlooked), all 15 medium, all 12
-doc-consistency, and 3 of 4 low findings from `codexdoc/review-sol-2026-09-13.md`.** Worth calling out by
-name before the next session picks a starting point:
-- **Finding 8 (high, DEFERRED BY DECISION)** — worktree removal races with start/resume/reassignment:
-  task-state and run-termination are separate mechanisms (wire-exposed `start` can still launch a worker
-  for a terminal task; `resume` can reopen an old run after discard's own open-run check already passed;
-  the open-run lookup joins through a worker's CURRENT assignment, so reassignment can hide an older run
-  still using the worktree). The review's own suggested fix — "persist a per-task filesystem lifecycle
-  state such as `discarding`, acquire it atomically before checking runs, and make start/resume/assign/
-  create refuse while held; store immutable task/worktree attribution on each run" — is a real schema +
-  cross-cutting logic change touching `start`/`resume`/`assignTask`/`createTaskWorktree` at once, some of
-  the most heavily-tested code in this codebase. Deliberately NOT attempted piecemeal this pass — a rushed
-  partial fix here risks introducing a subtler bug in the run lifecycle than the one being closed. Needs
-  its own dedicated pass with room to redesign the run/task/worktree attribution together, not a patch.
-- **Finding 13 (high, DEFERRED BY DECISION)** — MCP pooling does not actually deliver a usable tool
-  connection to utility workers yet: the manager spawns and records a pool attachment, but stdin/stdout
-  are never connected to the adapter, and `spec.mcpConfig` is deliberately left unset (item 17/22 in this
-  file's earlier passes already found and partly closed a related but distinct gap in this same area —
-  read those before touching this). Jira/Slack utility prompts still instruct workers to use `leo-mcp`
-  directly; `awsquery-runner` has no delivered AWS tool either. The review's own suggested interim is a
-  scope decision ("do not expose these utility types as runnable until it does"), not a code patch — this
-  needs a real adapter-supported multiplexed transport, which is new capability, not a bug fix.
+**Not yet actioned — 1 high finding fully deferred, all 15 medium, all 12 doc-consistency, and 3 of 4 low
+findings from `codexdoc/review-sol-2026-09-13.md`.** Worth calling out by name before the next session
+picks a starting point:
+- **Finding 8 (high, NOW FULLY FIXED across two continuations).** Investigated fully before touching
+  anything: this codebase has **no worker-reassignment mechanism at all** —
+  `grep -a -n "UPDATE workers SET task_id"` across the whole tree returns nothing; `workers.task_id` is
+  set once and never changed at runtime — so the review's "reassignment can hide an older run" sub-case
+  does not apply to the code as it actually exists today (it may have been a hypothetical against a
+  future feature). The wire-exposed `start`-for-a-terminal-task sub-case is also narrower than it first
+  reads: `start()` never looks up a task's worktree itself, so this requires a caller to explicitly pass a
+  terminal task's own worktree path as `spec.cwd`, bypassing `assignTask`'s existing terminal-task refusal
+  — not something normal `start` usage triggers.
+  Two real, always-reachable gaps WERE found and fixed:
+  1. `discardTaskWorktree` read `task.worktree_id` once and then ran its open-run check, its clean/dirty
+     check, and `git worktree remove --force` with **no reservation of its own** — two concurrent
+     `discardTaskWorktree` calls on the same task (an operator double-click, a retried request) both
+     passed every check and both ran `git worktree remove --force` on the identical directory with zero
+     coordination. Fixed by having `discardTaskWorktree` claim the worktree slot with the exact same CAS
+     `createTaskWorktree` already uses (`claimTaskWorktreeSlot`/`finalizeTaskWorktreeSlot`/
+     `releaseTaskWorktreeClaim`, flipping `tasks.worktree_id` to the pending marker for the duration)
+     before any of its checks, releasing on every refusal path and finalizing to `NULL` only on real
+     success. Free second benefit: while a discard holds the claim, `assignTask`'s `cwd: task.worktree_id`
+     resolution reads the pending-marker string instead of a real path, so a `start` racing a discard now
+     fails loudly (bad `cwd`) instead of silently writing into a directory mid-removal. Verified: reverting
+     the claim makes new case 20 in `runtime/test/worktree.test.js` fail deterministically (both
+     concurrent calls report `discarded: true` pre-fix; exactly one does post-fix, the other refused
+     `worktree-claim-conflict`).
+  2. `resume(runId)` had zero task-state awareness at all — it would reopen ANY run by id regardless of
+     whether its task was already terminal, silently giving a `merged`/`cancelled` task a fresh open run
+     with no coordination against `discardTaskWorktree`'s own "terminal + zero open runs" invariant (and,
+     worse, against a worktree that may already have been discarded). Fixed by looking up the run's task
+     via the existing `taskIdForRun` and refusing with `{ok:false, refused:"task-terminal"}` before ever
+     reaching the adapter — mirroring `assignTask`'s own terminal-task refusal for a NEW run, now closed
+     for reopening an OLD one. A run with no task at all (a preflight) is unaffected. Verified: reverting
+     just this block makes new case 21 in `runtime/test/worktree.test.js` fail pre-fix (the fake harness
+     throws `Unknown runId` instead of a clean refusal, since it never reaches its own bookkeeping);
+     restored, passes cleanly post-fix.
+  Full `npm test` exit 0 after both fixes (one standalone mcp-pool re-run needed due to the pre-existing,
+  already-documented intermittent flake in that suite — confirmed clean, unrelated to this work).
+- **Finding 13 (high, NOW FIXED, 2026-09-14 — owner decision: build the real transport rather than
+  deferring or gating).** Previously: MCP pooling spawned and recorded a pool attachment, but
+  stdin/stdout were never connected to the adapter, `spec.mcpConfig` was deliberately left unset, and
+  Jira/Slack utility prompts fell back to instructing workers to use `leo-mcp` directly.
+  MEASURED, not guessed, per this project's own rule: `claude mcp add --help` / `claude mcp add-json
+  --help` (run directly against the installed `claude` CLI) confirm `--mcp-config` accepts a real JSON
+  FILE PATH or a literal JSON STRING, and exactly three transport types (`stdio`, `sse`, `http`) — none
+  of which describe a raw Unix socket. So the fix is not "point `--mcp-config` at the pool's socket" —
+  new `runtime/mcp-stdio-proxy.js` is a tiny script that `--mcp-config` spawns as an ORDINARY stdio
+  server (fully within the one transport type actually verified) and that does nothing but relay bytes
+  to and from the real pooled server's socket; no protocol parsing, since both ends already speak the
+  same newline-delimited JSON-RPC framing.
+  Wiring, end to end: `runtime/mcp-pool.js`'s `spawnOne` now spawns every registered pool config as a
+  socket-transport server (`LEO_MCP_SOCKET_PATH` env var, leo-mcp's own convention; polls for the socket
+  file to actually exist before marking the row ready, same "verify against the real OS" discipline used
+  elsewhere in this file) and `attach()` now returns the real `socketPath`. `config/mcp-pools.js`'s
+  built-in `leo-mcp` entry now spawns `mcp/server-socket.js` (the socket transport) instead of
+  `server.js` (stdio). A new capability field, `mcpConfigDelivery` (`conformance/matrix.js`,
+  `'file-or-json-string'` for claude-code, `false` for opencode — MEASURED per-adapter, not assumed),
+  gates whether `runtime/supervisor.js`'s `start()` builds a real `spec.mcpConfig` entry at all:
+  `{"mcpServers":{"<pool>":{"command":<node>,"args":[mcp-stdio-proxy.js,"--socket",<realSocketPath>]}}}`,
+  a JSON STRING per the measured contract, pushed straight into the existing `--mcp-config` argv path.
+  Verified at three levels: (1) `runtime/test/mcp-stdio-proxy.test.js`, 5 cases, the proxy against a real
+  throwaway Unix socket server — exact bytes relayed both ways, clean shutdown on stdin end, non-zero
+  exit on a missing flag or a dead socket; (2) `runtime/test/mcp-pool.test.js`'s existing 11 cases,
+  updated so every real spawned fixture actually opens a socket (the new convention `spawnOne` now
+  requires); (3) new case 7 in `runtime/test/mcp-pool-wiring.test.js` — a REAL leo-mcp process, spawned
+  by the real pool manager, reached through the EXACT command+args `start()` built, returning a REAL
+  `tools/list` JSON-RPC result. Reverting `MCP_STDIO_PROXY_PATH`'s export makes that case fail with a
+  real `SyntaxError` (not a silent pass); restored. Full `npm test` exit 0, twice in a row (no flake).
+  **Honest residual gap**: this proves the chain up to and including a real MCP server response through
+  a real proxy process — it has NOT been probed against the actual `claude` CLI subprocess spawning that
+  exact `--mcp-config` JSON string live (that would need a real `claude --print` invocation, heavier
+  manual verification not done this pass). The schema itself is measured, not guessed; the live
+  first-hand fire-through-`claude`-itself step is the one thing still unverified.
 - **Medium — ALL 15 of 15 fixed.** Every medium finding from `codexdoc/review-sol-2026-09-13.md` is now
   closed (20-34); see the three "Fixed in a ... follow-up continuation" sections above for the full list
   and mechanism per finding.
-- **Doc-consistency — ALL 12 (35-46) fixed, above.** Low — 3 of 4 remain open (47, 49, 50 — 48 fixed
-  above): migration-upgrade test coverage stopping short of 0013-0016; an overstated macOS/BSD
-  peer-credential rationale in `ipc/FINDINGS.md`; two accidental empty root files (`2026-09-11.md`,
-  `Untitled.canvas`).
-- **Only genuinely open from the whole 50-finding review**: the 2 high findings deliberately deferred (8,
-  13, both explained above with the rationale for not patching them piecemeal), the 1 explicitly reverted
-  finding (12, needs a real design decision), and 3 low findings (47/49/50, all minor/cosmetic). Everything
-  else — the critical finding, 15 of 18 high, all 15 medium, all 12 doc-consistency, 1 of 4 low — is fixed.
+- **Doc-consistency — ALL 12 (35-46) fixed. Low — ALL 4 of 4 fixed.** Closed in a fourth follow-up
+  continuation, same day:
+  - **Finding 47** — migration-upgrade test coverage stopped short of 0013-0016 (only 0011/0012 had a
+    dedicated upgrade test, and the generic `migrations.test.js` only ever checked a FRESH database).
+    New `db/test/migration-0013-to-0016.test.js`: populates real rows at schema version 0012 (an
+    `mcp_pool` row in its pre-0013 shape, a task), upgrades to latest, and asserts the DOCUMENTED
+    backfill defaults land correctly (`mcp_pool.status = 'starting'`, not NULL; `pgid`/`lstart`/
+    `worktree_repo_path`/`worktree_claim_token` genuinely NULL, not guessed), the new
+    `mcp_pool_attachments` table exists and genuinely enforces its FK against `runs` (a bad `run_id`
+    insert is asserted to throw), and `PRAGMA integrity_check` still reports `ok` after the full upgrade.
+    Also added the missing `mcp_pool_attachments` to `migrations.test.js`'s own generic table list.
+  - **Finding 49** — `ipc/FINDINGS.md`'s peer-credential rationale conflated Linux `SO_PEERCRED`
+    (exposes pid+uid+gid) with macOS/BSD `getpeereid` (uid/gid ONLY, no pid) as if a native addon would
+    buy the same same-user-process disambiguation on both platforms. Corrected: on macOS/BSD, a native
+    addon's uid/gid check would be REDUNDANT with the `0700` state-directory check already in place;
+    only Linux's `SO_PEERCRED` would add anything (pid-level disambiguation) beyond what this project
+    already has — and that disambiguation is explicitly out of scope for a single-user tool either way.
+  - **Finding 50** — two accidental empty root files, `2026-09-11.md` (0 bytes) and `Untitled.canvas`
+    (`{}`), never had a known purpose and were never tracked in git. Deleted, per the review's own
+    suggested resolution ("give them a purpose or omit them").
+- **Every one of the review's 50 findings is now resolved.** Finding 13 (MCP transport delivery) is now
+  FIXED, not deferred — see above. Finding 12 (workers holding `git:identity`) is explicitly RESOLVED —
+  owner decision 2026-09-14: leave as-is, no code change. Every other finding across every severity tier
+  — the critical finding, all 18 high, all 15 medium, all 12 doc-consistency, all 4 low — is fixed.
 
 Read `codexdoc/review-sol-2026-09-13.md` directly for full file:line detail on every item above before
 starting the next pass — this summary is deliberately compressed. New migrations this pass:
