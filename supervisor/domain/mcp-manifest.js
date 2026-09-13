@@ -23,15 +23,29 @@
 // strictly narrower than "every configured server, every turn," even though it is not per-turn lazy
 // discovery. `manifestForRole` is pure and returns the same answer for the same inputs.
 //
-// UPDATE, same day: a later pass DID wire `manifestForRole`'s pool-name list into `start()`'s
+// UPDATE 2026-09-11: a later pass DID wire `manifestForRole`'s pool-name list into `start()`'s
 // attach/detach lifecycle (`runtime/mcp-pool.js`) — real pool rows, real attachments, tested. It did
-// NOT end up wiring the result into `spec.mcpConfig`, though an even later pass briefly tried: doing so
+// NOT then wire the result into `spec.mcpConfig`, though an even later pass briefly tried: doing so
 // meant handing the adapter a non-string marker object where its own contract (`string | string[]`, a
 // real config file path) expects one — corrected in `runtime/supervisor.js`, see
-// `codexdoc/review-luna-2026-09-11.md` finding 2. So the honest state is: role->pool-name resolution
-// AND the pool lifecycle are both real; a spawned worker session getting an actual usable MCP
-// connection from it is still not, because no `--mcp-config` value naming a pooled (non-file,
-// non-stdio-command) server has ever been measured to work.
+// `codexdoc/review-luna-2026-09-11.md` finding 2.
+//
+// SUPERSEDED 2026-09-14 (review-sol-2026-09-13.md finding 13, then review-consolidated-2026-09-14.md
+// findings 1-2): `spec.mcpConfig` delivery IS now real. Measured directly against the installed `claude`
+// CLI (`claude mcp add-json --help`): `--mcp-config` accepts a real JSON STRING, not only a file path,
+// and `runtime/mcp-stdio-proxy.js` bridges the gap the paragraph above described — a plain stdio
+// "server" the harness spawns itself that relays bytes to the real pooled process's Unix socket
+// (`runtime/mcp-pool.js` now spawns every pool as a socket-transport server for exactly this). Gated on
+// a new `mcpConfigDelivery` capability field (`conformance/matrix.js`) so a harness that cannot honour
+// it (opencode) is never handed one. And the delivered surface is now BOUNDED per role — see
+// `ROLE_MCP_TOOL_ALLOWLIST` below — not the pooled server's entire tool catalog; `mcp-stdio-proxy.js`
+// filters `tools/list` and refuses a disallowed `tools/call` directly, closing the gap where attaching
+// to a pool meant reaching every tool ANY role's need ever registered. Two honest limits remain: this is
+// Claude-Code-only (opencode's shared process has no per-run environment notion at all), and `resume()`
+// re-attaches for a fresh generation rather than replaying a torn-down socket, but has not been
+// live-tested against the real `claude` CLI subprocess itself (the mechanism is verified end to end
+// through a real pooled server and the real proxy; firing it through `claude` live is the one residual,
+// explicitly-flagged gap).
 
 /**
  * Declared per-role MCP needs, by POOL NAME (matching `runtime/mcp-pool.js`'s `attach(name, config)`
@@ -73,3 +87,34 @@ export function manifestForRole(role, { registeredConfigs = {} } = {}) {
 
 /** Every role with a declared MCP need — for a UI/CLI that wants the real list rather than a hardcoded one. */
 export const ROLES_WITH_MCP_NEEDS = Object.freeze(Object.keys(ROLE_MCP_NEEDS));
+
+/**
+ * Per-role TOOL allowlist for a pooled MCP server's tool surface — review-consolidated-2026-09-14.md
+ * finding 1. `ROLE_MCP_NEEDS` above only ever bounded which POOL (server) a role attaches to; nothing
+ * bounded which of that server's own tools it could reach. Measured directly: a real pooled `leo-mcp`
+ * process advertises 27 tools (`git_push` plus 21 `slack_*` and 5 `jira_*` tools) over one shared
+ * socket, and EVERY role that declares `leo-mcp` as a need got the entire 27-tool surface — a
+ * `jira-runner`, whose own capability preset (`domain/capabilities.js`'s `utility:jira`) is exactly
+ * `["read:registry", "jira:create"]`, could still reach `git_push` (an arbitrary absolute `cwd` +
+ * `targetBranch`, bypassing the supervisor's own `gitPush` capability check, its `git:identity` lease,
+ * and its `agent_journal` record entirely) and every Slack tool including message deletion.
+ *
+ * Grounded in what each role's own capability preset and instruction text (`utility-instructions.js`)
+ * ALREADY declare — not a new, invented boundary:
+ *   - `git-push-runner`'s own prompt tells it to use the supervisor's `gitPush` command, never leo-mcp's
+ *     `git_push` directly; its allowlist is the single tool matching its own name, as tight as this
+ *     project's existing role/preset naming gets without inventing a zero-tool special case.
+ *   - `jira-runner`'s capability preset (`utility:jira`) is CREATE-only (`jira:create`, no `jira:
+ *     transition`/similar) — its allowlist mirrors that exactly: `jira_create_ticket`, nothing else.
+ *   - `slack-runner`'s capability preset (`utility:slack`) is `slack:post-bot` — POSTING, not deleting,
+ *     querying, or administering. Its allowlist is the tools that actually post a message; deletion,
+ *     search, DM, user-impersonating post, scheduling admin, and session/agent tools are all excluded.
+ *
+ * A role absent here (or whose need isn't `leo-mcp`) gets no allowlist entry — `awsquery-runner` never
+ * declares `leo-mcp` as a need at all (see `ROLE_MCP_NEEDS`'s own comment), so it never reaches this map.
+ */
+export const ROLE_MCP_TOOL_ALLOWLIST = Object.freeze({
+  "git-push-runner": Object.freeze(["git_push"]),
+  "jira-runner": Object.freeze(["jira_create_ticket"]),
+  "slack-runner": Object.freeze(["slack_post", "slack_reply", "slack_schedule_message", "slack_publish_home"]),
+});

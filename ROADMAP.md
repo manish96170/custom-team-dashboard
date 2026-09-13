@@ -60,7 +60,30 @@
 > a genuine end-to-end round trip (a real leo-mcp process, reached through the exact command `start()`
 > built, returning a real `tools/list` result) — full detail in HANDOFF.md. **Every finding from the
 > entire 50-finding review is now resolved** — 12 by explicit owner decision (leave as-is), everything
-> else fixed. `npm test`: exit 0, twice in a row, no flake. This latest batch (findings 8 and 13) is not
+> else fixed. `npm test`: exit 0, twice in a row, no flake. This batch (findings 8 and 13) was committed
+> as `79aa275`.
+>
+> **UPDATE 2026-09-14, after `79aa275` — a THIRD independent review pass, this time cross-checked between
+> two independent reviewers before any fix was attempted.** `opencode`'s `sol` reviewed the last three
+> commits fresh (`codexdoc/review-sol-2026-09-14-commits.md`, 8 findings); a separate Claude Opus
+> (high effort) then did its OWN independent review FIRST, read sol's report only afterward, and verified
+> every one of sol's 8 findings against the real code — with a REAL reproduction wherever the claim was
+> about timing or state (real sockets, real git, real spawned processes) — before consolidating both into
+> `codexdoc/review-consolidated-2026-09-14.md`. **14 survivors (3 high, 6 medium, 4 low, 1 doc-
+> consistency); 0 of sol's 8 refuted; 6 new findings sol never reported.** The headline: the MCP transport
+> `79aa275` just built delivered a pooled server's ENTIRE tool surface to every attached role — a
+> `jira-runner` could reach `git_push` and every Slack tool, bypassing the supervisor's own capability
+> checks, lease, and journal entirely. **11 of 14 fixed** (protocol-aware tool allowlisting in
+> `mcp-stdio-proxy.js`; `resume()` now re-attaches a fresh MCP socket instead of replaying a torn-down
+> one; a crash mid-discard no longer permanently wedges the worktree claim or lets a stale create
+> resurrect a deliberately deleted worktree, new migration `0017_worktree_claim_op_and_stamp.sql`; real
+> socket-readiness verification instead of `existsSync` alone; a concurrent-attach timing mismatch;
+> confirmed-kill-before-drop-ownership teardown everywhere; `chmod 0600` sockets; preflight no longer
+> attaches MCP pools at all). **2 deferred by explicit judgment call** (fail-open MCP delivery — the blast
+> radius shrank once the tool surface got bounded, so refusing outright is now a real product-scope
+> decision, not a clear bug; the sibling-repo-dependent test's silent skip — made loud, not fully closed).
+> **1 left alone** (a fail-open git-diff default the code already documents as deliberate). Full detail,
+> per finding, in HANDOFF.md's top header. `npm test`: exit 0, twice in a row, no flake. This batch is not
 > yet committed — check `git status` for current state.
 
 
@@ -507,8 +530,10 @@ built correctly the first time, not a bug to patch in throwaway spike code.
       superseded by `leo-mcp` (a real MCP server, `../leo-mcp/`, `HANDOFF.md` item 12) plus this
       dashboard's own utility-task lane (`git-push-task`/`jira-task`/`awsquery-task`/`slack-task`,
       `HANDOFF.md` item 13) — role/capability/model machinery and real per-role dispatch/instructions ARE
-      built (item 26), though jira-task/slack-task/awsquery-task still have no DELIVERED MCP transport
-      (finding 13/35, top of `HANDOFF.md`). CTO (Phase 8) has only its schema-only first step (item 39).
+      built (item 26). **SUPERSEDED 2026-09-14**: jira-task/slack-task now have a real, DELIVERED, bounded
+      MCP transport too (finding 13, fixed; see top of `HANDOFF.md`) — awsquery-task still has none, but
+      because it never declares a leo-mcp need at all (its AWS access is a separate, unrelated MCP server),
+      not because delivery is missing. CTO (Phase 8) has only its schema-only first step (item 39).
       **CORRECTED 2026-09-13 (review-sol-2026-09-13.md finding 42): this line previously read `[ ]`
       unconditionally, implying none of "utility prompts/dispatch" existed — stale.**
       **List-management is not on this roster** — it's typed supervisor commands
@@ -650,6 +675,16 @@ built correctly the first time, not a bug to patch in throwaway spike code.
       the attach/detach bookkeeping is real and tested; a worker getting an actual usable MCP connection
       from it is not, and won't be until `--mcp-config`'s real accepted value shapes are measured against
       the real CLI (leo-mcp's new socket transport, below, doesn't by itself answer that).**
+      **SUPERSEDED 2026-09-14 (review-sol-2026-09-13.md finding 13, then review-consolidated-2026-09-14.md
+      findings 1-2, 5-7, 12) — that measurement is now done, and delivery is real.** `claude mcp add-json
+      --help` confirms `--mcp-config` accepts a real JSON string; `runtime/mcp-stdio-proxy.js` is the
+      plain-stdio bridge to leo-mcp's socket this note said would still be needed. `mcp-pool.js`'s spawn
+      path also got real readiness verification (a connect handshake + `isSocket()` check, not
+      `existsSync` alone), a fixed concurrent-attach timing mismatch, confirmed-kill-before-drop-ownership
+      teardown everywhere, and `chmod 0600` sockets. The delivered surface is bounded per role
+      (`ROLE_MCP_TOOL_ALLOWLIST`, below) rather than the pool's whole tool catalog. `resume()` now
+      re-attaches for a fresh generation instead of replaying a torn-down socket. Full detail in
+      `HANDOFF.md`'s top header.
       **Two more real bugs fixed in the same pass**: `hashPoolConfig` used to hash only top-level key
       NAMES (a `JSON.stringify` replacer-array quirk), so two configs differing only in a nested `env`
       credential hashed identically — closed with a real recursive canonical stringifier
@@ -668,6 +703,11 @@ built correctly the first time, not a bug to patch in throwaway spike code.
       all** (corrected above alongside §21.1) — this module's output was briefly wired in, found to hand
       the adapter a malformed value, and removed; `manifestForRole` itself stays correct and tested, its
       integration point is just not `spec.mcpConfig` until a real config-value shape is measured.
+      **SUPERSEDED 2026-09-14**: it is wired in now (see §21.1's own superseded note, above) — `start()`
+      and `resume()` both resolve the manifest and build a real `spec.mcpConfig`. This module also now
+      exports `ROLE_MCP_TOOL_ALLOWLIST` (review-consolidated-2026-09-14.md finding 1), a second bound this
+      original design didn't anticipate: which of a pool's OWN tools reach the harness, not just which
+      pool.
 - [ ] Operation-intent-before-side-effect journals for every utility agent (append-only
       task-history log, checked before acting — "did I already file this ticket").
 - [ ] slack-message agent posts as the bot only (PLAN.md section 14.5) — as-user

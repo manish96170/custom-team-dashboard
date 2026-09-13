@@ -25,10 +25,12 @@ parallel. Tasks *within* a group that aren't independent of each other are marke
 this section is a periodically-refreshed snapshot, not updated every pass)
 
 **Phases 0a-6 COMPLETE and reviewed. Phase 7 (authorization gate, resource leases, MCP pooling, the
-utility-task lane, `git-create-push`'s full fight loop) has its LIFECYCLE/FRAMEWORK COMPLETE — the
-git-push utility path works end to end, but Jira/Slack/awsquery utility roles have NO worker-side MCP
-tool transport yet (`spec.mcpConfig` deliberately unset — review-sol-2026-09-13.md finding 13/35,
-corrected 2026-09-13; see `HANDOFF.md`'s top header)**, independently
+utility-task lane, `git-create-push`'s full fight loop) has its LIFECYCLE/FRAMEWORK COMPLETE, AND
+worker-side MCP tool transport is now real too (`spec.mcpConfig` is genuinely built and delivered for
+any harness that declares `mcpConfigDelivery`, via `runtime/mcp-stdio-proxy.js`, with the delivered
+tool surface bounded per role — review-sol-2026-09-13.md finding 13, fixed 2026-09-14, then hardened
+and bounded further by review-consolidated-2026-09-14.md findings 1-2, 5-7, 12; see `HANDOFF.md`'s top
+header for the full mechanism and what's still honestly unverified)**, independently
 reviewed multiple times (two codex passes, two `opencode luna` passes — see `HANDOFF.md` items
 16/18/22/24/25 for the ~20 real findings those found and fixed), and the OLDER should-fix backlog
 predating those reviews is now fully closed or explicitly, correctly deferred (`HANDOFF.md` items
@@ -63,17 +65,21 @@ the mechanisms it describes. `ROADMAP.md` has the per-phase checklists.
       stage/commit/hook-failure/classify/autofix/re-run, `gitPush`/`gitPushProtected` wire commands, `git:identity`
       lease held across the whole loop. Built item 11; hardened repeatedly since (retry-after-partial-push-failure,
       server-side protected-destination classification, async/non-blocking git calls — `HANDOFF.md` items 21/32).
-- [~] **The roster, decided differently than originally planned**: `leo-mcp` (`../leo-mcp/`, private sibling
+- [x] **The roster, decided differently than originally planned**: `leo-mcp` (`../leo-mcp/`, private sibling
       repo, item 12) is a real, working, independently-tested MCP server providing Jira/Slack tool access —
       instead of bespoke jira-automation/slack-message agents in THIS repo, since the skills were already
       mature/conversational and `team-slack-bridge` had already grown a full MCP tool surface. **THAT DECISION
-      is done; wiring a dashboard worker session to actually REACH `leo-mcp` is not** (review-sol-2026-09-13.md
-      finding 13/35, corrected 2026-09-13) — `spec.mcpConfig` is deliberately left unset, so a jira-task/
-      slack-task run has no delivered channel to `leo-mcp` at all, only supervisor-side pool bookkeeping. This
-      dashboard's own utility-task lane (`git-push-task`/`jira-task`/`awsquery-task`/`slack-task`, item 13)
-      provides the role/capability/model machinery + a one-call dispatch helper (`createUtilityTask`, item 26)
-      + real per-role run instructions (item 26) on top of it — but only `git-push-task` has a real, DELIVERED
-      tool to call; the other three are role/capability/instruction scaffolding around a transport gap.
+      is done, and wiring a dashboard worker session to actually REACH `leo-mcp` is now done too**
+      (review-sol-2026-09-13.md finding 13, fixed 2026-09-14 — `spec.mcpConfig` is genuinely built and
+      delivered via `runtime/mcp-stdio-proxy.js`, a plain stdio bridge to leo-mcp's real Unix-socket transport,
+      since no MCP client contract measured here supports a raw socket directly). The delivered surface is
+      also BOUNDED per role, not the pool's entire tool catalog (review-consolidated-2026-09-14.md finding 1:
+      `domain/mcp-manifest.js`'s `ROLE_MCP_TOOL_ALLOWLIST`, enforced by the proxy itself). This dashboard's own
+      utility-task lane (`git-push-task`/`jira-task`/`awsquery-task`/`slack-task`, item 13) provides the
+      role/capability/model machinery + a one-call dispatch helper (`createUtilityTask`, item 26) + real
+      per-role run instructions (item 26) on top of it, and `git-push-task`/`jira-task`/`slack-task` all now
+      have a real, DELIVERED, bounded tool; `awsquery-task` still has none (it never declares a leo-mcp need —
+      its own AWS access is a separately-configured MCP server, not this project's pooled config).
 - [~] **Operation-intent journals per utility agent — PRIMITIVE built, not wired into any caller.**
       **CORRECTED 2026-09-13 (review-sol-2026-09-13.md finding 38) — this line previously read `[x]`,
       contradicting `ROADMAP.md`'s own (correct) `[ ]` for the same item.** `agent_journal` +

@@ -7,7 +7,7 @@
 //   4. ROLES_WITH_MCP_NEEDS matches ROLE_MCP_NEEDS's own keys, so a UI listing roles can't drift from it
 
 import assert from "node:assert/strict";
-import { manifestForRole, ROLE_MCP_NEEDS, ROLES_WITH_MCP_NEEDS } from "../mcp-manifest.js";
+import { manifestForRole, ROLE_MCP_NEEDS, ROLES_WITH_MCP_NEEDS, ROLE_MCP_TOOL_ALLOWLIST } from "../mcp-manifest.js";
 
 let failed = false;
 function testCase(name, fn) {
@@ -45,6 +45,25 @@ testCase("a declared pool absent from registeredConfigs is reported missing, not
 
 testCase("ROLES_WITH_MCP_NEEDS cannot drift from ROLE_MCP_NEEDS's own keys", () => {
   assert.deepEqual([...ROLES_WITH_MCP_NEEDS].sort(), Object.keys(ROLE_MCP_NEEDS).sort());
+});
+
+// review-consolidated-2026-09-14.md finding 1: every role that declares a pooled MCP need must ALSO
+// declare a tool allowlist for it — a role present in ROLE_MCP_NEEDS but missing from
+// ROLE_MCP_TOOL_ALLOWLIST would get the pooled server's ENTIRE tool surface with no bound at all,
+// silently reintroducing the exact gap this allowlist exists to close.
+testCase("every role with a declared pool need also declares a non-empty tool allowlist", () => {
+  for (const role of Object.keys(ROLE_MCP_NEEDS)) {
+    const allowlist = ROLE_MCP_TOOL_ALLOWLIST[role];
+    assert.ok(Array.isArray(allowlist) && allowlist.length > 0,
+      `role "${role}" declares a pool need but no tool allowlist — it would get the pool's entire tool surface`);
+  }
+});
+
+testCase("the tool allowlist names are non-empty strings with no duplicates, per role", () => {
+  for (const [role, tools] of Object.entries(ROLE_MCP_TOOL_ALLOWLIST)) {
+    assert.ok(tools.every((t) => typeof t === "string" && t.length > 0), `role "${role}" has a malformed tool name`);
+    assert.equal(new Set(tools).size, tools.length, `role "${role}" has a duplicate tool name`);
+  }
 });
 
 if (failed) {

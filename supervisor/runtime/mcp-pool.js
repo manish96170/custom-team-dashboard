@@ -26,7 +26,7 @@
 //   * No lazy-discovery/tool-catalog logic lives here — that is §21.2, a session-facing concern, not a
 //     process-lifecycle one. See PLAN.md §21.2 for what v1 of that turned out to actually need.
 
-import { spawnManaged, killProcessGroup } from "./spawn.js";
+import { spawnManaged, killProcessGroup, IDENTITY_TIMEOUT_MS } from "./spawn.js";
 import { verifyProcIdentity } from "./procinfo.js";
 import {
   claimPoolSlot, markPoolReady, markPoolFailed, attachToPool, detachAndMaybeDrain, markPoolStopped,
@@ -34,6 +34,7 @@ import {
 } from "../db/index.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -96,7 +97,18 @@ export function createMcpPool({ db, logger = console } = {}) {
     // is the one place a short poll is the right tool: spawning is inherently a "someone becomes the
     // spawner" race, and the DB-level claim above already makes that decision atomic — we're just
     // waiting for the winner's spawn to finish, not re-deciding who won.
-    for (let attempt = 0; attempt < 50; attempt += 1) {
+    //
+    // review-consolidated-2026-09-14.md finding 6: this used to be a FIXED 50×20ms ≈ 1s budget — but the
+    // WINNER's own spawn can legitimately take up to `IDENTITY_TIMEOUT_MS` (identity verification) plus
+    // `SOCKET_WAIT_ATTEMPTS × SOCKET_WAIT_INTERVAL_MS` (socket readiness) ≈ 7s, reproduced directly with
+    // a real delayed-bind socket server: the winner attached at ~2.1s while the loser had already thrown
+    // "timed out waiting for a joinable or spawnable slot" at ~1s — a perfectly healthy pooled server
+    // came up a second after the loser gave up on it. The loser's own budget is now derived from the
+    // SAME numbers the winner's spawn actually uses, not an independent guess that can fall short of it.
+    const ATTACH_WAIT_BUDGET_MS = IDENTITY_TIMEOUT_MS + (SOCKET_WAIT_ATTEMPTS * SOCKET_WAIT_INTERVAL_MS) + 2000;
+    const ATTACH_POLL_INTERVAL_MS = 20;
+    const attachDeadline = Date.now() + ATTACH_WAIT_BUDGET_MS;
+    for (let attempt = 0; Date.now() < attachDeadline; attempt += 1) {
       const claim = claimPoolSlot(db, { name, configHash });
       if (claim.claimed) {
         let spawned = null;
@@ -132,7 +144,7 @@ export function createMcpPool({ db, logger = console } = {}) {
       // once more before waiting, then retry the whole loop.
       const retry = attachToPool(db, { name, configHash, principalId, runId });
       if (retry.attached) return { attachmentId: retry.attachmentId, poolId: retry.pool.id, spawned: false, socketPath: retry.pool.socketPath };
-      await new Promise((r) => setTimeout(r, 20));
+      await new Promise((r) => setTimeout(r, ATTACH_POLL_INTERVAL_MS));
     }
     throw new Error(`mcp-pool: attach(${name}) timed out waiting for a joinable or spawnable slot`);
   }
@@ -151,6 +163,25 @@ export function createMcpPool({ db, logger = console } = {}) {
     return path.join(os.tmpdir(), `${poolId}.sock`);
   }
 
+  /** A single, bounded, real connect-then-close handshake — review-consolidated-2026-09-14.md finding
+   *  5's actual readiness proof. `fs.existsSync` alone cannot distinguish a live listening socket from
+   *  a regular file someone left at that path, or a socket a server bound and then crashed right after
+   *  (measured, real reproductions: both leave `existsSync` true and connecting fails — `ENOTSOCK` for
+   *  the regular-file case, `ECONNREFUSED` for the bind-then-exit case). */
+  function canConnect(socketPath) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const conn = net.connect(socketPath);
+      const settle = (ok) => { if (settled) return; settled = true; resolve(ok); };
+      conn.once("connect", () => { conn.end(); settle(true); });
+      conn.once("error", () => settle(false));
+      // A hung connect attempt (rare, but a socket handshake is not otherwise bounded) must not stall
+      // the whole readiness loop — treat it as "not ready yet" and let the outer loop's own attempt
+      // budget decide whether to keep trying.
+      setTimeout(() => { try { conn.destroy(); } catch { /* already gone */ } settle(false); }, SOCKET_WAIT_INTERVAL_MS);
+    });
+  }
+
   async function spawnOne(poolId, config) {
     const { command, args = [], env = {}, cwd } = config;
     const socketPath = socketPathFor(poolId);
@@ -163,6 +194,32 @@ export function createMcpPool({ db, logger = console } = {}) {
     const spawned = spawnManaged({
       command, args, cwd, env: { ...env, LEO_MCP_SOCKET_PATH: socketPath }, stdio: ["pipe", "pipe", "pipe"],
     });
+
+    // review-consolidated-2026-09-14.md finding 5: this listener is installed IMMEDIATELY, before ever
+    // awaiting identity or polling for the socket — Node does NOT replay a missed `exit` to a listener
+    // attached after the child already died (verified directly: a listener attached 600ms post-exit
+    // never fires), so a listener registered only after `markPoolReady` succeeded could permanently miss
+    // a death that happened during the wait itself. One listener does both jobs: it flags `died` for the
+    // readiness loop below to notice immediately, AND does the unconditional DB/handle cleanup whenever
+    // this process exits, at any point in its life — not just after this function returns successfully.
+    let died = false;
+    let dieInfo = null;
+    spawned.child.once("exit", (code, signal) => {
+      died = true;
+      dieInfo = { code, signal };
+      liveChildren.delete(poolId);
+      try {
+        markPoolFailed(db, poolId);
+      } catch (err) {
+        // MUST NOT THROW: this fires asynchronously, on the Node event loop's own schedule, arbitrarily
+        // long after the actual process death — including after a caller (e.g. a test) has already
+        // closed `db` and moved on. An uncaught throw inside an EventEmitter callback with no listener
+        // is FATAL to the whole process (confirmed: crashed the entire `npm test` run with "TypeError:
+        // The database connection is not open" when this fired post-teardown under load).
+        logger.warn?.(`[mcp-pool] could not record exit of pool ${poolId} (db likely already closed): ${err.message}`);
+      }
+    });
+
     const identity = await spawned.identity;
     if (!identity.verified) {
       try { spawned.child.kill("SIGKILL"); } catch { /* already gone */ }
@@ -171,47 +228,44 @@ export function createMcpPool({ db, logger = console } = {}) {
 
     // Verify the socket is ACTUALLY listening before ever telling a caller it can connect to it — same
     // "verify against the real OS, don't trust a fixed delay" discipline this codebase applies to git
-    // worktree claims and process identity elsewhere. A crashed/misbehaving server that never binds is a
-    // genuine, distinguishable failure, not something to guess past.
+    // worktree claims and process identity elsewhere. THREE checks, not one (finding 5): the path
+    // exists, it is genuinely a SOCKET (not a regular file some misconfigured process left there), and a
+    // real connect-then-close handshake actually succeeds (catches a server that bound and crashed
+    // before this loop got to it — `existsSync` alone would still report `true` for that stale file).
     let socketReady = false;
-    for (let attempt = 0; attempt < SOCKET_WAIT_ATTEMPTS; attempt += 1) {
-      if (fs.existsSync(socketPath)) { socketReady = true; break; }
-      if (spawned.child.exitCode !== null) break; // the process already died — no point waiting further
-      await new Promise((r) => setTimeout(r, SOCKET_WAIT_INTERVAL_MS));
+    for (let attempt = 0; attempt < SOCKET_WAIT_ATTEMPTS && !socketReady; attempt += 1) {
+      if (died) break; // the early exit listener above already caught this — no point waiting further
+      let isSocketFile = false;
+      try { isSocketFile = fs.existsSync(socketPath) && fs.statSync(socketPath).isSocket(); } catch { /* race with removal, retry */ }
+      if (isSocketFile && await canConnect(socketPath)) socketReady = true;
+      else await new Promise((r) => setTimeout(r, SOCKET_WAIT_INTERVAL_MS));
     }
     if (!socketReady) {
-      try { spawned.child.kill("SIGKILL"); } catch { /* already gone */ }
-      throw new Error(`mcp-pool: ${command} for pool ${poolId} never created its socket at ${socketPath} within ${SOCKET_WAIT_ATTEMPTS * SOCKET_WAIT_INTERVAL_MS}ms`);
+      if (!died) {
+        try { await killProcessGroup(identity.pgid, { graceMs: 1000 }); } catch (killErr) { logger.warn?.(`[mcp-pool] cleanup kill of ${poolId} after socket-wait timeout: ${killErr.message}`); }
+      }
+      throw new Error(
+        died
+          ? `mcp-pool: ${command} for pool ${poolId} exited (code=${dieInfo.code} signal=${dieInfo.signal}) before its socket at ${socketPath} became connectable`
+          : `mcp-pool: ${command} for pool ${poolId} never became connectable at ${socketPath} within ${SOCKET_WAIT_ATTEMPTS * SOCKET_WAIT_INTERVAL_MS}ms`,
+      );
     }
+
+    // review-consolidated-2026-09-14.md finding 12: a Node Unix socket is created mode 0755 by default —
+    // world-CONNECTABLE on any platform where the containing directory is itself shared (`TMPDIR=/tmp`
+    // on Linux/CI; macOS's per-user `os.tmpdir()` mitigates this locally but this must not depend on
+    // that). `0600` asserts the isolation directly rather than inheriting it from the platform's temp-dir
+    // policy — with no peer-credential check anywhere in this stack, this is the only boundary there is.
+    try { fs.chmodSync(socketPath, 0o600); } catch (err) { logger.warn?.(`[mcp-pool] could not chmod socket ${socketPath}: ${err.message}`); }
 
     const ready = markPoolReady(db, poolId, { pid: identity.pid, pgid: identity.pgid, lstart: identity.lstart, socketPath });
     if (!ready.updated) {
       // Someone else already marked this pool row past 'starting' — shouldn't happen (this function is
       // only reached by the caller that won the claim), but a spawned-and-orphaned process is worse than
       // a loud failure.
-      try { spawned.child.kill("SIGKILL"); } catch { /* already gone */ }
+      try { await killProcessGroup(identity.pgid, { graceMs: 1000 }); } catch (killErr) { logger.warn?.(`[mcp-pool] cleanup kill of ${poolId} after lost markPoolReady race: ${killErr.message}`); }
       throw new Error(`mcp-pool: pool ${poolId} was no longer 'starting' when spawn completed`);
     }
-    spawned.child.once("exit", () => {
-      // The process died on its own (crash, or a signal from outside this manager). Reflect it in the
-      // DB so a later attach doesn't trust a stale 'ready' row — reconciliation would eventually catch
-      // this too, but there's no reason to wait for a boot that may not come soon.
-      //
-      // MUST NOT THROW: this fires asynchronously, on the Node event loop's own schedule, arbitrarily
-      // long after the actual process death — including after a caller (e.g. a test) has already closed
-      // `db` and moved on. An uncaught throw inside an EventEmitter callback with no listener is FATAL to
-      // the whole process (confirmed: crashed the entire `npm test` run with "TypeError: The database
-      // connection is not open" when this fired post-teardown under load — the exact class of flake this
-      // file's own tests were written to catch, just in a path those tests hadn't reached yet). Same
-      // "best-effort, never throw from a fire-and-forget lifecycle hook" convention already used for the
-      // `killProcessGroup` catches just above.
-      liveChildren.delete(poolId);
-      try {
-        markPoolFailed(db, poolId);
-      } catch (err) {
-        logger.warn?.(`[mcp-pool] could not record exit of pool ${poolId} (db likely already closed): ${err.message}`);
-      }
-    });
     return spawned;
   }
 
@@ -312,9 +366,11 @@ export function createMcpPool({ db, logger = console } = {}) {
           continue;
         }
         markPoolFailed(db, pool.id);
+        try { fs.rmSync(socketPathFor(pool.id), { force: true }); } catch { /* best effort — finding 12 */ }
         results.push({ poolId: pool.id, name: pool.name, reconciledTo: "failed", reason: "orphan-from-previous-boot, killed" });
       } else {
         markPoolFailed(db, pool.id);
+        try { fs.rmSync(socketPathFor(pool.id), { force: true }); } catch { /* best effort — finding 12 */ }
         results.push({ poolId: pool.id, name: pool.name, reconciledTo: "failed", reason: `not verified-alive: ${identity.reason}` });
       }
     }
@@ -336,7 +392,12 @@ export function createMcpPool({ db, logger = console } = {}) {
   async function disposeAll({ graceMs = 1000 } = {}) {
     const results = [];
     for (const [poolId, entry] of [...liveChildren]) {
-      liveChildren.delete(poolId);
+      // review-consolidated-2026-09-14.md finding 7: the handle used to be deleted BEFORE the kill was
+      // even attempted — an unconfirmed kill (EPERM, a group that outlives the grace window) still left
+      // this manager believing it had already dropped ownership, so a real, still-resident MCP process
+      // holding real Jira/Slack/git credentials could survive shutdown with nothing tracking it and
+      // nothing warning about it. Same discipline `detach()` already has: only delete the handle once
+      // the kill is CONFIRMED.
       let killed = true;
       try {
         const pool = getPool(db, poolId);
@@ -349,10 +410,17 @@ export function createMcpPool({ db, logger = console } = {}) {
         logger.warn?.(`[mcp-pool] disposeAll kill of ${poolId}: ${err.message}`);
         killed = false;
       }
+      if (!killed) {
+        logger.warn?.(`[mcp-pool] disposeAll could not confirm ${poolId} is dead — leaving its handle live and its row unmarked, unlike every other reported result here`);
+        results.push({ poolId, killed: false });
+        continue;
+      }
+      liveChildren.delete(poolId);
       // Best-effort DB write — `shutdown()` calls this BEFORE `closeDb()` specifically so this succeeds,
       // but never let a write failure here block tearing down the next pool's real OS process.
-      try { if (killed) markPoolStopped(db, poolId); } catch { /* db may already be closing */ }
-      results.push({ poolId, killed });
+      try { markPoolStopped(db, poolId); } catch { /* db may already be closing */ }
+      try { fs.rmSync(socketPathFor(poolId), { force: true }); } catch { /* best effort — finding 12 */ }
+      results.push({ poolId, killed: true });
     }
     return results;
   }

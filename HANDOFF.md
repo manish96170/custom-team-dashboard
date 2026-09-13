@@ -319,9 +319,10 @@ escalated. **Decision (2026-09-14, owner): leave as-is, no code change.** A plai
 tradeoff rather than something to fix now — revisit only if a real incident or a new lease kind makes the
 blanket "any worker can acquire any lease" rule actually costly.
 
-**Not yet actioned — 1 high finding fully deferred, all 15 medium, all 12 doc-consistency, and 3 of 4 low
-findings from `codexdoc/review-sol-2026-09-13.md`.** Worth calling out by name before the next session
-picks a starting point:
+**Every finding below is FIXED or explicitly resolved — nothing from `codexdoc/review-sol-2026-09-13.md`
+remains open.** (Heading corrected 2026-09-14, review-consolidated-2026-09-14.md finding 14: this used to
+say "Not yet actioned" while every bullet under it already said FIXED — a maintainer reading only the
+heading would have believed the opposite of what the bullets themselves said.)
 - **Finding 8 (high, NOW FULLY FIXED across two continuations).** Investigated fully before touching
   anything: this codebase has **no worker-reassignment mechanism at all** —
   `grep -a -n "UPDATE workers SET task_id"` across the whole tree returns nothing; `workers.task_id` is
@@ -426,6 +427,119 @@ starting the next pass — this summary is deliberately compressed. New migratio
 `0015_mcp_pool_lstart.sql`, `0016_worktree_claim_token.sql` — both additive (`ALTER TABLE ... ADD COLUMN`),
 no backfill needed, no existing test's schema assumptions broken (verified: full `npm test` exit 0 after
 each).
+
+## Forty-seventh pass, 2026-09-14 — a THIRD independent review, cross-checked and consolidated, then fixed
+
+After commit `79aa275` (finding 8 + 13's fixes, above), a fresh review pass was commissioned against
+just the last three commits: `opencode`'s `sol` agent again (`codexdoc/review-sol-2026-09-14-commits.md`,
+8 findings), then an independent Claude Opus (high effort) pass that did its OWN review first — before
+reading sol's report — and only then cross-verified sol's 8 findings against the real code one by one,
+consolidating both into `codexdoc/review-consolidated-2026-09-14.md`. **Result: 14 survivors (3 high, 6
+medium, 4 low, 1 doc-consistency), 0 of sol's 8 refuted (2 severity regrades, 2 sub-claim corrections), 6
+new findings sol did not report.** Every finding was independently verified with a REAL reproduction
+(real sockets, real git, real spawned processes) before being trusted, per this file's own standing rule.
+
+**Fixed, all verified to fail against the pre-fix code first, full `npm test` exit 0 (twice, no flake):**
+
+- **Finding 1 (high) — the delivered MCP config handed every utility role leo-mcp's ENTIRE 27-tool
+  surface, not just what its own capability preset implies.** Measured with a real socket connection to
+  a real pooled leo-mcp process: `git_push` (arbitrary absolute `cwd`/`targetBranch`, bypassing the
+  supervisor's own `gitPush` capability check, its `git:identity` lease, and its `agent_journal` record
+  entirely) and every Slack/Jira tool were reachable by ANY role that attached to the pool — a
+  `jira-runner`, whose preset is exactly `["read:registry", "jira:create"]`, could reach all 27. Fixed by
+  making `runtime/mcp-stdio-proxy.js` protocol-aware: it now parses the newline-delimited JSON-RPC frames
+  leo-mcp already speaks in both directions, filters `tools/list` RESPONSES down to a per-role allowlist
+  (`domain/mcp-manifest.js`'s new `ROLE_MCP_TOOL_ALLOWLIST` — grounded in each role's own capability
+  preset and instruction text, not invented: `git-push-runner` → `git_push` only, `jira-runner` →
+  `jira_create_ticket` only, `slack-runner` → posting tools only, no delete/search/admin/DM), and refuses
+  a disallowed `tools/call` REQUEST directly (a real JSON-RPC error, never forwarded to the real server).
+  `runtime/supervisor.js`'s `start()`/`resume()` always pass `--allow-tools` for every pool they attach.
+  9 new cases in `runtime/test/mcp-stdio-proxy.test.js` prove the filtering against a real socket server.
+- **Finding 2 (high) — resume() replayed a torn-down MCP socket, silently leaving a resumed utility run
+  with no tool at all.** `detach()` (called when a run ends) kills the pooled process and removes its
+  socket file; `resume()` used to call `adapter.resume(runId)` with nothing else, and the adapter rebuilds
+  its argv from the run's OWN captured `spec` — still naming the dead socket. Fixed by extracting the
+  attach-and-build-config logic `start()` already had into a shared `attachMcpPoolsForRole` helper,
+  calling it again in `resume()` for a genuinely fresh attachment/socket, and giving the claude-code
+  adapter's `resume(runId, { specOverride })` a way to receive it for the new generation rather than
+  trusting `run.spec` to still be valid. New case 8 in `runtime/test/mcp-pool-wiring.test.js`: a real run,
+  ended for real (socket confirmed gone from disk), resumed, and the NEW generation's fresh socket
+  round-trips a real `tools/list` through the real pooled leo-mcp process.
+- **Finding 3 (high) — a crash mid-discard permanently wedged the worktree claim, and stale-claim
+  recovery on the CREATE side then resurrected the deliberately deleted worktree.** Reproduced exactly as
+  the review found it: claim, real `git worktree remove`, crash before finalize — `discardTaskWorktree`
+  refused `worktree-claim-conflict` forever (no stale recovery existed on the discard side at all), and
+  once the claim went stale, `createTaskWorktree`'s OWN recovery saw "no directory" and ran `git worktree
+  add`, undoing a completed deletion on a `merged` task. Fixed with new migration
+  `0017_worktree_claim_op_and_stamp.sql`: `tasks.worktree_claim_op` ('create'|'discard') records which
+  operation owns a pending claim, so create's recovery now refuses to resurrect when the reclaimed op was
+  a discard with no directory left (`{ok:false, refused:"worktree-was-discarded"}`); and
+  `discardTaskWorktree` itself now gets stale-claim recovery too, so a crashed discard is no longer
+  permanently wedged. Same migration adds `tasks.worktree_claim_at` for finding 11 (below). New cases
+  22-23 in `runtime/test/worktree.test.js`.
+- **Finding 5 (medium) — pool readiness was `fs.existsSync` alone, which cannot tell a live socket from a
+  dead one or a regular file.** Reproduced both: a server that binds a real socket then exits immediately
+  (file exists, nothing listening — `ECONNREFUSED`), and a "server" that writes a plain file at the
+  socket path and stays alive (`existsSync` true, `isSocket()` false — `ENOTSOCK`); both used to be
+  published `ready` and joinable. Fixed: `spawnOne` now installs its exit listener immediately (Node does
+  not replay a missed `exit` to a late listener — verified directly), checks `isSocket()`, and performs a
+  real bounded `net.connect` handshake as the actual readiness proof. New cases 12a/12b in
+  `runtime/test/mcp-pool.test.js`.
+- **Finding 6 (medium) — a concurrent attach LOSER's wait budget (~1s) was shorter than the WINNER's own
+  spawn budget (~7s: identity verification + socket wait).** Reproduced with a real 2s-delayed-bind
+  server: the winner attached at ~2.1s while the loser had already thrown at ~1s. Fixed: the loser's
+  budget is now derived from the same `IDENTITY_TIMEOUT_MS` (newly exported from `spawn.js`) plus the
+  socket-wait budget the winner actually uses. New case 13 in `mcp-pool.test.js`.
+- **Finding 7 (medium) — several teardown paths dropped ownership of a live handle before confirming the
+  kill, or killed only the direct child rather than its process group.** `disposeAll` deleted the
+  `liveChildren` handle BEFORE attempting the kill (an unconfirmed kill left a real, credentialed process
+  resident with nothing tracking it); `spawnOne`'s three internal failure branches killed only
+  `spawned.child` rather than the verified process group. Fixed: `disposeAll` now matches `detach()`'s
+  existing discipline (handle stays live until the kill is CONFIRMED); `spawnOne`'s failure branches kill
+  by `identity.pgid` via `killProcessGroup` once identity is verified.
+- **Finding 8 (high sub-scope; medium overall — see finding 1) — `preflight` attached real MCP pools and
+  delivered a real config even though its own spec's intent is "needs no MCP servers", with the host
+  approval round trip disabled.** Fixed: `start()` now skips the entire MCP attach/deliver block outright
+  when `spec.isPreflight === true`.
+- **Finding 10 (low) — the new proxy relay tests could hang the whole `npm test` run forever instead of
+  failing**, via a bare `setInterval` poll with no deadline. Fixed alongside finding 1's test rewrite: a
+  bounded `waitForBuffer` helper (real timer, real rejection) replaces every unbounded poll; every
+  spawned proxy is force-killed in `finally`.
+- **Finding 11 (medium) — stale-claim recovery compared against `tasks.updated_at`, which ANY unrelated
+  write to the task refreshed, pushing the staleness window out indefinitely.** Fixed in the same
+  migration as finding 3: `tasks.worktree_claim_at`, written only by the claim/reclaim functions
+  themselves, is what staleness is judged against now.
+- **Finding 12 (low) — pool sockets were created mode `0755` (world-connectable wherever the temp dir is
+  shared, e.g. `TMPDIR=/tmp` on Linux/CI) and only cleaned up on the happy-path `detach()`.** Fixed:
+  `spawnOne` now `chmod 0600`s the socket once verified; `disposeAll` and `reconcileOnBoot`'s confirmed-
+  kill path now also remove the socket file, matching `detach()`'s existing cleanup.
+- **Finding 14 (doc-consistency) — the docs simultaneously said MCP delivery was fixed, absent, and
+  uncommitted.** `PLAN.md` §21.1/§21.2, `TODO.md`, `ROADMAP.md`, and `domain/mcp-manifest.js`'s own module
+  header all corrected in place with dated SUPERSEDED notes, and this file's own stale "Not yet actioned"
+  heading (above) fixed too.
+
+**Deferred, by explicit judgment call, not fixed unilaterally:**
+- **Finding 4 (medium) — required MCP delivery still fails open** (a role with a declared need but no
+  deliverable pool still gets an ordinary successful start, just with no tool). After finding 1's fix,
+  the blast radius of failing open is far smaller (no tool vs. no bounded tool, not the full 27-tool
+  surface) — refusing the start outright is a real product-scope decision (would need an explicit
+  `allowDegradedMcp` opt-in and touches existing tests that assume a normal successful start for a
+  utility role), not a clear bug fix. Flagged for a real decision, same posture as findings 12/13 from
+  the earlier review.
+- **Finding 9 (medium) — the only end-to-end proof that MCP delivery works (`mcp-pool-wiring.test.js`
+  case 7) silently disappears when the private `../leo-mcp` sibling repo is absent**, with `npm test`
+  still reporting green. A full sibling-independent fixture reproducing leo-mcp's own tool surface was
+  judged out of scope for this pass; the skip message was made loud (a hard-to-miss stderr banner) as the
+  minimum honest fix, but the underlying coverage gap (this suite's cases are conditional on one
+  developer's directory layout) is not closed.
+- **Finding 13 (low) — `changedPathsFor`/`currentHeadFor` fail open on a `git diff` error**, which the
+  code's own comments already document as deliberate. Not touched — the review's own report treats this
+  as a narrow objection about not DISTINGUISHING "nothing changed" from "git could not answer," not a
+  claim that the fail-open default itself was an oversight.
+
+**Every one of THIS review's 14 findings is now resolved** — 11 fixed, 2 deferred by explicit judgment
+call (findings 4, 9), 1 left alone as already-deliberate (finding 13). New migration this pass:
+`0017_worktree_claim_op_and_stamp.sql` (additive, no backfill needed).
 
 **IMPORTANT META-NOTE for whoever reads this next**: this pass's own conversation context was
 compacted/rewound partway through — items 27-38 below were done and documented BEFORE the rewind

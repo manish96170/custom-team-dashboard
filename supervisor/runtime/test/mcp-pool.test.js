@@ -423,4 +423,80 @@ await runTest("mcp server pooling", async () => {
       rmScratchDir(stateDir);
     }
   }
+
+  // ── 12 ───────────────────────────────────────────────────────────────────────────
+  // review-consolidated-2026-09-14.md finding 5: `fs.existsSync` alone is not proof of a live listening
+  // socket. Two real reproductions: (a) a server that binds a real socket then exits immediately — the
+  // file exists, but nothing is listening; (b) a "server" that writes a REGULAR FILE at the socket path
+  // and stays alive — `existsSync` is true, but it is not a socket at all. Both must make `attach()`
+  // fail loudly (never publish `ready` for an unusable endpoint), not silently succeed.
+  {
+    const stateDir = makeScratchDir("mcp-pool-dead-readiness");
+    let db;
+    try {
+      db = openDb({ stateDir });
+      const pool = createMcpPool({ db, logger: quiet });
+
+      // (a) bind-then-exit
+      const bindThenExit = {
+        command: process.execPath,
+        args: ["-e", "require('net').createServer(()=>{}).listen(process.env.LEO_MCP_SOCKET_PATH, () => process.exit(7))"],
+      };
+      await assert.rejects(
+        pool.attach("bind-then-exit", bindThenExit),
+        /never became connectable|exited/,
+        "a server that binds its socket then exits must never be published as ready",
+      );
+      const deadRow = db.prepare(`SELECT status FROM mcp_pool WHERE name = 'bind-then-exit'`).get();
+      assert.notEqual(deadRow.status, "ready", "the row for a bind-then-exit server must never reach 'ready'");
+      console.log("  12a. a server that binds its socket then exits immediately never gets published as ready");
+
+      // (b) regular file at the socket path, process stays alive
+      const regularFile = {
+        command: process.execPath,
+        args: ["-e", "require('fs').writeFileSync(process.env.LEO_MCP_SOCKET_PATH, 'not a socket'); setInterval(() => {}, 60000)"],
+      };
+      await assert.rejects(
+        pool.attach("regular-file-not-socket", regularFile),
+        /never became connectable|exited/,
+        "a regular file at the socket path (not a real socket) must never be published as ready",
+      );
+      const fileRow = db.prepare(`SELECT status FROM mcp_pool WHERE name = 'regular-file-not-socket'`).get();
+      assert.notEqual(fileRow.status, "ready", "the row for a regular-file endpoint must never reach 'ready'");
+      console.log("  12b. a regular file sitting at the socket path (not a real socket) never gets published as ready either");
+    } finally {
+      try { closeDb(db); } catch { /* already closed */ }
+      rmScratchDir(stateDir);
+    }
+  }
+
+  // ── 13 ───────────────────────────────────────────────────────────────────────────
+  // review-consolidated-2026-09-14.md finding 6: a LOSER's own wait budget used to be far shorter than
+  // the WINNER's real spawn budget (~1s vs ~7s) — a perfectly healthy pooled server that legitimately
+  // takes a couple of seconds to bind would still make every concurrent loser time out and proceed with
+  // no MCP tool at all. A real delayed-bind socket server proves the loser now waits long enough.
+  {
+    const stateDir = makeScratchDir("mcp-pool-delayed-bind-concurrency");
+    let db;
+    try {
+      db = openDb({ stateDir });
+      const pool = createMcpPool({ db, logger: quiet });
+      const delayedBind = {
+        command: process.execPath,
+        args: ["-e", "setTimeout(() => require('net').createServer(() => {}).listen(process.env.LEO_MCP_SOCKET_PATH, () => setInterval(() => {}, 60000)), 2000)"],
+      };
+      const [a, b] = await Promise.all([
+        pool.attach("delayed-bind", delayedBind),
+        pool.attach("delayed-bind", delayedBind),
+      ]);
+      assert.equal(a.poolId, b.poolId, "both concurrent attachers must land on the same pool row");
+      assert.ok(a.spawned !== b.spawned, "exactly one of the two must have been the spawner, the other a joiner");
+      const finalPool = getPool(db, a.poolId);
+      assert.equal(finalPool.status, "ready", `expected the delayed-bind server to eventually be marked ready, got ${JSON.stringify(finalPool)}`);
+      console.log("  13. a concurrent LOSER now waits long enough for a real, legitimately slow (~2s) bind to succeed, instead of timing out at ~1s");
+    } finally {
+      try { closeDb(db); } catch { /* already closed */ }
+      rmScratchDir(stateDir);
+    }
+  }
 });

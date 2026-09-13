@@ -400,7 +400,7 @@ await runTest("shared per-task worktree lifecycle", async () => {
         previousValue: null, repoPath: resolvedRepoPath, branch: "ctd/t-stale-redo",
       });
       assert.equal(redoClaim.claimed, true);
-      db.prepare("UPDATE tasks SET updated_at = ? WHERE id = 't-stale-redo'")
+      db.prepare("UPDATE tasks SET worktree_claim_at = ? WHERE id = 't-stale-redo'")
         .run(new Date(Date.now() - 10 * 60_000).toISOString());
 
       const recoveredRedo = await supervisor.createTaskWorktree("t-stale-redo", { repoPath: repoDir });
@@ -423,7 +423,7 @@ await runTest("shared per-task worktree lifecycle", async () => {
       execFileSync("git", ["worktree", "add", "-b", "ctd/t-stale-adopt", preCreatedPath], {
         cwd: repoDir, stdio: ["ignore", "pipe", "pipe"],
       });
-      db.prepare("UPDATE tasks SET updated_at = ? WHERE id = 't-stale-adopt'")
+      db.prepare("UPDATE tasks SET worktree_claim_at = ? WHERE id = 't-stale-adopt'")
         .run(new Date(Date.now() - 10 * 60_000).toISOString());
 
       const listedBefore = git(repoDir, ["worktree", "list"]).trim().split("\n").filter(Boolean).length;
@@ -699,6 +699,79 @@ await runTest("shared per-task worktree lifecycle", async () => {
       const afterRow = db.prepare("SELECT ended_at FROM runs WHERE run_id = 'r-resume-terminal'").get();
       assert.ok(afterRow.ended_at, "a refused resume must not have reopened the run row");
       console.log("  21. resume refuses to reopen a run whose task is already terminal, without ever reaching the adapter");
+    }
+
+    // ── 22 ───────────────────────────────────────────────────────────────────────────
+    // review-consolidated-2026-09-14.md finding 3: a crash mid-discard (real `git worktree remove`
+    // already ran, but the claim never finalized to NULL) used to leave a GENERIC pending marker with
+    // no record of which operation owned it. Once that claim went stale, `createTaskWorktree`'s own
+    // recovery saw "no directory at the deterministic path" and concluded a `create` never got that far
+    // — so it ran `git worktree add` and REVERSED a deliberate, already-completed deletion. Simulating
+    // the crash as the exact row state a claim-then-remove death leaves (claim, real `git worktree
+    // remove`, then simply never calling finalize — no code path to fake this, so it's done for real).
+    {
+      createTask(db, { id: "t-crashed-discard", title: "crashed discard resurrection", type: "feature" });
+      const created = await supervisor.createTaskWorktree("t-crashed-discard", { repoPath: repoDir });
+      assert.equal(created.created, true);
+      db.prepare("UPDATE tasks SET state = 'merged' WHERE id = 't-crashed-discard'").run();
+
+      const crashClaim = claimTaskWorktreeSlot(db, "t-crashed-discard", {
+        previousValue: created.worktreeId, repoPath: repoDir, branch: created.branch, op: "discard",
+      });
+      assert.equal(crashClaim.claimed, true, "precondition: the simulated crashed discard must actually hold the claim");
+      const repoRootForRemove = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: created.worktreeId, encoding: "utf8" }).trim();
+      execFileSync("git", ["worktree", "remove", "--force", created.worktreeId], { cwd: repoRootForRemove });
+      assert.equal(fs.existsSync(created.worktreeId), false, "precondition: the crashed process's own git worktree remove really ran");
+      // Never finalized — this IS the crash: the row is stuck on the pending marker with no worktree on
+      // disk, `worktree_claim_op` still says 'discard'.
+
+      const wedgedRow = db.prepare("SELECT worktree_id, worktree_claim_op FROM tasks WHERE id = 't-crashed-discard'").get();
+      assert.equal(wedgedRow.worktree_id, WORKTREE_CLAIM_PENDING, "precondition: the row is genuinely wedged on the pending marker");
+      assert.equal(wedgedRow.worktree_claim_op, "discard");
+
+      const immediateRetry = await supervisor.discardTaskWorktree("t-crashed-discard", { actor: "owner" });
+      assert.equal(immediateRetry.ok, false);
+      assert.equal(immediateRetry.refused, "worktree-claim-conflict", "not yet stale — must refuse, not recover early");
+
+      // Backdate the claim past the stale window, same technique the existing crashed-CREATE test uses.
+      db.prepare("UPDATE tasks SET worktree_claim_at = ? WHERE id = 't-crashed-discard'")
+        .run(new Date(Date.now() - 120_000).toISOString());
+
+      const staleRetry = await supervisor.createTaskWorktree("t-crashed-discard", { repoPath: repoDir });
+      assert.equal(staleRetry.ok, false,
+        `createTaskWorktree must REFUSE to recreate a worktree a crashed DISCARD already deleted, got: ${JSON.stringify(staleRetry)}`);
+      assert.equal(staleRetry.refused, "worktree-was-discarded");
+      assert.equal(fs.existsSync(created.worktreeId), false, "the deleted worktree must stay deleted — createTaskWorktree must not have run git worktree add");
+      const rowAfterRefusedCreate = db.prepare("SELECT worktree_id FROM tasks WHERE id = 't-crashed-discard'").get();
+      assert.equal(rowAfterRefusedCreate.worktree_id, null, "the refused recovery must still have finalized the row to NULL, not left it wedged");
+      console.log("  22. createTaskWorktree's stale-claim recovery refuses to resurrect a worktree a crashed discard already deleted, and unwedges the row instead");
+    }
+
+    // ── 23 ───────────────────────────────────────────────────────────────────────────
+    // The other half of finding 3: `discardTaskWorktree` itself gets stale-claim recovery too, so a
+    // crashed discard is not permanently wedged forever (the pre-fix behavior: `worktree-claim-conflict`
+    // no matter how long you wait, since `reclaimStaleTaskWorktreeClaim` had exactly one caller).
+    {
+      createTask(db, { id: "t-crashed-discard-2", title: "crashed discard self-recovery", type: "feature" });
+      const created2 = await supervisor.createTaskWorktree("t-crashed-discard-2", { repoPath: repoDir });
+      db.prepare("UPDATE tasks SET state = 'merged' WHERE id = 't-crashed-discard-2'").run();
+      const crashClaim2 = claimTaskWorktreeSlot(db, "t-crashed-discard-2", {
+        previousValue: created2.worktreeId, repoPath: repoDir, branch: created2.branch, op: "discard",
+      });
+      assert.equal(crashClaim2.claimed, true);
+      const repoRootForRemove2 = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: created2.worktreeId, encoding: "utf8" }).trim();
+      execFileSync("git", ["worktree", "remove", "--force", created2.worktreeId], { cwd: repoRootForRemove2 });
+      db.prepare("UPDATE tasks SET worktree_claim_at = ? WHERE id = 't-crashed-discard-2'")
+        .run(new Date(Date.now() - 120_000).toISOString());
+
+      const selfRecovered = await supervisor.discardTaskWorktree("t-crashed-discard-2", { actor: "owner" });
+      assert.equal(selfRecovered.discarded, true, `expected discardTaskWorktree to finish its own crashed claim, got ${JSON.stringify(selfRecovered)}`);
+      assert.equal(selfRecovered.recoveredFromCrashedClaim, true);
+      const finalRow = db.prepare("SELECT worktree_id, worktree_claim_token, worktree_claim_op FROM tasks WHERE id = 't-crashed-discard-2'").get();
+      assert.equal(finalRow.worktree_id, null);
+      assert.equal(finalRow.worktree_claim_token, null, "no claim must be left dangling after self-recovery");
+      assert.equal(finalRow.worktree_claim_op, null);
+      console.log("  23. discardTaskWorktree can now reclaim and finish its OWN crashed claim, instead of refusing worktree-claim-conflict forever");
     }
   } finally {
     try { await supervisor?.shutdown({ timeoutMs: 3000 }); } catch { /* best effort */ }

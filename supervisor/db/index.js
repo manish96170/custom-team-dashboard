@@ -564,7 +564,7 @@ export const WORKTREE_CLAIM_PENDING = " pending-worktree-claim ";
  * for the same task can be refused while the FIRST caller's claim is still pending, not only once it
  * has already finalized.
  */
-export function claimTaskWorktreeSlot(db, taskId, { previousValue, repoPath, branch, now } = {}) {
+export function claimTaskWorktreeSlot(db, taskId, { previousValue, repoPath, branch, op, now } = {}) {
   const ts = now ?? nowIso();
   const tx = db.transaction(() => {
     const row = db.prepare(`SELECT worktree_id FROM tasks WHERE id = ?`).get(taskId);
@@ -577,9 +577,13 @@ export function claimTaskWorktreeSlot(db, taskId, { previousValue, repoPath, bra
     // `reclaimStaleTaskWorktreeClaim`) can never resolve a claim that is no longer its own, even though
     // the pending marker text itself is unchanged.
     const claimToken = crypto.randomUUID();
+    // review-consolidated-2026-09-14.md finding 3: `op` ('create' | 'discard') records WHICH operation
+    // owns this claim, and `worktree_claim_at` (finding 11) is a claim-specific stamp nothing else ever
+    // touches — see this migration's own comment (0017) for why both matter.
     db.prepare(
-      `UPDATE tasks SET worktree_id = ?, branch = ?, worktree_repo_path = ?, worktree_claim_token = ?, updated_at = ? WHERE id = ?`,
-    ).run(WORKTREE_CLAIM_PENDING, branch ?? null, repoPath ?? null, claimToken, ts, taskId);
+      `UPDATE tasks SET worktree_id = ?, branch = ?, worktree_repo_path = ?, worktree_claim_token = ?, `
+        + `worktree_claim_op = ?, worktree_claim_at = ?, updated_at = ? WHERE id = ?`,
+    ).run(WORKTREE_CLAIM_PENDING, branch ?? null, repoPath ?? null, claimToken, op ?? null, ts, ts, taskId);
     return { claimed: true, claimToken };
   });
   return tx.immediate();
@@ -591,7 +595,9 @@ export function claimTaskWorktreeSlot(db, taskId, { previousValue, repoPath, bra
 export function finalizeTaskWorktreeSlot(db, taskId, { worktreeId, branch, repoPath, claimToken, now } = {}) {
   const ts = now ?? nowIso();
   const info = db.prepare(
-    `UPDATE tasks SET worktree_id = ?, branch = ?, worktree_repo_path = ?, worktree_claim_token = NULL, updated_at = ? WHERE id = ? AND worktree_id = ? AND worktree_claim_token = ?`,
+    `UPDATE tasks SET worktree_id = ?, branch = ?, worktree_repo_path = ?, worktree_claim_token = NULL, `
+      + `worktree_claim_op = NULL, worktree_claim_at = NULL, updated_at = ? `
+      + `WHERE id = ? AND worktree_id = ? AND worktree_claim_token = ?`,
   ).run(worktreeId, branch, repoPath ?? null, ts, taskId, WORKTREE_CLAIM_PENDING, claimToken ?? null);
   return { finalized: info.changes === 1 };
 }
@@ -602,7 +608,9 @@ export function finalizeTaskWorktreeSlot(db, taskId, { worktreeId, branch, repoP
 export function releaseTaskWorktreeClaim(db, taskId, { previousValue, previousBranch, previousRepoPath, claimToken, now } = {}) {
   const ts = now ?? nowIso();
   const info = db.prepare(
-    `UPDATE tasks SET worktree_id = ?, branch = ?, worktree_repo_path = ?, worktree_claim_token = NULL, updated_at = ? WHERE id = ? AND worktree_id = ? AND worktree_claim_token = ?`,
+    `UPDATE tasks SET worktree_id = ?, branch = ?, worktree_repo_path = ?, worktree_claim_token = NULL, `
+      + `worktree_claim_op = NULL, worktree_claim_at = NULL, updated_at = ? `
+      + `WHERE id = ? AND worktree_id = ? AND worktree_claim_token = ?`,
   ).run(previousValue ?? null, previousBranch ?? null, previousRepoPath ?? null, ts, taskId, WORKTREE_CLAIM_PENDING, claimToken ?? null);
   return { released: info.changes === 1 };
 }
@@ -612,27 +620,36 @@ export function releaseTaskWorktreeClaim(db, taskId, { previousValue, previousBr
  * crashed-creator deadlock `codexdoc/review-luna-2026-09-11.md` finding 6 describes: the winning CAS
  * caller died after `claimTaskWorktreeSlot` and before `finalizeTaskWorktreeSlot`/
  * `releaseTaskWorktreeClaim`, so every later caller polled `worktree-claim-pending` forever with no
- * recovery path. Atomic inside `BEGIN IMMEDIATE`, same pattern as the claim itself: only refreshes
- * `updated_at` (the claim marker itself is untouched) so a second, concurrent reclaimer's own read
- * lands on a freshly-stamped row and correctly refuses as "not stale" rather than double-reclaiming.
+ * recovery path. Atomic inside `BEGIN IMMEDIATE`, same pattern as the claim itself.
+ *
+ * review-consolidated-2026-09-14.md finding 11: staleness is judged against `worktree_claim_at` — a
+ * stamp ONLY this function and `claimTaskWorktreeSlot` ever write — not `updated_at`, which any
+ * unrelated write to the task row (a state transition, a title edit) would otherwise refresh, pushing
+ * the staleness window out indefinitely and leaving a genuinely crashed claim unrecoverable forever.
+ * Reclaiming refreshes `worktree_claim_at` too (so a second, concurrent reclaimer's own read lands on a
+ * freshly-stamped row and correctly refuses as "not stale" rather than double-reclaiming) but leaves
+ * `worktree_claim_op` UNCHANGED — it identifies what the DEAD claimant was doing, which the reclaimer
+ * needs to decide how to recover, and is returned here so the caller doesn't need a second read.
  * The caller that wins this still has to decide, by inspecting the filesystem, whether the dead
  * claimant already finished the real git work before it died — this function only re-opens the door.
  */
 export function reclaimStaleTaskWorktreeClaim(db, taskId, { staleBeforeIso, now } = {}) {
   const ts = now ?? nowIso();
   const tx = db.transaction(() => {
-    const row = db.prepare(`SELECT worktree_id, updated_at FROM tasks WHERE id = ?`).get(taskId);
+    const row = db.prepare(`SELECT worktree_id, worktree_claim_at, worktree_claim_op FROM tasks WHERE id = ?`).get(taskId);
     if (!row) return { reclaimed: false, reason: "no-such-task" };
     if (row.worktree_id !== WORKTREE_CLAIM_PENDING) return { reclaimed: false, reason: "not-pending" };
-    if (row.updated_at >= staleBeforeIso) return { reclaimed: false, reason: "not-stale" };
+    // A pre-0017 row (or one claimed before this column existed) has no `worktree_claim_at` — fall back
+    // to refusing rather than treating a NULL stamp as infinitely stale.
+    if (!row.worktree_claim_at || row.worktree_claim_at >= staleBeforeIso) return { reclaimed: false, reason: "not-stale" };
     // review-sol-2026-09-13.md finding 9: mint a NEW claim token here, replacing whatever the original
     // (presumed-dead) claimant held. That original claimant, if it was only slow rather than actually
     // dead and wakes up later to call `finalizeTaskWorktreeSlot`/`releaseTaskWorktreeClaim` with ITS OLD
     // token, now fails the exact-token match instead of silently resolving a claim that is no longer
     // its own — the reclaimer below is the only party that can finalize or release from this point on.
     const claimToken = crypto.randomUUID();
-    db.prepare(`UPDATE tasks SET worktree_claim_token = ?, updated_at = ? WHERE id = ?`).run(claimToken, ts, taskId);
-    return { reclaimed: true, claimToken };
+    db.prepare(`UPDATE tasks SET worktree_claim_token = ?, worktree_claim_at = ?, updated_at = ? WHERE id = ?`).run(claimToken, ts, ts, taskId);
+    return { reclaimed: true, claimToken, op: row.worktree_claim_op ?? null };
   });
   return tx.immediate();
 }

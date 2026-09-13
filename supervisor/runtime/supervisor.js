@@ -136,7 +136,7 @@ import { runConformance, formatReport } from "../conformance/suite.js";
 import { reconcileOnBoot, reap as reapRun } from "./reconcile.js";
 import { readProcInfo } from "./procinfo.js";
 import { createMcpPool } from "./mcp-pool.js";
-import { manifestForRole, ROLE_MCP_NEEDS } from "../domain/mcp-manifest.js";
+import { manifestForRole, ROLE_MCP_NEEDS, ROLE_MCP_TOOL_ALLOWLIST } from "../domain/mcp-manifest.js";
 import { poolConfigFor } from "../config/mcp-pools.js";
 
 /** turn.end status (derived by the pump) -> the `runs.exit_reason` written when the
@@ -1102,6 +1102,54 @@ export function createSupervisor({
     }
   }
 
+  /**
+   * Attach to every pooled MCP server a `role` declares (`ROLE_MCP_NEEDS`), and build the real
+   * `spec.mcpConfig`-shaped `{ mcpServers }` object for whichever of them the current harness can
+   * actually be handed (`canDeliverMcpConfig`) — extracted from `start()` (review-consolidated-
+   * 2026-09-14.md finding 2) so `resume()` can call the exact same logic for a NEW generation, rather
+   * than replaying whatever `spec.mcpConfig` generation 1 happened to have (which, by the time a
+   * resume happens, names a socket `detach()` has already torn down and removed).
+   *
+   * review-consolidated-2026-09-14.md finding 1: every entry this builds also carries `--allow-tools`,
+   * bounding the pooled server's tool surface to exactly what `ROLE_MCP_TOOL_ALLOWLIST` declares for
+   * this role — attaching to a pool no longer means reaching its ENTIRE tool surface.
+   */
+  async function attachMcpPoolsForRole(role, { principalId, canDeliverMcpConfig, harnessId, workerId } = {}) {
+    const mcpAttachmentIds = [];
+    const mcpServersForConfig = {};
+    const declaredMcpNeeds = ROLE_MCP_NEEDS[role] ?? [];
+    if (!declaredMcpNeeds.length) return { mcpAttachmentIds, mcpServersForConfig };
+    const registeredConfigs = {};
+    for (const name of declaredMcpNeeds) {
+      if (poolConfigFor(name, { stateDir: stateDirOf() })) registeredConfigs[name] = name;
+    }
+    const manifest = manifestForRole(role, { registeredConfigs });
+    if (manifest.missing.length) {
+      logger.warn?.(`[supervisor] role "${role}" declares MCP need(s) [${manifest.missing.join(", ")}] with no registered pool config`);
+    }
+    for (const poolName of manifest.pools) {
+      const poolConfig = poolConfigFor(poolName, { stateDir: stateDirOf() });
+      if (!poolConfig) continue; // already warned above via `manifest.missing`
+      try {
+        const attached = await mcpPool.attach(poolName, poolConfig, { principalId: principalId ?? null, runId: null });
+        mcpAttachmentIds.push(attached.attachmentId);
+        if (canDeliverMcpConfig && attached.socketPath) {
+          const allowedTools = ROLE_MCP_TOOL_ALLOWLIST[role] ?? [];
+          const args = [MCP_STDIO_PROXY_PATH, "--socket", attached.socketPath];
+          if (allowedTools.length) args.push("--allow-tools", allowedTools.join(","));
+          mcpServersForConfig[poolName] = { command: process.execPath, args };
+        } else if (!canDeliverMcpConfig) {
+          logger.warn?.(`[supervisor] harness ${harnessId} cannot deliver an mcpConfig (mcpConfigDelivery: false) — run for ${workerId} attaches to pool "${poolName}" for bookkeeping only, with no usable tool`);
+        }
+      } catch (err) {
+        // Non-fatal: a utility-task run that can't attach to its declared pool still starts (it just
+        // won't have that tool), logged rather than failing the whole run/resume over a pooling concern.
+        logger.warn?.(`[supervisor] run for ${workerId} could not attach to mcp pool "${poolName}": ${err.message}`);
+      }
+    }
+    return { mcpAttachmentIds, mcpServersForConfig };
+  }
+
   async function start({ harnessId, workerId, spec }) {
     if (!harnessId) throw new Error("start: harnessId is required");
     if (!workerId) throw new Error("start: workerId is required");
@@ -1153,55 +1201,22 @@ export function createSupervisor({
     // spawns — the attach/detach LIFECYCLE bookkeeping is real and tested (`mcp-pool.js`,
     // `mcp-pool-wiring.test.js`).
     //
-    // CORRECTED 2026-09-14 (review-sol-2026-09-13.md finding 13, real transport delivery built) — this
-    // used to stop at the bookkeeping above, deliberately never setting `spec.mcpConfig`, because no
-    // probe in this repo had measured what a genuinely valid `--mcp-config` VALUE looks like for a
-    // pooled server with no on-disk config file. That has now been measured directly against the
-    // installed `claude` CLI: `--mcp-config` accepts a real JSON string (not just a file path), and only
-    // three transport types (stdio/sse/http) — none of which describe a raw Unix socket. So this does
-    // NOT point `--mcp-config` at the pool's socket; it points a `--mcp-config` stdio entry at
-    // `mcp-stdio-proxy.js`, a tiny script THIS repo controls that does nothing but relay bytes to that
-    // socket — a claim fully within the one transport type actually verified, not a guess at what the
-    // pooled server's own transport means to the harness. Gated on `adapter.capabilities?.().
-    // mcpConfigDelivery` (`conformance/matrix.js`) so a harness that cannot honour this (opencode: its
-    // shared process has no notion of a per-run environment at all) is never handed one, exactly as
-    // `worker-env.js` already refuses `mcpConfig` combined with `envProfile: 'inherit'` for the same
-    // reason — declare the limit, don't silently drop or crash on it.
-    const mcpAttachmentIds = [];
-    const mcpServersForConfig = {};
+    // review-consolidated-2026-09-14.md finding 8: a preflight's whole design constraint is being cheap
+    // and needing no MCP servers at all (`spec.isPreflight`'s own intent) — spawning/attaching a real
+    // pooled process for one anyway paid its full teardown cost for nothing, AND did so with the host
+    // approval round trip disabled (`approvalMode: 'off'`), the one configuration in the tree where a
+    // delivered tool surface would have no approval prompt in front of it at all. Skip entirely.
     const workerRow = database.prepare(`SELECT role FROM workers WHERE worker_id = ?`).get(workerId);
-    const declaredMcpNeeds = ROLE_MCP_NEEDS[workerRow?.role] ?? [];
-    if (declaredMcpNeeds.length) {
-      const registeredConfigs = {};
-      for (const name of declaredMcpNeeds) {
-        if (poolConfigFor(name, { stateDir: stateDirOf() })) registeredConfigs[name] = name;
-      }
-      const manifest = manifestForRole(workerRow.role, { registeredConfigs });
-      if (manifest.missing.length) {
-        logger.warn?.(`[supervisor] role "${workerRow.role}" declares MCP need(s) [${manifest.missing.join(", ")}] with no registered pool config`);
-      }
-      const canDeliverMcpConfig = adapter.capabilities?.()?.mcpConfigDelivery === "file-or-json-string";
-      for (const poolName of manifest.pools) {
-        const poolConfig = poolConfigFor(poolName, { stateDir: stateDirOf() });
-        if (!poolConfig) continue; // already warned above via `manifest.missing`
-        try {
-          const attached = await mcpPool.attach(poolName, poolConfig, { principalId: workerPrincipal?.id ?? null, runId: null });
-          mcpAttachmentIds.push(attached.attachmentId);
-          if (canDeliverMcpConfig && attached.socketPath) {
-            mcpServersForConfig[poolName] = { command: process.execPath, args: [MCP_STDIO_PROXY_PATH, "--socket", attached.socketPath] };
-          } else if (!canDeliverMcpConfig) {
-            logger.warn?.(`[supervisor] harness ${harnessId} cannot deliver an mcpConfig (mcpConfigDelivery: ${JSON.stringify(adapter.capabilities?.()?.mcpConfigDelivery)}) — run for ${workerId} attaches to pool "${poolName}" for bookkeeping only, with no usable tool`);
-          }
-        } catch (err) {
-          // Non-fatal, same posture as a missing principal above: a utility-task run that can't attach
-          // to its declared pool still starts (it just won't have that tool), logged rather than
-          // failing the whole run over a pooling concern.
-          logger.warn?.(`[supervisor] run for ${workerId} could not attach to mcp pool "${poolName}": ${err.message}`);
-        }
-      }
-      if (Object.keys(mcpServersForConfig).length) {
-        spec = { ...spec, mcpConfig: [...(spec.mcpConfig ? [].concat(spec.mcpConfig) : []), JSON.stringify({ mcpServers: mcpServersForConfig })] };
-      }
+    const mcpAttach = spec.isPreflight
+      ? { mcpAttachmentIds: [], mcpServersForConfig: {} }
+      : await attachMcpPoolsForRole(workerRow?.role, {
+        principalId: workerPrincipal?.id ?? null,
+        canDeliverMcpConfig: adapter.capabilities?.()?.mcpConfigDelivery === "file-or-json-string",
+        harnessId, workerId,
+      });
+    const mcpAttachmentIds = mcpAttach.mcpAttachmentIds;
+    if (Object.keys(mcpAttach.mcpServersForConfig).length) {
+      spec = { ...spec, mcpConfig: [...(spec.mcpConfig ? [].concat(spec.mcpConfig) : []), JSON.stringify({ mcpServers: mcpAttach.mcpServersForConfig })] };
     }
 
     // `mcpAttachmentIds` (if any) were made BEFORE this call, because the pooled config has to be in
@@ -1336,8 +1351,50 @@ export function createSupervisor({
       }
     }
     if (!adapter.resume) return { runId, harnessId, resumed: false, result: "unsupported" };
-    const result = await adapter.resume(runId);
-    if (result === "unsupported") return { runId, harnessId, resumed: false, result };
+
+    // review-consolidated-2026-09-14.md finding 2: `resume()` used to call `adapter.resume(runId)` with
+    // nothing else — the adapter rebuilds its argv from the run's OWN captured `spec`, which for a
+    // utility run still names the ORIGINAL generation's `--mcp-config`, pointing at a socket `detach()`
+    // (called when the first generation's run ended) has already killed the server behind and removed
+    // from disk. The resumed process's proxy would exit non-zero against a dead socket, silently leaving
+    // the resumed run with no MCP tool at all. Re-run the exact same attach logic `start()` uses, for a
+    // FRESH set of attachments and a FRESH socket, and hand the adapter the new config as an override
+    // for this specific generation rather than trusting it to still be valid.
+    const resumeWorkerId = workerIdForRun(database, runId);
+    const resumeWorkerRow = resumeWorkerId ? database.prepare(`SELECT role FROM workers WHERE worker_id = ?`).get(resumeWorkerId) : null;
+    const resumeMcpAttach = resumeWorkerRow?.role
+      ? await attachMcpPoolsForRole(resumeWorkerRow.role, {
+        principalId: principalForWorker(database, resumeWorkerId)?.id ?? null,
+        canDeliverMcpConfig: adapter.capabilities?.()?.mcpConfigDelivery === "file-or-json-string",
+        harnessId, workerId: resumeWorkerId,
+      })
+      : { mcpAttachmentIds: [], mcpServersForConfig: {} };
+    const specOverride = Object.keys(resumeMcpAttach.mcpServersForConfig).length
+      ? { mcpConfig: [JSON.stringify({ mcpServers: resumeMcpAttach.mcpServersForConfig })] }
+      : undefined;
+
+    let result;
+    try {
+      result = await adapter.resume(runId, specOverride ? { specOverride } : undefined);
+    } catch (err) {
+      for (const attachmentId of resumeMcpAttach.mcpAttachmentIds) {
+        mcpPool.detach(attachmentId).catch((detachErr) => {
+          logger.warn?.(`[supervisor] mcp-pool detach ${attachmentId} after failed adapter.resume() for ${runId} failed (best-effort): ${detachErr.message}`);
+        });
+      }
+      throw err;
+    }
+    if (result === "unsupported") {
+      for (const attachmentId of resumeMcpAttach.mcpAttachmentIds) {
+        mcpPool.detach(attachmentId).catch((detachErr) => {
+          logger.warn?.(`[supervisor] mcp-pool detach ${attachmentId} after unsupported adapter.resume() for ${runId} failed (best-effort): ${detachErr.message}`);
+        });
+      }
+      return { runId, harnessId, resumed: false, result };
+    }
+    // Backfill the fresh attachments to this run — mirrors `start()`'s own backfill; `runId` already
+    // exists here (unlike `start()`, which has to wait for `createRun` to commit first).
+    for (const attachmentId of resumeMcpAttach.mcpAttachmentIds) setAttachmentRunId(database, attachmentId, runId);
     // A resumed run is LIVE again, so its row must not still be terminal. Leaving it closed was
     // the invisible-orphan bug in another costume (verified: `resumed: true, generation: 2` over a
     // live process whose row still read `finished`): `listOpenRuns()` could not see it, so boot
@@ -3257,6 +3314,26 @@ export function createSupervisor({
           // redoing work that already landed.
           const worktreeBranch = task.branch ?? branch ?? `ctd/${taskId}`;
           const worktreePath = taskWorktreePath(resolvedRepoPath, taskId);
+
+          // review-consolidated-2026-09-14.md finding 3: the dead claimant might not have been a CREATE
+          // at all — a `discardTaskWorktree` call can crash after `git worktree remove` (the directory is
+          // genuinely, deliberately gone) but before finalizing to NULL. Without this check, seeing "no
+          // directory" below reads identically to "a create never got that far" and this function's own
+          // recovery would run `git worktree add`, REVERSING a completed, deliberate deletion. `op` is
+          // whatever the DEAD claimant recorded when it claimed (see migration 0017) — a discard op with
+          // no real directory on disk means the deletion already happened; refuse instead of redoing.
+          if (reclaim.op === "discard" && !looksLikeRealWorktree(worktreePath)) {
+            const finalizedAsDiscarded = finalizeTaskWorktreeSlot(database, taskId, {
+              worktreeId: null, branch: null, repoPath: null, claimToken: reclaim.claimToken,
+            });
+            return {
+              ok: false, refused: "worktree-was-discarded",
+              error: `task ${taskId}'s worktree was already discarded by a crashed process (its claim just `
+                + `recovered) — refusing to recreate a worktree that was deliberately deleted`
+                + (finalizedAsDiscarded.finalized ? "" : "; the task row may still show a stale claim, investigate manually"),
+            };
+          }
+
           if (looksLikeRealWorktree(worktreePath)) {
             const finalizedAdopt = finalizeTaskWorktreeSlot(database, taskId, {
               worktreeId: worktreePath, branch: worktreeBranch, repoPath: resolvedRepoPath, claimToken: reclaim.claimToken,
@@ -3303,7 +3380,7 @@ export function createSupervisor({
       // `task.worktree_id` is NULL, or a stale path nothing exists at any more — attempt the claim.
       const worktreeBranch = branch ?? task.branch ?? `ctd/${taskId}`;
       const claim = claimTaskWorktreeSlot(database, taskId, {
-        previousValue: task.worktree_id, repoPath: resolvedRepoPath, branch: worktreeBranch,
+        previousValue: task.worktree_id, repoPath: resolvedRepoPath, branch: worktreeBranch, op: "create",
       });
       if (!claim.claimed) {
         // Something changed between our read and our claim attempt (another claim landed, or a result
@@ -3416,12 +3493,64 @@ export function createSupervisor({
     // instant before this read) already holds the slot — `claimTaskWorktreeSlot`'s CAS is keyed on
     // `previousValue` matching the CURRENT row, so passing the pending marker itself through as
     // `previousValue` would incorrectly "succeed" at re-claiming an already-claimed slot and mint a
-    // second, competing token. Refuse instead of racing it.
+    // second, competing token. Refuse instead of racing it — UNLESS the claim has gone stale, in which
+    // case a caller that only ever refused here forever is exactly review-consolidated-2026-09-14.md
+    // finding 3's "permanently wedged discard": nothing but manual DB surgery could ever clear it, since
+    // `reclaimStaleTaskWorktreeClaim` (before this fix) had exactly one caller — `createTaskWorktree`.
     if (task.worktree_id === WORKTREE_CLAIM_PENDING) {
-      return {
-        ok: false, refused: "worktree-claim-conflict",
-        error: `task ${taskId}'s worktree slot is already claimed by another in-flight create/discard — retry shortly`,
-      };
+      const staleBeforeIso = new Date(Date.now() - STALE_WORKTREE_CLAIM_MS).toISOString();
+      const reclaim = reclaimStaleTaskWorktreeClaim(database, taskId, { staleBeforeIso });
+      if (!reclaim.reclaimed) {
+        return {
+          ok: false, refused: "worktree-claim-conflict",
+          error: `task ${taskId}'s worktree slot is already claimed by another in-flight create/discard — retry shortly`,
+        };
+      }
+      // We now hold the previously-stale claim under a fresh token. Whatever the dead claimant was
+      // doing, THIS call's own goal is always the same end state: no worktree, `worktree_id = NULL`.
+      // `task.worktree_repo_path`/`task.branch` are the values recorded AT CLAIM TIME (migration 0014),
+      // which for a legitimate crashed discard are the task's own real values, read and re-passed
+      // unchanged by discard's own claim call below — that is what lets us reconstruct the real,
+      // deterministic worktree path here even though `task.worktree_id` itself is just the marker.
+      const recoveredWorktreePath = task.worktree_repo_path ? taskWorktreePath(task.worktree_repo_path, taskId) : null;
+      if (recoveredWorktreePath && looksLikeRealWorktree(recoveredWorktreePath)) {
+        const openRunsDuringRecovery = database.prepare(
+          `SELECT r.run_id AS runId FROM runs r JOIN workers w ON r.worker_id = w.worker_id
+            WHERE w.task_id = ? AND r.ended_at IS NULL`,
+        ).all(taskId);
+        if (openRunsDuringRecovery.length > 0) {
+          // Leave the claim pending under our fresh token rather than releasing it back to a marker a
+          // dead process no longer controls — a later retry (after this run ends, or after another
+          // stale window) will reclaim it again and can proceed once it's actually safe to.
+          return {
+            ok: false, refused: "open-run",
+            error: `task ${taskId} has ${openRunsDuringRecovery.length} open run(s) still assigned — `
+              + "refusing to finish a crashed discard's removal while one is live; stop or reap them first",
+          };
+        }
+        const recoveryRepoRoot = await repoRootFromWorktree(recoveredWorktreePath) ?? task.worktree_repo_path;
+        try {
+          await execFileAsync("git", ["worktree", "remove", "--force", recoveredWorktreePath], {
+            cwd: recoveryRepoRoot, timeout: 30_000,
+          });
+        } catch (err) {
+          return { ok: false, error: err.message, refused: "git-worktree-remove-failed" };
+        }
+      }
+      // Either the directory never existed by the time we got here (the crashed process's own `git
+      // worktree remove` already succeeded before it died) or we just finished removing it above —
+      // either way, the end state is the same: finalize to NULL.
+      const finalizedRecovery = finalizeTaskWorktreeSlot(database, taskId, {
+        worktreeId: null, branch: null, repoPath: null, claimToken: reclaim.claimToken,
+      });
+      if (!finalizedRecovery.finalized) {
+        return {
+          ok: false, refused: "worktree-claim-superseded",
+          error: `task ${taskId}'s worktree was removed on disk, but the claim was superseded before the `
+            + "database could be finalized — the task row may still show a stale claim; investigate manually",
+        };
+      }
+      return { taskId, discarded: true, actor, recoveredFromCrashedClaim: true };
     }
 
     // review-sol-2026-09-13.md finding 8: everything below used to be a plain check-then-act against
@@ -3434,7 +3563,7 @@ export function createSupervisor({
     // `assignTask`'s `cwd: task.worktree_id` resolution — which cannot itself hold this claim — spawns
     // against the marker string and fails loudly instead of writing into a directory about to be deleted.
     const claim = claimTaskWorktreeSlot(database, taskId, {
-      previousValue: task.worktree_id, repoPath: task.worktree_repo_path ?? null, branch: task.branch ?? null,
+      previousValue: task.worktree_id, repoPath: task.worktree_repo_path ?? null, branch: task.branch ?? null, op: "discard",
     });
     if (!claim.claimed) {
       return {

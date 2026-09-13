@@ -224,9 +224,13 @@ export function createFakeHarness({ label = "fake", mcpConfigDelivery = false } 
     return { ack: true, runId, note: "fake harness: new session id, same process" };
   }
 
-  /** Mirrors the Claude Code adapter's cross-process resume: same runId, brand-new child. */
-  async function resume(runId) {
+  /** Mirrors the Claude Code adapter's cross-process resume: same runId, brand-new child. Also mirrors
+   *  its `specOverride` handling (review-consolidated-2026-09-14.md finding 2) — `run.spec` is mutated,
+   *  not just read, so a test can inspect `_runs.get(runId).spec` afterward to assert what the
+   *  supervisor actually handed this generation, the same way it inspects a fresh `start()`. */
+  async function resume(runId, { specOverride } = {}) {
     const run = get(runId);
+    if (specOverride) Object.assign(run.spec, specOverride);
     if (!run.ended) return runId;
     run.ended = false;
     bind(run, spawnManaged({ command: process.execPath, args: [CHILD, "resumed"], cwd: run.cwd }));

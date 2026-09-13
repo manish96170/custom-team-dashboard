@@ -962,7 +962,7 @@ export function clearContext(runId) {
  * the same _bindChild() helper as start(), so it can no longer omit the
  * child.on('error') handler start() has (the second half of S7).
  */
-export function resume(runId) {
+export function resume(runId, { specOverride } = {}) {
   const run = _get(runId);
   if (run.status !== 'stopped' && run.status !== 'errored' && run.child && !run.child.killed && run.exitCode === null) {
     // Process still alive — nothing to do, same runId already usable.
@@ -971,6 +971,13 @@ export function resume(runId) {
   if (!run.claudeSessionId) {
     return 'unsupported'; // never got far enough to have a session id to resume
   }
+
+  // review-consolidated-2026-09-14.md finding 2: without this, `_buildArgs` replays generation 1's
+  // OWN `mcpConfig` (and anything else the caller wants refreshed for the new generation) verbatim —
+  // for a pooled MCP tool, that names a socket the supervisor's own `detach()` already tore down when
+  // generation 1's run ended. `run.spec` is mutated (not just read from) so a THIRD resume also sees
+  // the latest override, not generation 1's original spec forever.
+  if (specOverride) Object.assign(run.spec, specOverride);
 
   const args = _buildArgs(run.spec);
   args.push('--resume', run.claudeSessionId);

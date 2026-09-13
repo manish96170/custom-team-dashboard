@@ -33,7 +33,10 @@ export const SPAWN_DEPTH_ENV = "DASHBOARD_SPAWN_DEPTH";
 export const MAX_SPAWN_DEPTH = 1;
 
 /** How long to wait for the OS to report a just-spawned child before giving up. */
-const IDENTITY_TIMEOUT_MS = 2000;
+// Exported (review-consolidated-2026-09-14.md finding 6) so `mcp-pool.js`'s `attach()` can derive a
+// LOSER's wait budget from the same number the WINNER's own spawn+identity step actually uses, instead
+// of an independent magic-number guess that can (and did) fall short of it.
+export const IDENTITY_TIMEOUT_MS = 2000;
 
 export class SpawnDepthExceededError extends Error {
   constructor(depth, ceiling) {

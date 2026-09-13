@@ -38,6 +38,19 @@ const quiet = { log() {}, warn() {}, error(...a) { console.error(...a); } };
 const LEO_MCP_AVAILABLE = fs.existsSync(BUILT_IN_DEFAULTS.pools["leo-mcp"].cwd);
 
 if (!LEO_MCP_AVAILABLE) {
+  // review-consolidated-2026-09-14.md finding 9: this used to be a single, easy-to-miss "SKIP:" line —
+  // `npm test`'s exit code stays 0 either way, and nothing distinguishes "this suite ran and passed" from
+  // "this suite (the ONLY one that round-trips a real MCP tool call end to end) never ran at all" unless
+  // a reader is specifically watching the suite COUNT, not just the exit code (TODO.md's own rule for
+  // exactly this class of gap). Loud, unmissable, and to stderr too — so it survives a `2>/dev/null`.
+  console.error("");
+  console.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+  console.error("!! SKIPPED (not a pass): mcp-pool-wiring — leo-mcp sibling repo not present on this     !!");
+  console.error("!! checkout. This is the ONLY suite that round-trips a real MCP tool call through the   !!");
+  console.error("!! real pooled server end to end — its absence from a PASS count is NOT the same as a   !!");
+  console.error("!! real green run. Check the sibling repo is checked out if you need this coverage.      !!");
+  console.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+  console.error("");
   console.log("SKIP: mcp-pool wiring (leo-mcp sibling repo not present on this checkout)");
   process.exit(0);
 }
@@ -295,6 +308,68 @@ await runTest("mcp-pool wiring", async () => {
       const response = JSON.parse(stdoutBuf.trim().split("\n")[0]);
       assert.ok(response.result?.tools, `expected a real tools/list result, got ${JSON.stringify(response)}`);
       console.log("  7b. that exact command+args, spawned for real, round-trips a real JSON-RPC request through the real pooled leo-mcp process");
+      assert.deepEqual(response.result.tools.map((t) => t.name), ["git_push"],
+        "the tools/list response reaching the harness must already be bounded to git-push-runner's own allowlist (finding 1)");
+      try { proxy.kill("SIGKILL"); } catch { /* best effort */ }
+
+      // ── 8 ────────────────────────────────────────────────────────────────────────────
+      // review-consolidated-2026-09-14.md finding 2: end this run for real (detaches the attachment,
+      // tears down the pool, removes the socket file from disk), then resume() it and prove the NEW
+      // generation gets a genuinely FRESH, LIVE socket — not the dead one generation 1 had.
+      //
+      // A NATURAL end (the child process exits on its own), not `supervisor.stop()` — `stop()`'s fake
+      // harness deletes the run entirely (matching a real "torn down for good" stop), which would make
+      // `resume()` legitimately unable to find it; ending naturally is what leaves a run resumable at
+      // all, on both this fake and the real claude-code adapter.
+      const naturalEndRunEnded = new Promise((resolve, reject) => {
+        const deadline3 = Date.now() + 5000;
+        const check = setInterval(() => {
+          if (harness._runs.get(started.runId)?.ended) { clearInterval(check); resolve(); return; }
+          if (Date.now() > deadline3) { clearInterval(check); reject(new Error("run never naturally ended within 5s")); }
+        }, 20);
+      });
+      harness._runs.get(started.runId).child.stdin.write(`${JSON.stringify({ type: "exit" })}\n`);
+      await naturalEndRunEnded;
+      const detachedAttachment = await waitUntilDetached(db, `SELECT * FROM mcp_pool_attachments WHERE run_id = ?`, [started.runId]);
+      assert.ok(detachedAttachment?.detached_at, "precondition: ending the run must have detached generation 1's attachment");
+      // `scheduleAttachmentDetach` is fire-and-forget — `detached_at` above is a synchronous DB write
+      // that can land before the REAL async kill + socket removal inside the same `detach()` call
+      // finishes, so this waits for the actual filesystem effect, not just the DB row.
+      const socketGoneDeadline = Date.now() + 5000;
+      while (fs.existsSync(socketPath) && Date.now() < socketGoneDeadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.equal(fs.existsSync(socketPath), false, "precondition: generation 1's socket must actually be gone from disk once torn down");
+
+      const resumed = await supervisor.resume(started.runId);
+      assert.equal(resumed.resumed, true, `expected resume to succeed, got ${JSON.stringify(resumed)}`);
+      const resumedChild = harness._runs.get(started.runId);
+      assert.ok(Array.isArray(resumedChild.spec?.mcpConfig) && resumedChild.spec.mcpConfig.length === 1,
+        `expected the resumed generation's spec.mcpConfig to be rebuilt, got ${JSON.stringify(resumedChild.spec?.mcpConfig)}`);
+      const resumedParsed = JSON.parse(resumedChild.spec.mcpConfig[0]);
+      const resumedSocketPath = resumedParsed.mcpServers["leo-mcp"].args[2];
+      // The path CAN legitimately be the same as generation 1's (the pool resurrects its own row rather
+      // than minting a new id, so the deterministic socket path is reused) — what matters is that it is
+      // freshly LIVE now, not a dead path replayed from a stale spec. That is what generation 1's own
+      // precondition above (`fs.existsSync(socketPath) === false`, right before this resume) already
+      // ruled out: if this assertion passes, the path was dead a moment ago and is real again now.
+      assert.ok(fs.existsSync(resumedSocketPath), "the resumed generation's own socket must be real and live");
+
+      let proxy2;
+      try {
+        proxy2 = spawnChild(resumedParsed.mcpServers["leo-mcp"].command, resumedParsed.mcpServers["leo-mcp"].args, { stdio: ["pipe", "pipe", "pipe"] });
+        let stdout2 = "";
+        proxy2.stdout.on("data", (c) => { stdout2 += c.toString("utf8"); });
+        proxy2.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "tools/list", id: 2 })}\n`);
+        const deadline2 = Date.now() + 10_000;
+        while (!stdout2.includes('"id":2') && Date.now() < deadline2) {
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        assert.match(stdout2, /"id":2/, `expected the RESUMED generation's fresh socket to round-trip a real tools/list too, got: ${JSON.stringify(stdout2)}`);
+      } finally {
+        try { proxy2?.kill("SIGKILL"); } catch { /* best effort */ }
+      }
+      console.log("  8. resume() re-attaches to a FRESH, live socket instead of replaying a torn-down one from generation 1");
 
       await supervisor.stop(started.runId);
     } finally {

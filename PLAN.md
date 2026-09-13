@@ -1859,6 +1859,26 @@ attachment row live forever, blocking a resurrected replacement's own teardown �
 closes every live attachment for that pool atomically with the failure write, proved with a real killed
 child process.
 
+**SUPERSEDED 2026-09-14 (review-sol-2026-09-13.md finding 13, then review-consolidated-2026-09-14.md
+findings 1-2, 5-7, 12) — everything above marked "not real" about worker MCP delivery is now real, and
+it shipped alongside real hardening this section's own bookkeeping never covered.** Measured directly
+against the installed `claude` CLI first: `--mcp-config` accepts a real JSON STRING (not just a file
+path), and `runtime/mcp-stdio-proxy.js` is a plain stdio "server" the harness spawns itself that relays
+frames to the real pooled server's socket — no guess about what `--mcp-config` means to a Unix socket,
+because it is never handed one. `mcp-pool.js`'s own spawn path was hardened alongside: readiness is now
+a real connect handshake plus an `isSocket()` check (`existsSync` alone published a dead or non-socket
+endpoint as `ready` — reproduced with a real bind-then-exit server and a real regular file at the socket
+path), a concurrent loser's wait budget now matches the winner's real spawn budget (~7s, not ~1s —
+reproduced with a real 2s-delayed bind), every teardown path kills by process group and confirms death
+before dropping ownership, and the socket is `chmod 0600` rather than inheriting the platform temp-dir's
+default. Crucially, the delivered tool surface is now BOUNDED per role
+(`domain/mcp-manifest.js`'s `ROLE_MCP_TOOL_ALLOWLIST`) — attaching to a pool no longer means reaching
+every tool the pool's process happens to expose; `mcp-stdio-proxy.js` filters `tools/list` and refuses a
+disallowed `tools/call` directly. Two honest limits remain, not silently dropped: Claude-Code-only
+delivery (opencode's shared process has no per-run environment notion at all), and `resume()`'s
+re-attachment (built and tested through a real pooled server + the real proxy) has not been fired
+through the actual `claude` CLI subprocess live.
+
 ### 21.2 Lazy discovery — don't put every tool's schema in front of every turn
 
 **Investigated 2026-09-11, and the investigation changed the scope, honestly.** The original framing
@@ -1878,9 +1898,13 @@ not something a sub-session's `--mcp-config` can opt into. OpenCode's adapter ha
 per-turn lazy discovery. A role absent from the declared map needs none; a declared pool name with no
 registered config path is reported `missing`, never silently dropped, the same "never guess an
 underspecified request" discipline section 16.2's utility-task lane already applies one layer up.
-**Not wired into an actual spawned worker's `spec.mcpConfig` in this pass** — that needs a real decision
-about where role->manifest resolution happens in the assignment path (`domain/assignment.js` /
-`runtime/supervisor.js`'s `assignTask`), which is future work, not a design gap in this module.
+**SUPERSEDED 2026-09-14**: this IS now wired into a spawned worker's `spec.mcpConfig` —
+`runtime/supervisor.js`'s `start()` (and, since finding 2, `resume()` too) resolves the manifest, attaches
+each pool, and builds a real `{ mcpServers }` JSON string for any harness whose `mcpConfigDelivery`
+capability allows it. `domain/mcp-manifest.js` also now exports `ROLE_MCP_TOOL_ALLOWLIST`, which bounds
+which of a pool's OWN tools reach the harness at all — a second layer this section's original design did
+not anticipate needing (see PLAN.md §21.1's own superseded note, and `codexdoc/review-consolidated-2026-
+09-14.md` finding 1).
 
 **The pooled MCP layer (21.1) and the manifest module (21.2) are complementary, not the same
 mechanism** — pooling saves host processes/RAM; a minimal manifest saves prompt tokens by bounding
