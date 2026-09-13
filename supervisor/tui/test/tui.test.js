@@ -25,13 +25,16 @@
 //  17. `state.status` is RENDERED (it was not), and an over-long one does not break the frame
 //  18. the pane layout follows the TASK TYPE, until someone toggles a reviewer explicitly
 //  19. the REVIEW BAR (Phase 6) shows which of section 13's conditions is short, and moves the geometry
+//  20. `t` hides/shows the TREE from anywhere; the pane area reclaims the width, selection survives
+//  21. `R` toggles the Requests panel from anywhere, regardless of pending count (unlike `h`)
+//  22. a long request expands to the Request Detail view; closing it restores the layout exactly
 //
 // Standing rule: every case asserts. This script cannot exit 0 with a broken claim.
 
 import assert from "node:assert/strict";
 import {
   renderFrame, renderPaneBody, visiblePanes, frameGeometry, hitTest,
-  requestsPanelHeight, renderRequestsPanel, teamBarChips, MIN_COLS, MIN_ROWS,
+  requestsPanelHeight, renderRequestsPanel, teamBarChips, MIN_COLS, MIN_ROWS, fit, cellWidth,
 } from "../layout.js";
 import { initialState, press, keyToAction, applyAction, withRequests, treeRows, FOCUS } from "../state.js";
 import { decodeMouse, decodeKey } from "../app.js";
@@ -145,9 +148,17 @@ testCase("the three non-running pane states each say which they are", () => {
   const empty = renderPaneBody({ title: "x", status: "empty", lines: [] }, 40, 8).join("\n");
   assert.match(empty, /nothing has happened/);
 
-  const crashed = renderPaneBody({ title: "x", status: "crashed", exitReason: "reaped", lines: ["last words"] }, 40, 10).join("\n");
-  assert.match(crashed, /this run ended: reaped/, "a closed run names its exit reason");
-  assert.match(crashed, /last words/, "and still shows what it produced");
+  // "ended", not "crashed" — fixed 2026-09-11 (`codexdoc/REVIEW-NOTES.md` finding 15's second half):
+  // a status literally named "crashed" for EVERY ended run asserted a failure a normal `finished`/
+  // `stopped` exit never had. Two cases: a deliberate reap (not a failure) and a genuine error, both
+  // rendered under the same neutral status, distinguished only by the reason text.
+  const reaped = renderPaneBody({ title: "x", status: "ended", exitReason: "reaped", lines: ["last words"] }, 40, 10).join("\n");
+  assert.match(reaped, /this run ended: reaped/, "a closed run names its exit reason");
+  assert.match(reaped, /last words/, "and still shows what it produced");
+  assert.doesNotMatch(reaped, /crashed/i, "a deliberate reap must not be labelled a crash anywhere in the render");
+
+  const errored = renderPaneBody({ title: "x", status: "ended", exitReason: "errored", lines: [] }, 40, 10).join("\n");
+  assert.match(errored, /this run ended: errored/, "a genuine failure still names its real reason");
 
   const stale = renderPaneBody({ title: "x", status: "stale", lines: [] }, 46, 8).join("\n");
   assert.match(stale, /not streaming/);
@@ -346,7 +357,9 @@ testCase("hitTest resolves FLOWS' click targets, verified against the drawn fram
   const reqRow = frame.findIndex((l) => l.includes("please review"));
   assert.ok(reqRow > 0, "precondition: the request is drawn");
   const reqHit = hitTest(s, size, 5, reqRow);
-  assert.deepEqual(reqHit, { kind: "requests", requestId: "r1" },
+  // `fits: true` since 2026-09-11 (FLOWS §6c) — this short request fits inline, so a click selects it
+  // rather than expanding to the Request Detail view; see the new case below for the "doesn't fit" path.
+  assert.deepEqual(reqHit, { kind: "requests", requestId: "r1", fits: true },
     `the click must resolve to the request on that row; frame row ${reqRow} reads ${JSON.stringify(frame[reqRow])}`);
   assert.equal(hitTest(s, size, 5, g.chat.top + 1).kind, "chat");
   // Off-frame is null rather than a clamped guess — a click nobody made must not act.
@@ -541,6 +554,280 @@ testCase("the review bar shows which condition is short, and only when a review 
   // An APPROVED review reads differently, which is the whole point of putting the verdict first.
   const approved = renderFrame(demoState({ review: { round: 3, approved: true, dimensions: {}, quorum: { required: 2, distinctReviewers: 2 } } }), size).join("\n");
   assert.match(approved, /REVIEW round 3 — APPROVED/);
+});
+
+// ── 20 ───────────────────────────────────────────────────────────────────────────────────
+// PLAN.md §5, added 2026-09-11. `t` from anywhere hides the tree; the pane area expands into the
+// freed width, and selection state survives — hiding is a view change, not a navigation reset, the
+// same distinction section 7 already draws for hiding a team from the top bar.
+testCase("t hides/shows the tree from anywhere, and the pane area reclaims its width", () => {
+  const size = { cols: 100, rows: 30 };
+  const shown = demoState();
+  assert.equal(frameGeometry(shown, size).treeWidth > 0, true, "precondition: the tree has real width");
+
+  const hidden = press(shown, "t");
+  assert.equal(hidden.treeHidden, true);
+  const g = frameGeometry(hidden, size);
+  assert.equal(g.treeWidth, 0, "the tree column itself is gone");
+  assert.equal(g.paneArea.tree, null, "and there is no tree hit-target to click");
+  // Selection survives — this is a view change, not a reset.
+  assert.equal(hidden.selectedNodeId, shown.selectedNodeId);
+  assert.equal(hidden.treeScroll, shown.treeScroll);
+
+  const frame = renderFrame(hidden, size);
+  for (const [i, line] of frame.entries()) assert.equal(line.length, 100, `line ${i} is still exactly cols wide`);
+  // The task TITLE is tree-only content (a pane's own header looks like "purus (coder)", which would
+  // still legitimately contain a worker's name even with the tree gone — the title is the thing that
+  // can only come from `renderTree`).
+  assert.equal(frame.join("\n").includes("Invert the tweak"), false, "the tree's own content is gone from the frame");
+
+  // `t` again restores it, from a focus other than tree (proving it really is "from anywhere").
+  const restored = press({ ...hidden, focus: FOCUS.PANE }, "t");
+  assert.equal(restored.treeHidden, false);
+  assert.equal(frameGeometry(restored, size).treeWidth, frameGeometry(shown, size).treeWidth);
+});
+
+// ── 21 ───────────────────────────────────────────────────────────────────────────────────
+// PLAN.md §14.4 correction 2, added 2026-09-11. Unlike `h` (which only hides while the panel is
+// focused), `R` toggles regardless of focus AND regardless of pending count, and a new request landing
+// while manually hidden still auto-reappears — that rule (`withRequests`) is unchanged by this.
+testCase("R toggles the Requests panel from anywhere, regardless of pending count", () => {
+  const size = { cols: 100, rows: 30 };
+  const req = { id: "r1", from: "nj", channel: "#chan", text: "short one" };
+  const withOne = withRequests(demoState(), [req]);
+  assert.ok(requestsPanelHeight(withOne, size.rows) > 0, "precondition: the panel is showing");
+
+  // `R` works from TREE focus, not just from inside the panel — the actual point of this key existing
+  // (the `h`-while-focused path already covers the focused case).
+  const hidden = press(withOne, "R");
+  assert.equal(hidden.requestsHidden, true);
+  assert.equal(requestsPanelHeight(hidden, size.rows), 0);
+
+  const shown = press(hidden, "R");
+  assert.equal(shown.requestsHidden, false);
+  assert.ok(requestsPanelHeight(shown, size.rows) > 0, "R toggles back on, unlike h which only ever hides");
+
+  // `withRequests`'s existing empty-list rule (case 15) is unaffected by this new toggle — it is what
+  // actually prevents a manual hide from swallowing every future request: the list has to pass through
+  // EMPTY (everything resolved) before the "unhide" branch fires, so a batch resolving and a fresh one
+  // landing later still surfaces.
+  const stillHidden = press(withOne, "R");
+  const wentEmpty = withRequests(stillHidden, []);
+  assert.equal(wentEmpty.requestsHidden, false, "the list going empty clears the manual hide (case 15's rule, still intact)");
+  const withNew = withRequests(wentEmpty, [{ id: "r2", from: "asha", text: "another one" }]);
+  assert.equal(withNew.requestsHidden, false, "and a fresh request after that stays visible");
+});
+
+// ── 22 ───────────────────────────────────────────────────────────────────────────────────
+// PLAN.md §14.4 correction 3 / FLOWS §6c, added 2026-09-11. A request too long to fit inline expands to
+// a full-width detail view that REPLACES the tree + pane area; a short one does not (case 13 already
+// covers that half). The round trip restores the layout exactly, because nothing but `focus` changes.
+testCase("a long request expands to the Request Detail view, and closing it restores the layout exactly", () => {
+  const size = { cols: 100, rows: 30 };
+  // "payment webhook" is placed well past the panel's truncation width (~96 chars at cols=100) on
+  // purpose — this fixture only proves the expand-on-click behaviour if the inline row genuinely
+  // cannot show that phrase.
+  const longText = "please review this before standup, there is quite a lot of context to give here about why this one is not a simple lint fix, it touches the payment webhook so please take a careful look and there is also a flaky test in the same file";
+  const req = { id: "r1", from: "nj", channel: "#your-mr-channel", text: longText };
+  const before = withRequests(demoState(), [req]);
+  const beforeFrame = renderFrame(before, size).join("\n");
+  assert.equal(beforeFrame.includes("payment webhook"), false, "too long to fit inline — it must be truncated, not wrapped, in the small panel");
+
+  // Click resolves as NOT fitting, and that's what state.js keys the expand decision on.
+  const g = frameGeometry(before, size);
+  const reqRow = g.requests.top + 2; // header rule + button row, first request line
+  const hit = hitTest(before, size, 5, reqRow);
+  assert.equal(hit.kind, "requests");
+  assert.equal(hit.fits, false, "precondition: this request does not fit inline");
+
+  const expanded = applyAction(before, { type: "click", target: hit });
+  assert.equal(expanded.focus, FOCUS.REQUEST_DETAIL);
+  assert.equal(expanded.selectedRequestId, "r1");
+
+  const detailFrame = renderFrame(expanded, size);
+  for (const [i, line] of detailFrame.entries()) assert.equal(line.length, 100, `line ${i} is exactly cols wide`);
+  const joined = detailFrame.join("\n");
+  assert.match(joined, /REQUEST DETAIL/);
+  assert.match(joined, /payment webhook/, "the FULL text is shown, not truncated");
+  assert.match(joined, /\[a\] Accept\s+\[d\] Decline/);
+  // Tree + pane area are genuinely gone, not just visually similar — no worker names, no dev pane header.
+  assert.equal(joined.includes("purus"), false);
+
+  // `return` on a selected (but not yet expanded) request does the same thing as the click.
+  const viaReturn = press({ ...before, focus: FOCUS.REQUESTS, selectedRequestId: "r1" }, "return");
+  assert.equal(viaReturn.focus, FOCUS.REQUEST_DETAIL);
+
+  // `esc` restores the layout EXACTLY — nothing else was touched, so this is the whole test.
+  const closed = press(expanded, "escape");
+  assert.equal(closed.focus, FOCUS.REQUESTS);
+  assert.deepEqual({ ...closed, focus: null }, { ...before, focus: null },
+    "closing the detail view must restore every other field untouched");
+
+  // Accept/Decline hand off to app.js (PLAN.md §16.2's own pattern for `pendingChat`) and also close it.
+  const accepted = press(expanded, "a");
+  assert.deepEqual(accepted.pendingRequestDecision, { requestId: "r1", decision: "accept" });
+  assert.equal(accepted.focus, FOCUS.REQUESTS);
+  const declined = press(expanded, "d");
+  assert.deepEqual(declined.pendingRequestDecision, { requestId: "r1", decision: "decline" });
+});
+
+// review-sol-2026-09-13.md finding 17: an external request's text used to be written into the Request
+// Detail view with no escaping — ESC/OSC/CR/BEL bytes could clear/reposition the terminal or spoof its
+// own controls. `renderRequestsPanel`'s compact line happened to be safe only because it wraps text in
+// JSON.stringify for unrelated cosmetic reasons; the detail view had no such accident protecting it.
+testCase("a request's ESC/OSC/CR/BEL bytes never reach the rendered frame raw, in either the compact panel or the detail view", () => {
+  const size = { cols: 100, rows: 30 };
+  const dangerous = "before\x1b[2J\x1b]0;pwned\x07mid\rafter\x1b[31mred";
+  const req = { id: "r-danger", from: "attacker\x1b[2J", channel: "#c", text: dangerous };
+  const state = withRequests(demoState(), [req]);
+
+  const compactFrame = renderFrame(state, size).join("\n");
+  assert.equal(compactFrame.includes("\x1b"), false, "no raw ESC byte in the compact panel's rendered frame");
+  assert.equal(compactFrame.includes("\x07"), false, "no raw BEL byte in the compact panel's rendered frame");
+
+  const expanded = applyAction(state, {
+    type: "click",
+    target: { kind: "requests", requestId: "r-danger", fits: false },
+  });
+  const detailFrame = renderFrame(expanded, size).join("\n");
+  assert.equal(detailFrame.includes("\x1b"), false, "no raw ESC byte anywhere in the rendered Request Detail frame");
+  assert.equal(detailFrame.includes("\x07"), false, "no raw BEL byte anywhere in the rendered Request Detail frame");
+  assert.equal(detailFrame.includes("\r"), false, "no raw CR byte anywhere in the rendered Request Detail frame");
+  assert.match(detailFrame, /before/, "the surrounding legitimate text must still render");
+  assert.match(detailFrame, /mid/);
+  assert.match(detailFrame, /after/);
+});
+
+// review-sol-2026-09-13.md finding 18: if the request open in the DETAIL view disappears while
+// others remain, `withRequests` used to retarget `selectedRequestId` to whatever request happened to
+// be first while leaving `focus` at REQUEST_DETAIL — so the screen silently started showing a
+// DIFFERENT request's content than the one the operator opened, and the next Accept/Decline would act
+// on it. Detail view must close back to the list instead.
+testCase("withRequests closes the Request Detail view (rather than silently swapping its content) when the open request disappears", () => {
+  const two = withRequests(demoState(), [{ id: "r1", text: "one" }, { id: "r2", text: "two" }]);
+  const openedR2 = applyAction(two, {
+    type: "click",
+    target: { kind: "requests", requestId: "r2", fits: false },
+  });
+  assert.equal(openedR2.focus, FOCUS.REQUEST_DETAIL);
+  assert.equal(openedR2.selectedRequestId, "r2");
+
+  // r2 (the OPEN one) disappears; r1 and a new r3 remain — a real batch update, not just an empty list.
+  const afterUpdate = withRequests(openedR2, [{ id: "r1", text: "one" }, { id: "r3", text: "three" }]);
+  assert.notEqual(afterUpdate.focus, FOCUS.REQUEST_DETAIL, "the detail view must close, not silently show a different request");
+  assert.equal(afterUpdate.focus, FOCUS.REQUESTS, "control returns to the requests list");
+  assert.notEqual(afterUpdate.selectedRequestId, "r2", "the vanished id must not still be selected");
+});
+
+// review-sol-2026-09-13.md finding 48: the Request Detail view read `postedAt`/`at`, but the runtime
+// projection (`pendingRequests()` in supervisor.js) only ever supplies `createdAt` — so a real request's
+// timestamp never rendered at all.
+testCase("Request Detail renders a request's createdAt timestamp (the field the runtime projection actually supplies)", () => {
+  const size = { cols: 100, rows: 30 };
+  const req = { id: "r-ts", from: "nj", channel: "#c", text: "hello", createdAt: "2026-09-13T12:00:00.000Z" };
+  const state = withRequests(demoState(), [req]);
+  const expanded = applyAction(state, { type: "click", target: { kind: "requests", requestId: "r-ts", fits: false } });
+  const frame = renderFrame(expanded, size).join("\n");
+  assert.match(frame, /2026-09-13T12:00:00\.000Z/, "the request's real createdAt must appear in the detail view");
+});
+
+// review-sol-2026-09-13.md finding 27: `requestUp`/`requestDown` move `selectedRequestId` but never
+// touched `requestScroll` — pressing down repeatedly could select a request several rows below the
+// visible window, with `return` then opening whatever request the operator could not actually see.
+testCase("requestUp/requestDown keep the selected request within the visible window, in both render and hitTest", () => {
+  const size = { cols: 100, rows: 30 };
+  const many = Array.from({ length: 10 }, (_, i) => ({ id: `r${i}`, from: "nj", text: `request ${i}` }));
+  let s = withRequests(demoState(), many);
+  s = applyAction(s, { type: "click", target: { kind: "requests", requestId: "r0" } });
+  assert.equal(s.focus, FOCUS.REQUESTS);
+
+  // A small panel: requestsPanelHeight forces a short height here via a tiny fraction override, so the
+  // visible room is far smaller than 10 requests — room is what forces the scroll question at all.
+  s = { ...s, requestsHeightFraction: 0.001 };
+  const height = requestsPanelHeight(s, size.rows);
+  assert.ok(height > 0 && height < 6, `precondition: the panel must be small enough that not all 10 requests fit; got height=${height}`);
+
+  // Press down enough times to select a request well past the initial visible window.
+  for (let i = 0; i < 7; i += 1) s = applyAction(s, { type: "requestDown" });
+  assert.equal(s.selectedRequestId, "r7");
+
+  const rendered = renderRequestsPanel(s, size.cols, height).join("\n");
+  assert.match(rendered, /request 7/, `the selected request must actually be rendered in the visible window; got:\n${rendered}`);
+
+  // hitTest must agree with what was actually drawn — clicking the row where the selection now shows
+  // must resolve to "r7", not to whatever a stale, unclamped scroll would have pointed at.
+  const g = frameGeometry(s, size);
+  const bodyTop = g.requests.top + (g.requests.height - 1 >= 2 ? 2 : 1);
+  const hit = hitTest(s, size, 5, bodyTop);
+  assert.equal(hit.requestId, "r7", `hitTest must resolve the same row renderRequestsPanel actually drew there; got ${JSON.stringify(hit)}`);
+});
+
+// review-sol-2026-09-13.md finding 25: a single token wider than the viewport used to become one
+// unsplit "line" that `row()`'s own `fit()` then silently truncated with an ellipsis — the rest of a
+// long URL/hash/stack-trace line was gone with no indication, right before an Accept/Decline decision.
+testCase("Request Detail hard-splits a single token wider than the viewport, rather than silently truncating it", () => {
+  const size = { cols: MIN_COLS, rows: 30 };
+  const longToken = "x".repeat(200); // far wider than any plausible column count
+  const req = { id: "r-long-token", from: "nj", text: `see ${longToken} for details` };
+  const state = withRequests(demoState(), [req]);
+  const expanded = applyAction(state, { type: "click", target: { kind: "requests", requestId: "r-long-token", fits: false } });
+  const frame = renderFrame(expanded, size).join("\n");
+  // If the token were still unsplit, `x`.repeat(200) would appear as one run far longer than any single
+  // rendered line (36 visible chars at cols=40) — so finding it split across lines means every
+  // individual line-length invariant already enforced elsewhere held AND the full token is present.
+  const totalXs = (frame.match(/x/g) ?? []).length;
+  assert.equal(totalXs, 200, `the full long token must still be present somewhere in the frame (split across lines), got ${totalXs} of 200 x's`);
+  for (const line of frame.split("\n")) assert.ok(line.length <= size.cols, `every rendered line must stay within cols; got length ${line.length}: ${JSON.stringify(line)}`);
+});
+
+testCase("Request Detail shows an explicit continuation indicator rather than silently dropping lines past the viewport", () => {
+  const size = { cols: 100, rows: MIN_ROWS }; // deliberately at the minimum, so a long message overflows the body budget
+  const longText = Array.from({ length: 50 }, (_, i) => `sentence number ${i} in a very long message`).join(". ");
+  const req = { id: "r-tall", from: "nj", text: longText };
+  const state = withRequests(demoState(), [req]);
+  const expanded = applyAction(state, { type: "click", target: { kind: "requests", requestId: "r-tall", fits: false } });
+  const frame = renderFrame(expanded, size).join("\n");
+  assert.match(frame, /more line\(s\) not shown/, `an overflowing message must show an explicit continuation indicator, not silently drop lines; got:\n${frame}`);
+});
+
+// review-sol-2026-09-13.md finding 26: closing the Request Detail view used to route focus to REQUESTS
+// unconditionally — but the panel could have been hidden (`R`) WHILE detail was open, since
+// `toggleRequestsHidden` only redirects focus away from REQUESTS when focus was ALREADY there at the
+// moment of hiding. Escape then left focus on a panel that isn't drawn at all.
+testCase("closing Request Detail routes focus to TREE (not the hidden REQUESTS panel) if the panel was hidden while detail was open", () => {
+  const two = withRequests(demoState(), [{ id: "r1", text: "one" }, { id: "r2", text: "two" }]);
+  const opened = applyAction(two, { type: "click", target: { kind: "requests", requestId: "r1", fits: false } });
+  assert.equal(opened.focus, FOCUS.REQUEST_DETAIL);
+
+  const hiddenWhileOpen = press(opened, "R");
+  assert.equal(hiddenWhileOpen.requestsHidden, true, "R must hide the panel even while detail view has focus");
+  assert.equal(hiddenWhileOpen.focus, FOCUS.REQUEST_DETAIL, "hiding must not itself close the detail view");
+
+  const closed = press(hiddenWhileOpen, "escape");
+  assert.notEqual(closed.focus, FOCUS.REQUESTS, "closing detail must not land focus on a panel that is hidden and therefore not drawn");
+  assert.equal(closed.focus, FOCUS.TREE);
+});
+
+// review-sol-2026-09-13.md finding 29: `fit()` used `.length` — UTF-16 code units — for both the
+// "does it fit" check and the truncation point, so wide characters (CJK, most emoji) could overflow
+// past the intended column budget, or get cut at a point that doesn't match the actual visible width.
+testCase("fit() measures and pads/truncates by terminal CELL width, not UTF-16 code-unit length", () => {
+  // A CJK string: 5 characters, each 1 UTF-16 code unit but 2 terminal cells — 10 cells total, NOT 5.
+  const cjk = "日本語text!"; // 3 wide (6 cells) + "text!" (5 cells) = 11 cells, 8 code units
+  assert.equal(cellWidth(cjk), 11);
+  const padded = fit(cjk, 15);
+  assert.equal(cellWidth(padded), 15, "fit() must pad to the exact CELL width requested, not code-unit length");
+
+  // A string wider (in cells) than the target width must truncate SHORT ENOUGH that cell width + the
+  // ellipsis fits exactly — using code-unit length here would keep too many wide characters and overflow.
+  const long = "日".repeat(10); // 10 characters, 20 cells
+  const truncated = fit(long, 10);
+  assert.equal(cellWidth(truncated), 10, `truncated output must be exactly 10 CELLS wide, not 10 code units; got cellWidth=${cellWidth(truncated)} for ${JSON.stringify(truncated)}`);
+  assert.ok(truncated.includes("…"), "truncation must still be visible");
+
+  // A combining mark occupies 0 cells of its own — must not be counted as a full column.
+  const combining = "ééé"; // "é" written as e + combining acute, 3 times: 3 cells, 6 code units
+  assert.equal(cellWidth(combining), 3);
 });
 
 if (failed > 0) {

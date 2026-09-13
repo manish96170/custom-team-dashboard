@@ -29,6 +29,8 @@
 //  15. `approveTask` derives round and commit authoritatively and refuses a stale round
 //  16. an approval cannot slip past a verdict whose verification is still in flight
 //  17. a REFUTED finding reaches the coder through neither `ranked` nor `diff`
+//  18. one authenticated token cannot manufacture the distinct-reviewer quorum by claiming a second
+//      worker's identity; two genuinely distinct reviewers still can (added 2026-09-11)
 //
 // Standing rule: every case asserts. This script cannot exit 0 with a broken claim.
 
@@ -739,6 +741,63 @@ await runTest("configurable reviews", async () => {
       assert.equal(listReviewVerdicts(db, "t-ref")[0].findings[0].verdict, "REFUTED",
         "the verdict row keeps it, because the record of what a reviewer claimed is not the same as what a coder is handed");
       console.log("  17. a REFUTED finding reaches the coder through neither ranked nor diff");
+    }
+
+    // ── 18 ───────────────────────────────────────────────────────────────────────────
+    // ONE AUTHENTICATED TOKEN CANNOT MANUFACTURE THE DISTINCT-REVIEWER QUORUM BY CLAIMING TWO WORKER
+    // IDENTITIES. Case 14 already made a verdict's registry facts (task membership, role, dimension, slot)
+    // immune to the REQUEST — but `_principal` was never checked against the request's own `workerId`, so a
+    // single reviewer token could still submit under a SECOND real reviewer's identity and satisfy "two
+    // distinct reviewers" alone. Verified before fixing: the cross-identity call succeeded. Codex review
+    // (`codexdoc/REVIEW-NOTES.md` finding 3), fixed 2026-09-11.
+    {
+      createTask(db, { id: "t-quorum-attack", title: "quorum manufacture attempt", type: "feature" });
+      createWorker(db, { workerId: "w-qa1", nickname: "qa1", role: "reviewer", taskId: "t-quorum-attack" });
+      createWorker(db, { workerId: "w-qa2", nickname: "qa2", role: "reviewer", taskId: "t-quorum-attack" });
+      walkToReview(db, "t-quorum-attack");
+
+      const wrapped = supervisor.authorizedCommandHandlers();
+      const qa1 = supervisor.ensureWorkerPrincipal("w-qa1", { rotate: true });
+
+      // The attack: qa1's OWN token, claiming to BE qa2. `recordVerdict` throws on every other identity
+      // violation too (case 14: wrong task, wrong role, invented dimension) — this is the same style, not
+      // a `{ok:false}` return.
+      await assert.rejects(
+        () => wrapped.recordVerdict({
+          id: "atk1", token: qa1.token, taskId: "t-quorum-attack", workerId: "w-qa2",
+          round: 1, commitSha: "sha1", dimension: "correctness", verdict: "approved",
+        }),
+        /OWN worker identity/,
+        "one token cannot record a verdict under a DIFFERENT worker's identity",
+      );
+      assert.equal(listReviewVerdicts(db, "t-quorum-attack").length, 0, "the attack must not have stored anything");
+
+      // The honest path: qa1 records its OWN two dimensions.
+      for (const dimension of ["correctness", "security"]) {
+        const res = await wrapped.recordVerdict({
+          id: `honest-qa1-${dimension}`, token: qa1.token, taskId: "t-quorum-attack", workerId: "w-qa1",
+          round: 1, commitSha: "sha1", dimension, verdict: "approved",
+        });
+        assert.equal(res.ok, true, JSON.stringify(res));
+      }
+
+      const ownerToken = fs.readFileSync(path.join(stateDir, "owner.token"), "utf8").trim();
+      const stillShort = await wrapped.approveTask({ id: "app1", token: ownerToken, taskId: "t-quorum-attack", round: 1 });
+      assert.equal(stillShort.result.approved, false, "one real reviewer is not a quorum of two, even though qa1's own verdicts are legitimate");
+
+      // A GENUINE second identity — qa2's own token — must still be able to reach real quorum. The fix
+      // must block IMPERSONATION, not reviewing itself.
+      const qa2 = supervisor.ensureWorkerPrincipal("w-qa2", { rotate: true });
+      for (const dimension of ["correctness", "security"]) {
+        const res = await wrapped.recordVerdict({
+          id: `honest-qa2-${dimension}`, token: qa2.token, taskId: "t-quorum-attack", workerId: "w-qa2",
+          round: 1, commitSha: "sha1", dimension, verdict: "approved",
+        });
+        assert.equal(res.ok, true, JSON.stringify(res));
+      }
+      const nowApproved = await wrapped.approveTask({ id: "app2", token: ownerToken, taskId: "t-quorum-attack", round: 1 });
+      assert.equal(nowApproved.result.approved, true, `two GENUINELY distinct reviewers must still approve; got ${JSON.stringify(nowApproved)}`);
+      console.log("  18. one token cannot manufacture the distinct-reviewer quorum by impersonating a second worker; two genuine reviewers still can");
     }
   } finally {
     try { if (ipc) await ipc.shutdown(); } catch { /* teardown */ }

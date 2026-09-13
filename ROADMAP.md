@@ -1,21 +1,47 @@
 # Build Roadmap
 
-> **STATUS 2026-09-09.** Phases 0a, 0b, 1, 2, 3, 4, 5 and 6 are COMPLETE; Phase 7's authorization GATE is done
-> and reviewed, and the rest of Phase 7 (the utility roster) is next. `cd supervisor && npm test` -> **113
-> suites, exit 0**; thirteen mutation harnesses, **185 mutations**, all behaving as expected. Phases 6 and 7's
-> gate were each independently reviewed (`review-phase6/verdicts.md`, `review-phase7/verdicts.md`) — between them
-> 8 blocking findings, all reproduced before fixing. Every decision and defect is recorded in
-> `supervisor/runtime/FINDINGS.md` §1-§38; read that before changing a mechanism it describes.
+> **STATUS 2026-09-13, updated after item 39 — read `HANDOFF.md`'s top header for the full current
+> picture, this is just a pointer.** Phases 0a-6 complete and reviewed. Phase 7 (utility framework,
+> resource leases, MCP pooling, the utility-task lane) has its LIFECYCLE/FRAMEWORK complete — the
+> git-push utility path is genuinely complete end to end, but Jira/Slack/awsquery utility roles have NO
+> worker-side MCP tool transport yet (`spec.mcpConfig` is deliberately unset — review-sol-2026-09-13.md
+> finding 13/35, corrected 2026-09-13; see HANDOFF.md's top header) — and has had 24 real
+> findings fixed across four independent-review passes (two codex, two `opencode luna` after codex hit a
+> multi-day quota wall — see `HANDOFF.md` items 22/24/25 and both `codexdoc/` review files). **All 9
+> findings from the `luna` review, and all remaining should-fix findings from the codex review, are now
+> fixed** (items 24-25). The utility-task lane's own "not built" gap — a one-call dispatch helper and
+> real per-role run instructions — is closed too (item 26). **The OLDER (pre-review) should-fix backlog
+> is now FULLY closed, items 27-38** — every directory's list is either fixed (`db/`'s fd leak, `lock/`'s
+> two temp-file gaps, `ipc/`'s unsolicited-frame contract, `adapters/`'s entire 5-item list,
+> `runtime/`'s iterator-cancellation gap — the last one GENUINELY real, reproduced empirically before
+> fixing), correctly deferred by explicit design decision (`runtime/`'s pump-state-retention item), or
+> resolved as a stale note / already-decided-elsewhere with no code needed (several `db/`/`adapters/`
+> items, and `ipc/`'s `SO_PEERCRED` note — verified NOT to actually need a native addon before writing
+> anything, per explicit instruction to check before building). **Phase 8 (CTO) has its first
+> schema-only step started** (item 39): `config/harness-defaults.js` now declares the `clearPolicy`
+> vocabulary and validates it on load; no decision module reads it yet (that's this checkbox's
+> remaining half, not started). `cd supervisor
+> && npm test` -> **127 suites, exit 0**, re-verified repeatedly, zero leaked processes each
+> time. Nothing in this repo (or `../leo-mcp/`) has been committed or pushed
+> this session.
 >
-> **This repo is not in git yet.** The plan is a private repo on the personal account `manish96170`; a push needs
-> an account switch (`anchor-mani` is active) AND the owner's go-ahead — see HANDOFF.md's "PUSHING THIS REPO".
-> Another session is watching git for this purpose.
->
-> **The Slack side has its own plan now**: `../team-slack-bridge/PLAN.md` (2026-09-09). Phase 9 consumes it.
->
-> **Watch the suite COUNT.** It dropped from 109 to 104 on 2026-09-08 because 202 files in this tree were
-> overwritten by an older copy (cause never identified). Snapshots live outside the tree at
-> `~/ctd-snapshot-*.tar.gz`.
+> **UPDATE, same day — a full review of every uncommitted change, from `opencode`'s `sol` agent
+> (GPT-5.6 Sol via Bedrock), found real defects the test suite does not catch: `codexdoc/review-sol-2026-09-13.md`,
+> 50 findings (1 critical, 18 high, 15 medium, 12 doc-consistency, 4 low). **The critical finding, 15 of the
+> 18 high findings, 1 of the 4 low findings, ALL 15 of 15 medium findings, and ALL 12 doc-consistency
+> findings are FIXED** (HANDOFF.md's top header has the full list, including two additive migrations —
+> `0015_mcp_pool_lstart.sql`, `0016_worktree_claim_token.sql` — and every CODE fix independently verified
+> to fail against the pre-fix code first; every DOC fix corrected directly in its own file, cross-checked
+> against current code). One finding (12, workers holding `git:identity`) was explicitly reverted after
+> confirming it contradicts ~10 pre-existing, deliberately-tested cases — flagged as needing a real design
+> decision, not fixed unilaterally. **Two high findings remain OPEN BY DELIBERATE DEFERRAL, not oversight**
+> (8: worktree-removal races with start/resume/reassignment, needs a cross-cutting redesign of
+> run/task/worktree attribution together, not a patch; 13: MCP pooling has no real tool-delivery transport
+> to utility workers yet, a capability gap not a bug). **Only 3 of 4 low findings remain open** (47/49/50,
+> all minor/cosmetic) — read the review file directly before picking the next item. `npm test`:
+> exit 0, all suites, throughout (several standalone flakes in real-OS-process suites hit across this
+> session, all pre-existing and unrelated, all confirmed clean
+> on immediate re-run).
 
 
 Order matters here — each phase either de-risks an unknown or is a hard dependency for
@@ -348,12 +374,38 @@ built correctly the first time, not a bug to patch in throwaway spike code.
       events, which is every run in every suite here.
 - [x] **Mouse/click bindings** — SGR reporting, and one `frameGeometry` for drawing AND hit-testing, because
       two copies of that arithmetic is how mouse support rots. Press of button 0 only.
-- [x] **The Requests panel** (FLOWS §6a) — built and read-only; the Slack inbound path that fills it is still
-      backlog, so the buttons are drawn and inert rather than claiming to accept work nothing can produce.
-      Absent at zero pending, `h` hides it while focused.
+- [x] **The Requests panel** (FLOWS §6a) — built and read-only ON THE TUI SIDE (Accept/Decline are drawn
+      but inert): the Slack **inbound** path that would fill it is still backlog, so there is nothing yet
+      for the buttons to act on. **Clarified 2026-09-13 (review-sol-2026-09-13.md finding 42) — this
+      "read-only" describes the TUI panel/inbound gap only, NOT the `utility:slack` role's own
+      capability**, which is a separate thing and is NOT read-only: `domain/capabilities.js` grants
+      `utility:slack` the `slack:post-bot` (send) capability; `utility:awsquery` is the actually
+      read-only-by-design role (`read:registry` only, no side-effecting capability at all). Absent at
+      zero pending, `h` hides it while focused.
 - [x] **A defect found by looking rather than testing**: `state.status` — including `supervisor unreachable`
       on every failed round trip — was rendered by NOTHING. Frames are now captured by a committed script
       (`tui/capture-frames.mjs`) so looking stays one command.
+- [x] **Requests panel layout/toggle/detail-view mechanics — BUILT 2026-09-11** (PLAN.md §14.4/§5
+      corrections; the buttons themselves and everything server-side stay backlog, unchanged — see
+      the item above). Default height raised to ~30%; `R` toggles the panel from anywhere regardless
+      of pending count; `t` toggles the TREE panel the same way; a request too long to fit inline
+      expands to a full-width Request Detail view (`FOCUS.REQUEST_DETAIL`) that replaces the tree +
+      pane area, with `[a] Accept`/`[d] Decline`/`esc` — closing it restores the layout exactly, since
+      entering/leaving only ever changes `focus`. 3 new pure cases in `tui/test/tui.test.js` (20-22),
+      5 new captured scenes in `tui/evidence/01-demo-frames.txt`, `TUI-GUIDE.md` steps 16-20.
+- [x] **Two should-fix findings from `codexdoc/REVIEW-NOTES.md` fixed the same day**: finding 10
+      (standalone `attachPane`/`pane/cli.js --list` sent no principal token, refused by the real
+      authorization gate — `ipc/client.js`'s `connect()` now carries one, `pane/pane.js` reads
+      `owner.token` by default same as `tui/cli.js` already did; new `pane/test/pane-auth.test.js`, 3
+      cases against the REAL authorized socket) and finding 15 (a restarted worker's pane showed its
+      OLD ended run instead of its live replacement — `tui/app.js`'s `forWorker` now prefers live over
+      ended regardless of array position, and newest-by-`lastEventAt` among ended-only runs; new case
+      9 in `runtime/test/tui-replay.test.js`). Finding 15's SECOND half was left open at the time this
+      bullet was first written, then **CLOSED the same day (HANDOFF.md item 20)** — `buildPanes` now
+      uses the neutral `status: "ended"` for every ended run, never `"crashed"`, regardless of
+      `exitReason`. **CORRECTED 2026-09-13 (review-sol-2026-09-13.md finding 42): this bullet's original
+      wording still said "still open, not fixed" and named the field `"crashed"` — both stale.**
+      `npm test`: exit 0, **117 suites**, re-verified 3x, zero leaked processes each time.
 
 ## Phase 5 — Domain — **COMPLETE 2026-09-08**
 - [x] **The full failure/cancel state set from PLAN.md §6 is built AND ENFORCED** — `domain/task-states.js`
@@ -430,13 +482,172 @@ built correctly the first time, not a bug to patch in throwaway spike code.
 - [ ] **A real sandbox is NOT this** — named so it is not mistaken for done. Workers run as the same user, so a
       worker that reads `owner.token` holds the owner's authority. If that ever matters, the fix is a separate
       uid per worker or OS-level confinement, not more capability checks.
-- [ ] Stand up the roster: jira-automation, git-create-push, slack-message, CTO.
+- [x] **Stand up the roster — decided differently, and built.** `git-create-push`'s full fight loop is
+      DONE (item 11 in this file, `HANDOFF.md` items 21/32). `jira-automation`/`slack-message` were
+      superseded by `leo-mcp` (a real MCP server, `../leo-mcp/`, `HANDOFF.md` item 12) plus this
+      dashboard's own utility-task lane (`git-push-task`/`jira-task`/`awsquery-task`/`slack-task`,
+      `HANDOFF.md` item 13) — role/capability/model machinery and real per-role dispatch/instructions ARE
+      built (item 26), though jira-task/slack-task/awsquery-task still have no DELIVERED MCP transport
+      (finding 13/35, top of `HANDOFF.md`). CTO (Phase 8) has only its schema-only first step (item 39).
+      **CORRECTED 2026-09-13 (review-sol-2026-09-13.md finding 42): this line previously read `[ ]`
+      unconditionally, implying none of "utility prompts/dispatch" existed — stale.**
       **List-management is not on this roster** — it's typed supervisor commands
       (`moveWorker`, `renameWorker`, `hideTeam`, `pinMain`) the CTO calls directly, not
       a separate agent (PLAN.md section 16).
-- [ ] `git-create-push` gets its full fight-loop (PLAN.md section 8, Rule 2): real
-      `git` access (not just `gh`/`glab`), stage/commit/hook-failure/classify/autofix/
-      re-run, returning a short structured result — never raw tool output to the caller.
+      **Corrected 2026-09-11 — the roster's shape changed, not just its status.** `leo-mcp`
+      (`../leo-mcp/`, new standalone sibling repo, decided after reviewing what already existed:
+      the `git-create-push`/`jira-automation` Claude Code skills and `team-slack-bridge`'s own
+      21-tool MCP server) is now where the Slack and Jira MECHANICS live, consolidated into one
+      MCP server instead of three. See PLAN.md §16.1 for the full split of what's dashboard-code
+      vs. leo-mcp vs. still-a-skill.
+- [x] **PLAN.md §16.2, the utility-task lane — BUILT 2026-09-11.** The dashboard-side half of the
+      roster: four `type: "adhoc"`-shaped task types (`git-push-task`/`jira-task`/`awsquery-task`/
+      `slack-task`), each a single worker in a role (`git-push-runner`/`jira-runner`/`awsquery-runner`/
+      `slack-runner`) with its own cheap-model default and its own fixed UTILITY capability preset
+      (`utility:git`/`utility:jira`/`utility:awsquery`/`utility:slack` — the last one new, `read:registry`
+      only, since a pure AWS read query has no dashboard side effect to gate). `ensureWorkerPrincipal`
+      mints these `kind: "utility"`, matching migration 0010's own description of that kind. 4 new test
+      cases (`runtime/test/utility-task-lane.test.js`) including a NEGATIVE check that a role does NOT
+      also hold another role's capabilities. `npm test`: exit 0, **113 suites**, re-verified 3x.
+      **Not done**: the runner's own prompt/instructions text, and any dispatch convenience beyond the
+      same `createTask`/`assignTask` calls every other task type already uses.
+- [x] **`git-create-push` gets its full fight-loop — DONE 2026-09-10** (PLAN.md section 8, Rule 2;
+      §16's roster; the first real consumer of both the worktree lifecycle and resource leases).
+      `agents/git-create-push.js` (pure, no db) + `runtime/supervisor.js`'s `gitCreatePush` glue:
+      real `git` access, stage/commit/hook-failure/classify (8 classes)/autofix (format +
+      lint-autofixable only, via a repo-provided `.git-create-push-autofix.sh`)/re-run bounded at 3
+      attempts, returning the exact `{status, attempts, unresolved?}` contract — never raw tool
+      output. Two wire commands (`gitPush`/`git:push`, `gitPushProtected`/`git:push-protected`
+      SENSITIVE) sharing one loop, `git:identity` held across the whole call and released in a
+      `finally` (proven by real cross-process contention AND a forced-throw case). `gh pr
+      create`/`mrUrl` is real but opt-in and excluded from `npm test` (real credentials/network) —
+      `runtime/test/real-git-create-push.slice.mjs` is the manual counterpart, same pattern as this
+      project's other `real-*.slice.mjs` files. 15 new cases, suite 110 -> 112, exit 0, re-verified 3x.
+- [x] **Schema landed 2026-09-10, migration 0011** (`db/migrations/0011_leases_and_mcp_pool.sql`) —
+      `resource_leases`: one row per active CLAIM, not one row per resource, so a `counted` lease at
+      capacity > 1 can have multiple concurrent holders (`released_at IS NULL` = still held, same
+      convention `runs`/`asks` already use); indexed for "who holds X now" and "find expired leases."
+      Verified: `npm test` exit 0, tested both fresh-db and upgrading from schema version 10.
+- [x] **`acquireLease`/`releaseLease`/`renewLease` BUILT and tested, 2026-09-10** (PLAN.md section 20;
+      `runtime/supervisor.js`, `db/index.js`'s `tryAcquireLease` et al., `config/resources.js` for
+      `resources.json`, migration 0012 adding `resource_leases.release_reason`). `git:identity`
+      (exclusive) and `host:heavy-job` (counted, capacity 1, `memoryHeadroomPercent: 15` default) ship
+      as built-in declared resources. **Claim-before-side-effect, proven CONCURRENTLY**: 8 real OS
+      processes race an exclusive lease (`db/test/leases.test.js` case 1, exactly 1 granted) and a
+      capacity-3 counted lease (case 2, exactly 3 granted) via `BEGIN IMMEDIATE` — a plain
+      `db.transaction()` only escalates to a write lock at the first write, which is too late for a
+      check-then-insert. TTL+heartbeat persisted, swept on the SAME timer `asks.auto_close_at` already
+      uses rather than a second mechanism, `release_reason` distinguishes a sweep from a holder's own
+      release (same shape as `asks.answered_by = 'supervisor:auto-close'`). Gated by one new capability
+      `resource:lease` (not per-resource — the capability model gates commands, not arguments, outside
+      the sensitive-approval mechanism, checked before deciding). **§20.2's queue visibility, decided**:
+      no FIFO "position" concept — a `counted` resource is a semaphore, not a mutex queue, so "3rd in
+      line" isn't well-defined when up to `capacity` holders can be admitted in any order; a refusal
+      names every current holder (`blockedBy`) instead. 8 pure + 7 wired test cases, 0 mutations (no
+      pre-fix state for brand-new code; the concurrent-process race stands in, same as Group 5's
+      standing rule). **Flaked once on a re-run** (`runtime/test/leases.test.js`'s "healthy host" case
+      depended on real ambient free memory, which briefly dropped under 15% from something else running
+      on the machine) — fixed by mocking `os.freemem`/`os.totalmem` in both directions rather than
+      relying on the real host being "healthy"; re-verified clean across 3 consecutive full-suite runs
+      afterward. `npm test`: 110 suites, exit 0.
+- [x] **A blocked lease is a non-blocking refusal naming the holder, matching §20.2's spirit** — there is
+      no in-process blocking wait to pause on (`acquireLease` is a synchronous check-and-claim in a
+      multi-process daemon), so "pause, don't kill" is satisfied by the CALLER (not yet built —
+      `git-create-push`) choosing to retry or surface `blockedBy` to a human rather than killing anything
+      on a refusal. Nothing here kills a worker on a lease refusal; there is no code path that could.
+- [x] **`host:heavy-job`'s memory-pressure check is BUILT, 2026-09-10** (PLAN.md §20.3) — reversing the
+      "not built yet" note from earlier the same day. `os.freemem()`/`os.totalmem()` sampled on every
+      `acquireLease('host:heavy-job')` call (not periodically while held — see below), refusing below
+      the configured headroom and surfacing the sampled numbers in BOTH the grant and the refusal object
+      (`{freeBytes, totalBytes, freePercent, headroomPercent}`), per §20.3's "a human sees the number,
+      not just a refusal." **Not built**: periodic re-sampling of a lease already held (only the acquire
+      moment is checked) — noted as open, not silently dropped.
+- [x] **Per-task shared git worktree, with an explicit opt-out for isolated testing — BUILT 2026-09-10**
+      (PLAN.md §7). `createTaskWorktree(taskId, { repoPath, branch })` (idempotent — a real `git worktree
+      add`, `repoPath` caller-supplied since `tasks.repo_id` is unused with no registry to look it up),
+      `discardTaskWorktree(taskId)` (refuses on a non-terminal task via `domain/task-states.js`'s
+      `isTerminal`, else `git worktree remove` + clears `tasks.worktree_id`/`branch`), and
+      `requestWorktree(runId, { reason })` (refuses with no `reason`; creates a SEPARATE overlay worktree
+      off the task's current HEAD on branch `ctd-overlay/<taskId>/<runId>` — a top-level ref namespace,
+      not nested under the task's own `ctd/<taskId>` branch, because git refs can't have a ref be both a
+      leaf and a path segment; hit that collision once while building this). All three gated by one new
+      capability `task:worktree`, granted to `worker`/`reviewer`/`cto` (owner has everything) — deliberately
+      coarse: a worker can technically also create/discard the shared worktree, not just request its own
+      overlay, documented as a tradeoff in `domain/capabilities.js` rather than split further. No schema
+      addition was needed — confirmed 2026-09-10, `tasks.worktree_id`/`tasks.branch` already existed
+      (migration 0001) and are already the live cwd a task's runs spawn into
+      (`runtime/supervisor.js`'s `cwd ?? task.worktree_id`); this item was the *lifecycle*, not new fields.
+      `requestWorktree`'s reason is written to `agent_journal` (§16's existing "task history, not memory"
+      log — reused, not a new table), mirroring `grantApproval`'s own pattern of a second, human-readable
+      journal entry alongside the wrapper's generic one; worth also surfacing to agentmemory/claude-mem
+      where installed, per §2, as richer optional recall on top of the mandatory entry.
+      **`merge` is NOT a supervisor command** — `mergeTask()` already explicitly does not touch git ("Merging
+      code is the `git-create-push` agent's job"), so PLAN.md §7's "merge" lifecycle step is
+      `git-create-push` operating inside the shared worktree after `mergeTask`'s approval-gated transition,
+      not something built here. `sync` (rebase base updates into the shared worktree on request) is also not
+      built yet — deferred, not forgotten.
+      **CORRECTED 2026-09-11 — the non-terminal check above was not the safety backstop it looked like.**
+      Both codex reviews (`codexdoc/REVIEW-NOTES.md`/`review-phase7-uncommitted.md` finding 4/3) found that
+      task state and run termination are separate — `mergeTask`/cancel/fail transitions record the state
+      change without stopping any run still using the tree — so a terminal task could still have an open run,
+      and `discardTaskWorktree` would force-delete the dirty tree out from under it. **Fixed the same day**:
+      `discardTaskWorktree` now also refuses when any run joined via `workers.task_id` has `ended_at IS NULL`,
+      regardless of the task's own terminal state. Proven against the pre-fix code (`runtime/test/worktree.test.js`
+      case 7 — terminal task + open run refuses; discard succeeds once the run ends). **Both remaining
+      deferred items fixed 2026-09-11**: `createTaskWorktree` now claims the slot with a compare-and-swap
+      (`WORKTREE_CLAIM_PENDING` marker, `BEGIN IMMEDIATE`) before running any git command — proven with a
+      deterministic two-barrier real-process test (`worktree.test.js` case 10; the first, non-deterministic
+      version, case 9, passed 3/3 times against the UNFIXED code, worth remembering); and
+      `acquireLease`/`requestWorktree` now refuse a worker-backed principal's `runId` that resolves to a
+      different worker (case 8 in both `leases.test.js` and `worktree.test.js`).
+      Tests: `runtime/test/worktree.test.js`, 6 cases, real `git worktree add`/`remove` against a throwaway
+      repo in `os.tmpdir()` (no mocked git) — idempotent create, discard refuses non-terminal / actually
+      removes once terminal, requestWorktree refuses with no reason / creates a genuinely separate directory,
+      capability+coverage wiring. `npm test`: exit 0, 107 suites (was 106; `domain/test/capabilities.test.js`
+      also updated — its own allow-listed-domains assertion needed `"task"` added for `worker`/`reviewer`,
+      the deliberate consequence of this capability grant, not a workaround).
+- [x] **MCP server pooling — BUILT 2026-09-11** (PLAN.md §21.1). `runtime/mcp-pool.js` + migration 0013
+      (`mcp_pool.status`/`.pgid`, new `mcp_pool_attachments` table — refcount DERIVED from attachment
+      rows, not migration 0011's original bare integer, per `codexdoc/REVIEW-NOTES.md`'s explicit
+      warning against exactly that). One resident process per `(name, config_hash)`, resurrected (same
+      row) after a full drain rather than re-inserted. The last-detach-vs-new-attach race is closed by
+      construction (attach only joins `starting`/`ready`, never `draining`) and proved 4 ways:
+      deterministic interleaving, a real 8-process DB-primitive race, a 6-worker concurrent-async race
+      of the full manager with real spawn/kill, and boot reconciliation killing a real orphan from a
+      "previous boot." `leo-mcp` (§16.1) is the first real pooled config. `runtime/test/mcp-pool.test.js`,
+      6 cases (a 7th and 8th added 2026-09-11 in the fix pass below). **Wired end-to-end 2026-09-11**:
+      `start()` attaches a utility-task role to its declared pool(s) before spawning; `endRun`/
+      `releaseSession`/boot reconciliation's `lost` path detach on the way out. 6 cases in
+      `runtime/test/mcp-pool-wiring.test.js` (a real pool+attachment row after start; detach-on-end; a
+      non-utility role untouched; two concurrent same-role runs sharing one pool row; a lost run's
+      attachment cleaned up by reconciliation; an `adapter.start()` throw before a runId exists still
+      detaching).
+      **Corrected 2026-09-11, by an independent review (`codexdoc/review-luna-2026-09-11.md` finding
+      2) — the wiring above briefly ALSO built `spec.mcpConfig` from the attachment and handed it to the
+      real adapter. That was worse than "not yet shared": the adapter's own `StartSpec` typedef declares
+      `mcpConfig` as `string | string[]` (a real config file path), so a non-string marker object would
+      have been pushed into a real `spawn()`'s argv. `start()` no longer sets `spec.mcpConfig` at all —
+      the attach/detach bookkeeping is real and tested; a worker getting an actual usable MCP connection
+      from it is not, and won't be until `--mcp-config`'s real accepted value shapes are measured against
+      the real CLI (leo-mcp's new socket transport, below, doesn't by itself answer that).**
+      **Two more real bugs fixed in the same pass**: `hashPoolConfig` used to hash only top-level key
+      NAMES (a `JSON.stringify` replacer-array quirk), so two configs differing only in a nested `env`
+      credential hashed identically — closed with a real recursive canonical stringifier
+      (`mcp-pool.test.js` case 7). A dead pooled process used to leave its attachment row live forever,
+      blocking a resurrected replacement's own teardown — `markPoolFailed` now closes every live
+      attachment atomically with the failure write (`mcp-pool.test.js` case 8, a real killed child
+      process). All four fixes verified to fail against the pre-fix code first.
+- [x] **Lazy capability router — BUILT 2026-09-11, scope corrected by investigation** (PLAN.md §21.2).
+      Checked first whether a harness-level "defer tool schemas" mechanism exists for a spawned worker
+      session (modeled on this project's own deferred-tool pattern) — it does NOT: `worker-env.js`
+      shows `spec.mcpConfig` (an explicit file list + `--strict-mcp-config`) is the only lever this
+      codebase has, with no per-turn ask-for-it-by-name deferral available. Built what IS buildable
+      given that ceiling: `domain/mcp-manifest.js`'s `manifestForRole` (pure, 4 cases) computes the
+      MINIMAL `--mcp-config` set a role would need by declared pool name — narrower than "every
+      configured server," honestly not per-turn lazy discovery. **Not wired into `spec.mcpConfig` at
+      all** (corrected above alongside §21.1) — this module's output was briefly wired in, found to hand
+      the adapter a malformed value, and removed; `manifestForRole` itself stays correct and tested, its
+      integration point is just not `spec.mcpConfig` until a real config-value shape is measured.
 - [ ] Operation-intent-before-side-effect journals for every utility agent (append-only
       task-history log, checked before acting — "did I already file this ticket").
 - [ ] slack-message agent posts as the bot only (PLAN.md section 14.5) — as-user
@@ -449,8 +660,15 @@ built correctly the first time, not a bug to patch in throwaway spike code.
 - [ ] Cheap resident model by default (`cto` role in `harness-defaults.json`), with
       single-decision escalation to a stronger model rather than running high-effort
       resident all day.
-- [ ] Clear policies per role (PLAN.md section 8, Rule 5) — `harness-defaults.json`
-      `clearPolicy` field, proven against real `clearContext` behavior from Phase 0b.
+- [~] Clear policies per role (PLAN.md section 8, Rule 5) — **SCHEMA done, 2026-09-13, item 39;
+      decision logic NOT built.** `config/harness-defaults.js`'s `CLEAR_POLICIES` vocabulary
+      (`on-state-transition`/`per-review-round`/`on-demand`/`always`) and a `clearPolicy` field on
+      every `BUILT_IN_DEFAULTS` role entry, validated on load (a value outside the vocabulary now
+      throws, matching this file's own "malformed file throws" rule — it did NOT before this fix).
+      Nothing yet reads `clearPolicy` to actually call `clearContext()`/`resume()` at the right
+      moment — no `domain/clear-policy.js` decision module exists. That module, proven against
+      real `clearContext` behavior from Phase 0b, is the remaining, NOT-yet-started half of this
+      checkbox.
 - [ ] Wire the "clean vs. kill" distinction (PLAN.md section 7) as an explicit rule the
       CTO follows, never inferred from a loose paraphrase.
 
@@ -488,6 +706,11 @@ rewritten while the workflow is still changing shape. See PLAN.md section 18.)*
 - [ ] Register pre-installed, versioned adapters that declare a capability matrix and
       pass the conformance suite (PLAN.md section 9) — no runtime adapter generation.
 - [ ] Turn "onboard agy" into this repeatable registration flow (FLOWS.md diagram 4).
+- [ ] **Spike, before committing: does ACP (Agent Client Protocol) replace bespoke per-harness
+      adapters** (PLAN.md section 9, added 2026-09-10 after reviewing `hydra-acp`). Check whether
+      either current harness speaks ACP today; if not, weigh a translation shim's cost against the two
+      adapters it would replace. If it clears that bar, ACP is a *transport* — still registered and
+      conformance-tested exactly per section 9, not a bypass of that model.
 
 ## Phase 12 — Release hardening
 - [ ] Crash injection testing, migration testing, install/update/uninstall flows,

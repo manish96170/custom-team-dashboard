@@ -126,8 +126,36 @@ detail and the mutation evidence live in `supervisor/runtime/FINDINGS.md`.
    The shape underneath this changed too: an `observe` connection is no longer the run's
    event *consumer* (the supervisor's pump is), so a disconnect can no longer stop a run.
 
-## Open item, not implemented
+## `SO_PEERCRED`/`getpeereid` — DECIDED, not a gap (re-verified 2026-09-13)
 
-`SO_PEERCRED`/`getpeereid` uid-check on socket accept (listed in TODO.md Group 3) —
-Node has no built-in API for it. Flagged for a follow-up (likely a small native
-addon or a documented deferral), not silently dropped.
+Listed in TODO.md Group 3 and in HANDOFF.md's older should-fix backlog as still open; it is not.
+This was investigated and DECIDED before Phase 7's authorization work existed, in
+`adapters/claude-code/probe/peercred-probe.mjs` (evidence 17, 2026-09-09) — re-run today against
+the current Node version and it reproduces identically: a Unix-socket connection's `remoteAddress`/
+`remotePort`/`remoteFamily` are all `undefined`, and the connection handle's own prototype exposes
+only `bind, listen, connect, open, fchmod` — no cred/peer/uid/pid method exists anywhere in pure
+Node. A real OS-level peer-credential check is genuinely not reachable without a native addon.
+
+**Decided not to build one.** The two-part identity `runtime/supervisor.js` documents at length
+(§14.5/migration 0010, right where `ensureOwnerPrincipal` lives) already closes the SAME gap
+SO_PEERCRED would have, and does it with something SO_PEERCRED could not on its own: capability
+granularity, not just same-user liveness.
+
+  1. **The state directory is `0700`** (`db/index.js`'s `ensureStateDir`, forced via `chmodSync`
+     rather than trusted to `mkdir`'s umask-affected mode) — the socket lives inside it, so on
+     POSIX, resolving the path to `connect()` at all already requires being the owning OS user.
+     This is exactly what SO_PEERCRED would have told the server about an accepted connection;
+     the filesystem enforces it BEFORE the connection is even accepted, for free.
+  2. **A supervisor-minted, hashed, capability-scoped token** (Phase 7's whole authorization gate)
+     is checked on every command — a real uid check would only prove "same OS user," never "this
+     specific principal, holding these specific capabilities," which is what the actual command
+     surface needs and is what's actually enforced.
+
+Building a native addon (real node-gyp compilation, real per-platform code — `SO_PEERCRED` is a
+Linux `getsockopt`, macOS/BSD use `getpeereid`, different APIs) would add real maintenance surface
+to close a gap the two mechanisms above already close for this project's stated threat model. The
+ONE thing it would add that neither mechanism above provides — telling apart two DIFFERENT
+processes owned by the SAME OS user — is explicitly out of scope for "a local single-user tool"
+(`runtime/supervisor.js`'s own words) and would only matter on a shared multi-user host, which is
+not this project's current design target. That limitation is written down, not hidden: "an honest
+boundary for a local single-user tool... would not be one on a shared host."

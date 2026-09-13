@@ -63,6 +63,25 @@ export const CAPABILITIES = Object.freeze([
   "task:approve",
   "task:merge",
 
+  // The shared per-task worktree (§7, added 2026-09-10). One capability covers create/discard of the task's
+  // ONE shared worktree AND a run's own `requestWorktree` opt-out, because this codebase's capability model is
+  // coarse-grained per class of action, not per individual command (contrast the fine split on `git:push` vs
+  // `git:push-protected`, which exists because it is what makes the sensitive-approval requirement apply to
+  // one and not the other — there is no equivalent safety reason to split this one). Granting it to `worker`/
+  // `reviewer` (see PRESETS below) means a worker can also create/discard the shared worktree, not just
+  // request its own overlay — a deliberate simplification, not an oversight; `discardTaskWorktree` refuses on
+  // a non-terminal task regardless of who calls it, which is the actual backstop.
+  "task:worktree",
+
+  // Machine-wide resource arbitration (§20, added 2026-09-10): `git:identity`, `host:heavy-job`. One
+  // capability covers acquire/release/renew of ANY declared resource, not one per resource name — this
+  // codebase's capability model gates the COMMAND, not its arguments (checked against `authorize()` before
+  // deciding; the only per-argument binding it has is the sensitive-approval mechanism, which this is not:
+  // a routine lease is not in `SENSITIVE`). The backstop against misuse is `acquireLease`/`releaseLease`
+  // themselves — a principal can only release/renew a lease IT holds, checked by `holderPrincipalId`, and
+  // `host:heavy-job` refuses under real memory pressure regardless of who is asking.
+  "resource:lease",
+
   // Harness administration (§9, §12.1).
   "harness:onboard",
   "harness:preflight",
@@ -139,6 +158,7 @@ export const COMMAND_CAPABILITIES = Object.freeze({
   answerAsk: "ask:answer",
   tuiChat: "run:input",
   assignTask: "task:assign",
+  createUtilityTask: "task:assign",
   recordVerdict: "review:record",
   approveTask: "task:approve",
   preflight: "harness:preflight",
@@ -153,6 +173,21 @@ export const COMMAND_CAPABILITIES = Object.freeze({
   // needs a second principal's approval bound to its exact arguments, which is where §6's "explicit human
   // approval" stops being a boolean a caller passes and becomes a recorded artifact.
   mergeTask: "task:merge",
+  // §7's worktree lifecycle (added 2026-09-10). `createTaskWorktree`/`discardTaskWorktree` operate on the
+  // task's ONE shared worktree; `requestWorktree` is a run's explicit opt-out for isolated testing.
+  createTaskWorktree: "task:worktree",
+  discardTaskWorktree: "task:worktree",
+  requestWorktree: "task:worktree",
+  // §20's resource leases (added 2026-09-10).
+  acquireLease: "resource:lease",
+  releaseLease: "resource:lease",
+  renewLease: "resource:lease",
+  // §16's git-create-push agent (added 2026-09-10). Two commands, one fight loop
+  // (`agents/git-create-push.js`) — which one you call IS the protected/non-protected decision.
+  // `gitPushProtected` is SENSITIVE (see `SENSITIVE`): reaching its handler already required a second
+  // principal's approval bound to these exact arguments, same mechanism as `mergeTask`/`task:merge`.
+  gitPush: "git:push",
+  gitPushProtected: "git:push-protected",
 });
 
 /**
@@ -169,13 +204,18 @@ export const COMMAND_CAPABILITIES = Object.freeze({
 export const PRESETS = Object.freeze({
   // The foreground human. Holds `approve:sensitive`, and is the only holder until the CTO exists (§2, Phase 8).
   owner: Object.freeze([...CAPABILITIES]),
-  worker: Object.freeze(["read:registry", "ask:answer"]),
-  reviewer: Object.freeze(["read:registry", "observe:run", "review:record"]),
+  // `task:worktree` is here so a worker can `requestWorktree` its own isolated overlay for testing (§7) —
+  // the self-referential shape `ask:answer` already has, not a task-management power. `resource:lease` is
+  // here (added 2026-09-10) so a worker running a heavy build/test can hold `host:heavy-job` — the incident
+  // §20 exists for was two WORKER-run webpack builds, not a utility-agent or CTO action.
+  worker: Object.freeze(["read:registry", "ask:answer", "task:worktree", "resource:lease"]),
+  reviewer: Object.freeze(["read:registry", "observe:run", "review:record", "task:worktree", "resource:lease"]),
   // The CTO (Phase 8) routes and advises; it holds the registry-adjacent writes and the second signature, and
   // deliberately not `git:*` or `slack:*` — §16: "delegates all repository and external side effects".
   cto: Object.freeze([
     "read:registry", "observe:run", "run:start", "run:input", "run:interrupt", "run:stop", "run:clear",
-    "run:resume", "run:reap", "ask:answer", "task:assign", "task:transition", "task:approve",
+    "run:resume", "run:reap", "ask:answer", "task:assign", "task:transition", "task:approve", "task:worktree",
+    "resource:lease",
     // `task:merge` IS here, and it is not a contradiction with `approve:sensitive` below — it is the point.
     // Moving a task to `merged` is registry-adjacent, which §16 gives the CTO ("performs registry-adjacent
     // actions directly via typed supervisor commands"). But merge is in the sensitive class, and a principal
@@ -185,10 +225,17 @@ export const PRESETS = Object.freeze({
     "harness:preflight", "harness:onboard", "session:adopt", "approve:sensitive",
   ]),
   // The roster (§16). One domain each, and `git:push-protected` is present for the git agent because holding
-  // it is what makes the second-signature requirement apply to it at all.
-  "utility:git": Object.freeze(["read:registry", "git:push", "git:push-protected"]),
+  // it is what makes the second-signature requirement apply to it at all. `resource:lease` is on `utility:git`
+  // (not the other two roster presets) because `git:identity` is the resource the not-yet-built
+  // `git-create-push` agent will hold across its whole switch -> push -> restore triple (§20.1) — jira and
+  // slack agents have no machine-wide resource of this kind to arbitrate.
+  "utility:git": Object.freeze(["read:registry", "git:push", "git:push-protected", "resource:lease"]),
   "utility:jira": Object.freeze(["read:registry", "jira:create"]),
   "utility:slack": Object.freeze(["read:registry", "slack:post-bot"]),
+  // PLAN.md §16.2, added 2026-09-11: `awsquery-runner` is a pure read query (an AWS MCP call the worker
+  // makes itself, not a dashboard wire command) — no side-effecting capability exists for it to hold,
+  // and none should be invented just to give this preset a second entry. `read:registry` only.
+  "utility:awsquery": Object.freeze(["read:registry"]),
 });
 
 /** Validate a capability set at mint time, so a typo cannot silently grant nothing (or something else). */

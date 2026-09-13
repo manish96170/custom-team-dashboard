@@ -141,10 +141,11 @@ testCase("a sensitive action needs an approval bound to the exact arguments", ()
   assert.match(authorize({ principal: holder, command, args: cmdArgs, approval: { ...base, expiresAt: "2026-09-08T23:00:00.000Z" }, now: NOW }).reason, /expired/);
   assert.match(authorize({ principal: holder, command, args: cmdArgs, approval: { ...base, action: "slack:post-as-user" }, now: NOW }).reason, /not task:merge/);
 
-  // An unmapped command is refused BEFORE any of that, which is why a capability that has no command yet
-  // (`git:push-protected`, waiting on Phase 7's git agent) cannot be reached at all.
+  // An unmapped command is refused BEFORE any of that, which is why holding a real capability cannot
+  // reach a command nobody has declared. `gitPushProtected` used to be this example (it had a capability
+  // but no command); it's real now (Phase 7 step 5), so a genuinely nonexistent command name stands in.
   const gitAgent = principal(["git:push-protected"], { id: "p-git", kind: "utility" });
-  const unmapped = authorize({ principal: gitAgent, command: "gitPushProtected", args: { branch: "main" }, now: NOW });
+  const unmapped = authorize({ principal: gitAgent, command: "gitCreatePushRebaseEverything", args: { branch: "main" }, now: NOW });
   assert.equal(unmapped.ok, false);
   assert.match(unmapped.reason, /declares no required capability/,
     "the capability exists, the command does not, and fail-closed means the answer is still no");
@@ -234,14 +235,21 @@ testCase("the presets are fixed toolsets", () => {
   // Phase 7 review (sol), and it is the difference between "these three are absent" and "only these are
   // present": a fixed toolset is a statement about the whole set.
   const ALLOWED_DOMAINS = {
-    worker: ["read", "ask"],
-    reviewer: ["read", "observe", "review"],
-    "utility:git": ["read", "git"],
+    // "task" added 2026-09-10 (§7): `task:worktree` is what lets a worker/reviewer call `requestWorktree`
+    // for its own isolated overlay — the same self-referential shape `ask:answer` already has, not a
+    // task-management power (`createTaskWorktree`/`discardTaskWorktree` share the one capability too; see
+    // domain/capabilities.js's comment on why this is one coarse-grained capability, not several).
+    // "resource" added 2026-09-10 (§20): `resource:lease` is what lets a worker/reviewer hold `host:heavy-job`
+    // while running a build/test, and the git-create-push agent (not yet built) hold `git:identity` — a
+    // machine-wide arbitration capability, not a registry power, same reasoning as `task:worktree` above.
+    worker: ["read", "ask", "task", "resource"],
+    reviewer: ["read", "observe", "review", "task", "resource"],
+    "utility:git": ["read", "git", "resource"],
     "utility:jira": ["read", "jira"],
     "utility:slack": ["read", "slack"],
     // The CTO runs the dashboard and delegates side effects, so it may hold registry and lifecycle domains and
     // NOT `git:` or `slack:` — which the loop below enforces rather than a hand-listed exclusion.
-    cto: ["read", "observe", "run", "ask", "task", "harness", "session", "approve"],
+    cto: ["read", "observe", "run", "ask", "task", "resource", "harness", "session", "approve"],
   };
   for (const [name, domains] of Object.entries(ALLOWED_DOMAINS)) {
     for (const cap of PRESETS[name]) {

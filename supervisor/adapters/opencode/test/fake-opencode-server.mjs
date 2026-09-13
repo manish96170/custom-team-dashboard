@@ -129,6 +129,17 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Test-only trigger: broadcasts a real `server.instance.disposed` SSE event on demand, so a test
+  // can fire it mid-turn (a real timing this server's own env-var-driven behaviors can't reliably
+  // hit) and prove the adapter synthesizes a terminal event for every run still in progress on this
+  // server, rather than leaving `observe()` waiting forever for a `turn.end` that will never arrive.
+  if (req.method === 'POST' && url.pathname === '/debug/dispose') {
+    broadcast({ type: 'server.instance.disposed', properties: {} });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"ok":true}');
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/event') {
     const eventDelayMs = Number(process.env.FAKE_OC_EVENT_DELAY_MS ?? 0);
     if (eventDelayMs > 0) await new Promise((r) => setTimeout(r, eventDelayMs));
@@ -168,6 +179,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'DELETE' && sub === '') {
+      const existed = sessions.delete(sessionID);
+      res.writeHead(existed ? 200 : 404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: sessionID }));
+      return;
+    }
+
     if (req.method === 'POST' && sub === '/prompt_async') {
       const body = await readBody(req);
       logPromptCall({ sessionID, ...body });
@@ -196,7 +214,10 @@ const server = http.createServer(async (req, res) => {
         broadcast({ type: 'message.part.delta', properties: { sessionID, field: 'text', delta: 'hi' } });
         broadcast({ type: 'session.idle', properties: { sessionID } });
       };
-      if (process.env.FAKE_OC_FAST_TURN === '1') {
+      if (process.env.FAKE_OC_NEVER_FINISH === '1') {
+        // Deliberately never calls emitTurn — a turn genuinely, permanently mid-flight, so a test
+        // can prove what happens when the SERVER (not the turn) ends first, via /debug/dispose.
+      } else if (process.env.FAKE_OC_FAST_TURN === '1') {
         emitTurn(); // synchronously, before the caller could plausibly call observe()
       } else {
         setTimeout(emitTurn, 50);
@@ -206,6 +227,11 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && sub === '/abort') {
       broadcast({ type: 'session.error', properties: { sessionID, error: { name: 'MessageAbortedError' } } });
+      // Matches real OpenCode's MEASURED abort behavior (adapter.js's own interrupt() doc comment,
+      // FINDINGS.md #4): session.error is followed by session.idle for the SAME logical ending, not
+      // two independent outcomes. Older should-fix backlog: "OpenCode abort can emit two terminal
+      // events... both mapped to turn.end" — this is what a test needs to actually reproduce it.
+      broadcast({ type: 'session.idle', properties: { sessionID } });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end('{}');
       return;

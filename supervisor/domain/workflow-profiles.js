@@ -41,6 +41,11 @@ export const ROLES = Object.freeze(["coder", "reviewer", "parentReviewer"]);
 const DEFAULT_PROFILE = Object.freeze({
   type: "(default)",
   roles: Object.freeze(["coder", "reviewer", "reviewer"]),
+  // `workRoles`: which of this profile's roles count as "there is work to do" for `isActionable`
+  // (domain/assignment.js) — explicit per profile rather than a global two-name hardcode, so a NEW
+  // profile declares its own answer instead of silently falling through a condition nobody updated for
+  // it. Codex review (`codexdoc/REVIEW-NOTES.md` finding 7), fixed 2026-09-11.
+  workRoles: Object.freeze(["coder"]),
   requiredVerdicts: 2,
   paneDefault: "dev",
   reviewRequired: true,
@@ -54,6 +59,7 @@ const PROFILES = Object.freeze({
   bug: Object.freeze({
     type: "bug",
     roles: Object.freeze(["coder", "reviewer"]),
+    workRoles: Object.freeze(["coder"]),
     requiredVerdicts: 1,
     paneDefault: "dev",
     reviewRequired: true,
@@ -67,6 +73,7 @@ const PROFILES = Object.freeze({
   review: Object.freeze({
     type: "review",
     roles: Object.freeze(["parentReviewer"]),
+    workRoles: Object.freeze(["parentReviewer"]),
     requiredVerdicts: 1,
     paneDefault: "review",
     reviewRequired: true,
@@ -79,6 +86,7 @@ const PROFILES = Object.freeze({
   adhoc: Object.freeze({
     type: "adhoc",
     roles: Object.freeze(["coder"]),
+    workRoles: Object.freeze(["coder"]),
     requiredVerdicts: 0,
     paneDefault: "dev",
     reviewRequired: false,
@@ -87,10 +95,54 @@ const PROFILES = Object.freeze({
   chore: Object.freeze({
     type: "chore",
     roles: Object.freeze(["coder"]),
+    workRoles: Object.freeze(["coder"]),
     requiredVerdicts: 0,
     paneDefault: "dev",
     reviewRequired: false,
     description: "maintenance: one worker, no reviewers",
+  }),
+  // PLAN.md §16.2, the utility-task lane, added 2026-09-11: same adhoc shape (one worker, zero required
+  // verdicts, still no autonomous merge) but a DISTINCT role name per type, not "coder" — that's what
+  // makes each one resolve to its own cheap-model `harness-defaults.json` entry
+  // (config/harness-defaults.js's BUILT_IN_DEFAULTS) instead of the coder's. A separate profile per role
+  // rather than one adhoc profile with an overridable role name, because task TYPE already drives role
+  // resolution everywhere else in this file — a second, parallel override mechanism would be the same
+  // "two ways to reach the same decision" shape this project avoids elsewhere.
+  "git-push-task": Object.freeze({
+    type: "git-push-task",
+    roles: Object.freeze(["git-push-runner"]),
+    workRoles: Object.freeze(["git-push-runner"]),
+    requiredVerdicts: 0,
+    paneDefault: "dev",
+    reviewRequired: false,
+    description: "a narrow, do-and-forget git push (PLAN.md §16.2) — one worker, no reviewers",
+  }),
+  "jira-task": Object.freeze({
+    type: "jira-task",
+    roles: Object.freeze(["jira-runner"]),
+    workRoles: Object.freeze(["jira-runner"]),
+    requiredVerdicts: 0,
+    paneDefault: "dev",
+    reviewRequired: false,
+    description: "a narrow, do-and-forget Jira operation (PLAN.md §16.2) — one worker, no reviewers",
+  }),
+  "awsquery-task": Object.freeze({
+    type: "awsquery-task",
+    roles: Object.freeze(["awsquery-runner"]),
+    workRoles: Object.freeze(["awsquery-runner"]),
+    requiredVerdicts: 0,
+    paneDefault: "dev",
+    reviewRequired: false,
+    description: "a narrow, do-and-forget AWS read query (PLAN.md §16.2) — one worker, no reviewers",
+  }),
+  "slack-task": Object.freeze({
+    type: "slack-task",
+    roles: Object.freeze(["slack-runner"]),
+    workRoles: Object.freeze(["slack-runner"]),
+    requiredVerdicts: 0,
+    paneDefault: "dev",
+    reviewRequired: false,
+    description: "a narrow, do-and-forget Slack post (PLAN.md §16.2) — one worker, no reviewers",
   }),
 });
 
@@ -113,6 +165,20 @@ export function profileFor(type) {
 /** The roles a task of this type needs a worker for — §11's "each role the task needs". */
 export function rolesFor(type) {
   return [...profileFor(type).roles];
+}
+
+/**
+ * The roles of THIS profile that count as "there is work to do" — `domain/assignment.js`'s
+ * `isActionable` uses this instead of a hardcoded role-name check, so a new profile states its own
+ * answer rather than silently falling through a condition nobody remembered to extend for it. Falls
+ * back to every role EXCEPT "reviewer" for a profile that doesn't declare `workRoles` explicitly (every
+ * profile in this file does, but a future one that forgets should still behave sensibly rather than
+ * report no work at all). Codex review (`codexdoc/REVIEW-NOTES.md` finding 7), added 2026-09-11.
+ */
+export function workRolesFor(type) {
+  const profile = profileFor(type);
+  if (profile.workRoles) return [...profile.workRoles];
+  return profile.roles.filter((r) => r !== "reviewer");
 }
 
 /**

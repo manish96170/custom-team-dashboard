@@ -42,6 +42,11 @@ import {
   deletePreflightRun,
   getModelHealth,
   listModelHealth,
+  mintPrincipal,
+  tryAcquireLease,
+  claimPoolSlot,
+  markPoolReady,
+  attachToPool,
 } from "../../db/index.js";
 import { createSupervisor } from "../supervisor.js";
 import { createFakeHarness } from "./_fake-harness-adapter.js";
@@ -288,6 +293,40 @@ await runTest("preflight", async () => {
         "the pump must be closed before the rows go, or it persists events for a run that no longer exists");
       assert.equal(getRun(db, runId) ?? null, null, "and the row is gone");
       console.log("  9. the pump was detached before the rows were deleted");
+    }
+
+    // ── 10 ───────────────────────────────────────────────────────────────────────────
+    // review-sol-2026-09-13.md finding 20: migrations 0011/0013 added FOREIGN KEY references to
+    // `runs(run_id)` from `resource_leases.holder_run_id` and `mcp_pool_attachments.run_id`, neither of
+    // which existed when `deletePreflightRun` was written. A preflight run that ever acquired a lease
+    // or attached to a pooled MCP server used to make the `DELETE FROM runs` fail with a real
+    // `FOREIGN KEY constraint failed`, regardless of whether the lease/attachment had already been
+    // released/detached — the historical row's FK reference remains either way.
+    {
+      const { runId } = await supervisor.start({
+        harnessId: "fake",
+        workerId: "w1",
+        spec: { cwd: stateDir, prompt: "preflight with FK children", isPreflight: true },
+      });
+      await waitFor(() => rowCount(db, "event_log", runId) > 0, { timeoutMs: 5000, what: "event rows" });
+
+      mintPrincipal(db, { id: "p-preflight-fk", kind: "worker", tokenSha256: "hash-preflight-fk", capabilities: ["resource:lease"] });
+      const lease = tryAcquireLease(db, { resourceName: "host:heavy-job", kind: "counted", capacity: 3, holderPrincipalId: "p-preflight-fk", holderRunId: runId });
+      assert.equal(lease.granted, true, "precondition: the preflight run holds a real lease referencing it");
+
+      const claim = claimPoolSlot(db, { name: "preflight-fk-pool", configHash: "x" });
+      markPoolReady(db, claim.pool.id, { pid: 999997, pgid: 999997 });
+      const attached = attachToPool(db, { name: "preflight-fk-pool", configHash: "x", runId });
+      assert.equal(attached.attached, true, "precondition: the preflight run has a real MCP pool attachment referencing it");
+
+      const removed = deletePreflightRun(db, runId);
+      assert.equal(removed.deleted, true, `deletePreflightRun must succeed despite the FK-referencing lease/attachment rows; got ${JSON.stringify(removed)}`);
+      assert.equal(removed.leases, 1, "the lease row must have been deleted along with the run");
+      assert.equal(removed.mcpAttachments, 1, "the mcp_pool_attachments row must have been deleted along with the run");
+      assert.equal(db.prepare("SELECT COUNT(*) AS n FROM resource_leases WHERE holder_run_id = ?").get(runId).n, 0);
+      assert.equal(db.prepare("SELECT COUNT(*) AS n FROM mcp_pool_attachments WHERE run_id = ?").get(runId).n, 0);
+      assert.equal(getRun(db, runId) ?? null, null, "and the run row itself is gone");
+      console.log("  10. deletePreflightRun succeeds despite FK-referencing resource_leases/mcp_pool_attachments rows, deleting them too");
     }
   } finally {
     try { await supervisor?.shutdown({ timeoutMs: 3000 }); } catch { /* best effort */ }

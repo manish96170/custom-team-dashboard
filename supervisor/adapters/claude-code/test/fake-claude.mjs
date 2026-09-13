@@ -135,6 +135,26 @@ function handleTurn() {
     event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'hi' } },
   });
   setTimeout(() => {
+    if (mode === 'stall') {
+      // Never emits a result and never exits — the turn sits genuinely, permanently mid-flight.
+      // Distinct from 'crash': the PROCESS stays alive, so `observe()`'s idle-poll loop keeps
+      // running rather than being ended by a process.exit event.
+      return;
+    }
+    if (mode === 'crash') {
+      // Older should-fix backlog: "a Claude Code process exiting with no `result` object
+      // produces no turn.end at all." Exits with a nonzero code having printed the delta above
+      // but NEVER a `type: 'result'` line — the exact on-wire shape a real crash mid-turn leaves.
+      process.exit(1);
+      return;
+    }
+    if (mode === 'crash-clean-exit') {
+      // review-sol-2026-09-13.md finding 19: same "no result line" shape as 'crash', but exit code
+      // 0 — a process that exits cleanly WITHOUT ever printing a result is still a protocol failure,
+      // never a completed turn, regardless of its exit code.
+      process.exit(0);
+      return;
+    }
     if (mode === 'error') {
       writeLine({ type: 'result', is_error: true, terminal_reason: 'error', subtype: 'error_during_execution', result: 'boom', usage: {} });
     } else if (mode === 'aborted') {

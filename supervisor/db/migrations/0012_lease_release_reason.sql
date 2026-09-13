@@ -1,0 +1,13 @@
+-- 0012_lease_release_reason.sql — distinguish a swept-stale lease from a normal release
+-- (PLAN.md section 20). Phase 7.
+--
+-- `resource_leases.released_at IS NULL` already answers "is it held"; this answers "why did it stop
+-- being held", which the sweep needs a stored (not just logged) answer to -- the same reasoning
+-- `asks.answered_by = 'supervisor:auto-close'` already uses to distinguish a human close from a
+-- grace-period sweep close (migration 0003). A log line alone would make "how often are leases
+-- expiring instead of being released" a question nobody could answer from the database.
+--
+-- NULL for a lease that is still held (the common case, so no backfill is needed for existing rows).
+ALTER TABLE resource_leases ADD COLUMN release_reason TEXT;
+-- 'released'      -- a live holder called releaseLease.
+-- 'expired-swept' -- the TTL sweep found released_at IS NULL past ttl_expires_at.

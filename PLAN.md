@@ -452,6 +452,13 @@ Click behavior:
 - Click a worker, then press `m` -> pins its run as `mainWorkerId` for that task
   (overrides the most-recent-message default until unpinned).
 
+**Added 2026-09-11, BUILT the same day: the TREE panel gets a show/hide toggle too**, same idea as
+section 14.4's Requests panel toggle. Bound to `t` (mnemonic, and unused — checked `tui/state.js`'s
+`keyToAction` before picking it). `frameGeometry`'s `treeWidth` is simply 0 when hidden, the pane area
+reclaims exactly that width, and `selectedNodeId`/`treeScroll` are untouched — a view change, not a
+navigation reset, the same distinction section 7 already draws for "hiding a team/session from the top
+bar." Tested in `tui/test/tui.test.js` case 20.
+
 ## 6. Task state machine
 
 ```
@@ -540,6 +547,65 @@ not after.
 - **Manager-direct**: the CTO can pick up a small task itself instead of delegating,
   and logs it the same way (`source: "manager-direct"`). No work happens outside the
   database, regardless of who did it or how it was triggered.
+- **A task's worktree is shared by every worker assigned to that task — the default is
+  ONE worktree per task, not one per session.** Corrected 2026-09-10 from an earlier
+  version of this bullet that copied `hydra-acp`'s per-session isolation wholesale; on
+  reflection that was wrong for this project's actual shape. A task's coder(s),
+  reviewer(s) and lead are reviewing and building on the *same* revision on purpose —
+  section 13's quorum counts distinct reviewers looking at one commit, and a shared
+  worktree is what lets a resumed/cleared worker (section 7) and a fresh reviewer see
+  each other's actual working state without round-tripping it through a handoff first.
+  Splitting that by session would recreate, in git, exactly the isolation section 8's
+  tier-3 handoff exists to cross *deliberately* — an accident instead of a decision.
+  **Correction, 2026-09-10: no new columns needed.** `tasks.worktree_id` and
+  `tasks.branch` already exist (migration 0001) and are already the live cwd a task's
+  runs spawn into (`runtime/supervisor.js` reads `task.worktree_id` directly as `cwd`).
+  This section's job is the *lifecycle* around those existing columns — torn down on
+  `discard` after the task reaches a terminal state — not a parallel pair of fields.
+  **CORRECTED 2026-09-13 (review-sol-2026-09-13.md finding 37): creation is NOT automatic
+  on a task's first `start`.** `createTaskWorktree(taskId, { repoPath, branch })` is an
+  explicit API call a caller must make first, requiring `repoPath` (there is no
+  repo-path registry — `tasks.repo_id` is unused — so the caller must say where the repo
+  lives); `assignTask`/`start` read whatever `tasks.worktree_id` already holds and do not
+  create one themselves. A caller relying on the original wording could start a run in
+  the wrong cwd (or fail outright) expecting a worktree that was never actually made. Adding one would have repeated the exact
+  two-sources-of-truth mistake this project's own HANDOFF already calls out for
+  `runs.lifecycle` vs `exit_reason`.
+  **A session may explicitly ask for its own separate worktree** — the one case this
+  is for is isolated testing/experimentation a worker doesn't want landing in the
+  shared tree (a spike, a destructive migration dry run, anything it would need to
+  discard without touching what teammates are looking at). That is a request, not a
+  default: `requestWorktree(runId, { reason, principal })` in-process (the wire payload is flat —
+  `{ runId, reason }`, with `principal` resolved server-side from the caller's token, never taken from
+  the request; **corrected 2026-09-13, review-sol-2026-09-13.md finding 43 — this previously showed
+  `requestWorktree(runId, reason)`, a bare string second argument that does not match the real options-
+  object signature**), which creates a per-run overlay worktree
+  off the task's current branch, and the request + its reason is written to the task's
+  append-only history log (section 16's "task history, not memory" — the same log,
+  not a new one) so it is queryable later: which sessions branched off for isolated
+  work, why, and whether the result needs merging back. **This is exactly the kind of
+  fact worth also surfacing to agentmemory/claude-mem where installed** (section 2) —
+  richer recall of "who tested what in isolation and what came of it" is precisely its
+  optional value-add, on top of the mandatory log entry that works with or without it.
+  Lifecycle: `start`/`create` and `discard` are supervisor commands
+  (`createTaskWorktree`/`discardTaskWorktree`/`requestWorktree`, BUILT 2026-09-10 —
+  ROADMAP Phase 7), gated by one capability, `task:worktree`. **`merge` is deliberately
+  NOT a supervisor command** — `mergeTask()` already states plainly that it does not
+  touch git ("Merging code is the `git-create-push` agent's job"), so the git side of a
+  merge is `git-create-push` operating inside the shared worktree after `mergeTask`'s
+  approval-gated transition has already happened, per section 6's `merged` gate; this
+  section opens no new path to `merged`. `sync` (rebase/merge base updates into the
+  shared worktree on request, never silently) is specified but not yet built.
+  **CORRECTED 2026-09-13 (review-sol-2026-09-13.md finding 37) — this was aspirational,
+  never built: a new worktree starts from COMMITTED branch/HEAD state ONLY.**
+  `createTaskWorktree`'s real mechanism is a plain `git worktree add`, which checks out
+  the named branch fresh — it does not copy any uncommitted/dirty file from anywhere,
+  because there is no "wherever they were" for it to read in the first place (a task has
+  no prior worktree to copy FROM the first time one is created). A caller expecting
+  in-flight uncommitted work to follow a task into its new shared worktree will not get
+  it; only what was already committed to the branch is there.
+  Concurrent host-level resources a worktree can't isolate either way — host memory, a
+  machine-wide git identity — are still section 20's job, not this bullet's.
 
 ## 8. Context economy & token architecture
 
@@ -631,6 +697,11 @@ per-role defaults biased toward cheaper models with explicit opt-in required for
 expensive ones. This is an operational limit, not accounting — it does not touch
 section 19's no-cost-tracking non-goal.
 
+**This rule is per-supervisor, and that is not enough.** Two sessions can each honour
+their own `maxConcurrentSessions` and still take the machine down between them (it
+happened: two concurrent webpack builds). Host memory and other machine-wide resources
+are arbitrated by **section 20**'s leases, not here.
+
 **Rule 8 — measure before you optimize.** Emit `tokensIn`/`tokensOut`/`cachedTokens`
 per turn into `event_log` from the earliest runtime spike onward (harnesses already
 report this). Without a baseline, Rules 3 and 4 are folklore, not engineering. This is
@@ -693,6 +764,20 @@ an adapter its accurate label.
 Runtime research-and-generate (the original flow: CTO command -> research pass ->
 generated adapter config) stays as a **backlog** idea, gated behind whatever
 review/sandbox/rollback story would make it safe — not v1.
+
+**A candidate for Phase 11, not a decision yet: adopt ACP (Agent Client Protocol,
+agentclientprotocol.com) as the adapter-facing wire format instead of a bespoke
+protocol per harness.** Noticed reviewing `hydra-acp` 2026-09-10 — it drives Claude,
+Codex, opencode and others through one client protocol rather than one adapter per CLI.
+If a harness already speaks ACP, "onboard it" could become "register something that
+speaks the protocol we already support" instead of writing and conformance-testing a
+new adapter each time — real leverage against exactly the problem this section exists to
+solve. It does **not** replace this section's registration/conformance-suite/tiering
+model; ACP would be a *transport* a registered adapter could use, still gated by the
+same conformance suite before `active`. Spike before committing: does either current
+harness (Claude Code, OpenCode) actually speak ACP today, or would supporting it mean
+maintaining a translation shim — which could cost more than the two bespoke adapters it
+was meant to replace.
 
 ## 10. Direct-message / adhoc sessions
 
@@ -981,6 +1066,18 @@ Five things this section did not specify, decided while building and recorded he
    is delivered LABELLED — calling it confirmed would be a lie, and dropping it would lose a real finding to a
    missing configuration.
 
+**CORRECTED 2026-09-11 — quorum counting distinct reviewers (item 2 above) assumed the caller-supplied
+`workerId` on a verdict was trustworthy.** Both codex reviews (`codexdoc/REVIEW-NOTES.md` finding 3) found
+that `recordVerdict`'s wire handler accepted a caller-supplied `workerId` without binding it to the
+authenticated principal — one authenticated reviewer token could submit verdicts under a second, unrelated
+worker's identity and manufacture the two-distinct-reviewer quorum by itself. **Fixed the same day**:
+`recordVerdict` now refuses when an authenticated worker-backed principal's own `workerId` disagrees with the
+verdict's claimed `workerId`, the same "identity is a registry fact, not a request field" rule already applied
+to task/role/dimension; the wire handler now forwards `cmd._principal` through, which it had been dropping.
+Proven against the pre-fix code (`runtime/test/review.test.js` case 18). Deferred, real, and NOT fixed: nothing
+stops a reviewer from arbitrarily advancing the authoritative round being reviewed — noted as a separate open
+concern in the same finding.
+
 **Two-stage review.** `verifyFindings: true` runs each finding through an adversarial
 verification pass before it reaches the coder — findings that fail verification never
 arrive. This is both a quality gain and a token saving (section 8): the coder receives
@@ -1076,12 +1173,39 @@ slack-message agent a question. Belongs on the slack-message global utility agen
 the scopes it needs are already in the Bot Token Scopes list (section 14.1). No schema
 changes needed to defer this.
 
-### 14.4 Requests panel (UI, backlog)
+### 14.4 Requests panel (UI, backlog — layout/toggle/detail-view mechanics now BUILT 2026-09-11)
 
-Top-left of the dashboard, configurable height (default ~12%), Accepted/Declined/
-Completed buttons for review-requests plus a separate Team Requests button. Collapsed
-by default with zero pending requests. Full wireframe and keybinding in FLOWS.md
-section 6a/6b.
+Top-left of the dashboard, configurable height, Accepted/Declined/Completed buttons
+for review-requests plus a separate Team Requests button. Collapsed by default with
+zero pending requests. Full wireframe and keybinding in FLOWS.md section 6a/6b.
+
+**Still backlog: the buttons themselves and everything server-side** (a request only exists here once
+Slack inbound exists; Accept/Decline have nothing to create/reject yet — see PLAN.md §16.2's neighbor
+note). **Built 2026-09-11: the UI mechanics below**, so whoever eventually wires Slack inbound builds
+against a real, tested layout instead of the original 12%-strip design:
+
+**Corrected 2026-09-11, before this is ever built — three gaps in the original design:**
+
+1. **Default height raised to ~30% (from ~12%) — BUILT.** `tui/layout.js`'s `requestsPanelHeight`.
+2. **An explicit show/hide keybinding, independent of whether anything is pending — BUILT, bound to
+   capital `R`.** Lowercase `r` was already taken (toggle all reviewer panes); this codebase's own
+   `decodeKey` already returns a shifted letter as a distinct string (verified before picking it — it
+   just returns `chunk.toString()` unchanged for one printable character), so `R`/`r` never collide.
+   Works from anywhere, toggles both ways (unlike `h`, which only ever hides), and the existing
+   auto-reappear-on-a-fresh-non-empty-list rule (`withRequests`) is untouched.
+3. **A big request expands to a full detail view — BUILT**, as a new `FOCUS.REQUEST_DETAIL` in
+   `tui/state.js` (see FLOWS §6c). Whether a request "fits inline" is computed in `layout.js`'s
+   `hitTest` by mirroring `renderRequestsPanel`'s own row construction, so the two can't disagree about
+   width — a request that already fits just selects, as before; only a genuinely-too-long one expands.
+   Deliberately does NOT snapshot/restore anything: entering/leaving only ever changes `focus`, so
+   nothing else needs to change for the layout to come back exactly as it was — the same technique
+   `fullscreen`/`reviewersHidden` already use. Accept/Decline (`a`/`d`) hand off to `app.js` as
+   `pendingRequestDecision`, mirroring `pendingChat`'s existing split — honestly a status-line no-op
+   today, since there is still no wire command to accept a request into a real task (that part is
+   still backlog, per above).
+
+Tested in `tui/test/tui.test.js` (cases 20-22, pure state/layout, no terminal) and captured as real
+evidence in `tui/evidence/01-demo-frames.txt` / walked through in `TUI-GUIDE.md`.
 
 ### 14.5 Identity-bound authorization for as-user posting
 
@@ -1157,15 +1281,165 @@ that (a) the capability to push code, file a Jira ticket, or post to Slack isn't
 duplicated into every worker's toolset, and (b) each one is small enough to reason
 about and audit on its own — this is section 8's Rule 1, restated as an agent boundary.
 
-**Roster:**
+**Roster:** (each agent's fixed toolset is also the first candidate for section 21's
+MCP pooling + capability router — narrow-by-construction is exactly what makes a fixed
+router unambiguous.)
 1. **jira-automation agent** — only the `jira-automation` skill + its MCP server.
 2. **git-create-push agent** — real `git` access plus `gh`/`glab`, not `gh`/`glab`
    alone (section 8, Rule 2, corrects the original under-scoping). Owns its own
    fight-loop end to end and returns a short structured result, never raw tool output.
+   **BUILT, 2026-09-10** (`agents/git-create-push.js`'s pure fight loop + `runtime/supervisor.js`'s
+   `gitCreatePush` glue): stage -> commit -> classify (8 classes, pattern-matched from real hook
+   output, heuristic documented in code) -> autofix ONLY `format`/`lint-autofixable` via an
+   `.git-create-push-autofix.sh` extension point at the repo root (no autofix script -> honestly
+   unresolved, never a silent no-op claiming success) -> push, bounded at 3 total commit attempts.
+   **Two wire commands, not a runtime flag**: `gitPush` (`git:push`) and `gitPushProtected`
+   (`git:push-protected`, SENSITIVE) share one fight loop. `git:identity` (§20) is acquired
+   before anything else and released in a `finally`, proven both by a genuine cross-process
+   contention test (a real separate OS process holding the lease genuinely blocks a `gitCreatePush`
+   call from this process) and by a forced-throw case (a task whose worktree points nowhere still
+   releases the lease). **`gh pr create`/`mrUrl` is real and wired (`openPullRequest`, opt-in via
+   `runFightLoop`'s `openPr: true`) but deliberately excluded from `npm test`** — needs real
+   credentials and network, same class of exclusion as this project's other `real-*.slice.mjs`
+   files; `runtime/test/real-git-create-push.slice.mjs` is the manual counterpart. 15 new cases
+   across two test files (`agents/test/`, `runtime/test/`), suite 110 -> 112, exit 0, re-verified
+   3x.
+   **CORRECTED 2026-09-11 — the claim above (bold, now removed) was WRONG and a real bypass:** "which
+   one you call IS the protected/non-protected decision" assumed a caller would honestly choose
+   `gitPushProtected` for a protected destination — nothing stopped it from calling the cheap `gitPush`
+   for the SAME destination instead, since neither command classified the actual branch being pushed to.
+   Found independently by both codex reviews (`codexdoc/REVIEW-NOTES.md` finding 2). **Fixed the same
+   day**: `gitPush`'s handler now resolves the real destination and refuses server-side, BEFORE the
+   fight loop runs, if it matches a configured protected-branch list (`config/protected-branches.js`,
+   new — same on-demand/malformed-throws contract as `harness-defaults.js`). `gitPushProtected` needed
+   no change — reaching it already required the sensitive approval regardless of destination.
+   **Also fixed the same day, a separate finding**: `git add -A` on the task's SHARED worktree staged
+   and pushed ANY uncommitted change present, not just the caller's own (`codexdoc/REVIEW-NOTES.md`
+   finding 5). `runFightLoop` gained an optional `paths` parameter to stage exactly named files instead
+   — **this does not make the default safe**; omitting `paths` still runs `-A` unchanged, and a caller
+   on a shared worktree MUST pass explicit paths. Both fixes proven against the pre-fix code
+   (`runtime/test/git-create-push.test.js` case 7, `agents/test/git-create-push.test.js` cases 7-8).
 3. **slack-message agent** — wraps `team-slack-bridge` (outbound posting/DM; as-user
-   and DM-reading are backlog per section 14.5/14.6).
+   and DM-reading are backlog per section 14.5/14.6). **Corrected 2026-09-11 — see §16.1: this
+   wraps `leo-mcp`'s mounted Slack tools now, not `team-slack-bridge` directly**, though the
+   underlying code is still exactly `team-slack-bridge`'s own, unchanged.
 4. **CTO agent** — section 2. Delegates all repository and external side effects;
    performs registry-adjacent actions directly via typed supervisor commands.
+
+### 16.1 `leo-mcp` — why the Jira/Slack roster items changed shape, 2026-09-11
+
+While starting jira-automation/slack-message, checking what already existed changed the plan:
+`~/.claude/skills/git-create-push/SKILL.md` and `~/.claude/skills/jira-automation/SKILL.md` are real,
+mature, CONVERSATIONAL skills (they ask a human everything up front — commit type, MR method, sprint,
+custom fields — then execute); and `team-slack-bridge` (the sibling repo section 14 already depends on)
+had, by 2026-09-10, grown a full 21-tool MCP server (`team-slack-bridge/mcp/tools.local.js`) — posting,
+DMs, scheduling, search, an idempotency ledger — none of which this document's earlier draft of section
+14 had caught up to.
+
+**Building bespoke supervisor-side Jira/Slack agents here would have duplicated real, working code.**
+So: **`leo-mcp`** (new standalone sibling repo, `../leo-mcp/`) consolidates the MECHANICAL, deterministic
+half of this roster into one MCP server:
+
+- **`git_push`** — the exact fight-loop this section's item 2 already built (`agents/git-create-push.js`),
+  ported to `leo-mcp/git/fight-loop.js` as a standalone, dashboard-independent copy. **Deliberate,
+  tracked duplication, not an oversight** — this dashboard keeps its own copy for its lease-gated
+  automated path (`git:identity` held across the whole call, section 20), and `leo-mcp`'s copy is for
+  anyone/anything else that wants the same tool without the dashboard's SQLite/lease/capability system.
+  Both copies' header comments point at each other and say so.
+- **`slack_*` (21 tools)** — MOUNTED directly from `team-slack-bridge/mcp/tools.local.js`, not
+  reimplemented. `leo-mcp` takes a `file:` dependency on `team-slack-bridge` and re-registers its real
+  tool objects under one combined `tools/list`, so a caller gets git + Slack (+ Jira, below) over ONE MCP
+  connection instead of two or three — the actual point of section 21's pooling reasoning, generalized
+  from "don't duplicate copies of the same server" to "don't make a caller connect to N servers when one
+  consolidated one will do."
+- **`jira_create_ticket`** — a STUB, deliberately. `jira-automation`'s SKILL.md encodes this org's real
+  custom-field IDs (sprint, acceptance criteria, area of impact, etc.) as prose, and porting them to code
+  is exactly the reliability/token win this consolidation is for — but those IDs were read out of a
+  skill file, never verified against a live Jira schema, and a wrong custom-field ID silently corrupts a
+  REAL ticket rather than failing loudly. `leo-mcp/jira/tools.js` documents the field map and refuses to
+  write anything until a human has checked it against `getJiraIssueTypeMetaWithFields` (the `atlassian`
+  MCP already has this) and signed off. Unlike a bad git push (fails locally, nothing lost) or a bad
+  Slack message (deletable), this is a different risk class and gets a stub instead of a guess.
+
+**What stays a skill, not an MCP tool, and why:** both `git-create-push` and `jira-automation`'s
+conversational halves — asking a human for a ticket number, drafting a summary from a diff, deciding
+whether to open an MR — are JUDGMENT, which an MCP tool call (deterministic args in, deterministic
+result out) cannot do. Those skills keep existing, unchanged, for a human's own interactive use; they are
+candidates to eventually CALL `leo-mcp`'s tools for their mechanical steps instead of shelling out to
+`git`/`gh`/`glab` themselves, so the conventions live in one place — not done yet, noted as a follow-up in
+`leo-mcp`'s own README.
+
+**Later, not now: ACP.** If `leo-mcp` is fronted by ACP instead of/alongside raw MCP, every harness
+(Claude Code, Codex, OpenCode) could attach to the SAME resident process rather than each spawning its
+own MCP client connection — the load-reduction case for consolidation, one level up. Flagged in section
+9's own ACP note and `leo-mcp`'s README; not started.
+
+### 16.2 The utility-task lane — do-and-forget sessions for narrow mechanical jobs
+
+Added 2026-09-11, **BUILT the same day** (`domain/workflow-profiles.js`, `config/harness-defaults.js`,
+`domain/capabilities.js`'s new `utility:awsquery` preset, `runtime/supervisor.js`'s `ensureWorkerPrincipal`
+role->preset lookup; `runtime/test/utility-task-lane.test.js`, 4 cases, `npm test` exit 0 at 113 suites).
+Not a new subsystem — a named configuration of things this document already specifies, so the pattern is
+deliberate rather than reinvented per role each time someone wants a fifth one of these.
+
+**CORRECTED 2026-09-11, same day: the lane was built but UNREACHABLE.** Two independent codex reviews
+(`codexdoc/REVIEW-NOTES.md` finding 7) found that `domain/assignment.js`'s `isActionable` only ever
+recognized `role === "coder" || role === "parentReviewer"` as "there is work to do" — a hardcode that
+predates this section and had never heard of the four roles above, so `assignTask` refused every one of
+these task types even with a correctly-configured worker present. Testing `rolesFor`/`ensureWorkerPrincipal`
+in isolation (the paragraph above) was NOT sufficient evidence the lane worked; it never exercised
+`assignTask` itself. **Fixed the same day**: `workflow-profiles.js` profiles now each declare their own
+`workRoles` (which of their roles count as work-bearing), and `isActionable` looks that up per task type
+instead of a hardcoded pair of names — so a fifth role added later declares its own answer rather than
+silently falling through a condition nobody remembered to extend. Proven with a real end-to-end
+`assignTask()` call that actually starts a run (`runtime/test/assignment.test.js` case 11), not just the
+pieces in isolation.
+
+**The shape:** a `type: "adhoc"` task (section 10 — single worker, no reviewer ceremony, the SAME
+`start()`/`sendInput()` contract as everything else) whose worker is one of a small set of narrow
+roles — `git-push-runner`, `jira-runner`, `awsquery-runner`, `slack-runner` are the first four, one per
+skill/MCP surface this document already has (`git-create-push`/`jira-automation` skills, `awsquery`
+skill, `leo-mcp`/`team-slack-bridge`). Each role:
+
+- **Is single-purpose by construction**, the same "fixed toolset" discipline section 16's roster already
+  keeps — a `git-push-runner` never picks up Jira access "just this once."
+- **Defaults to a cheap model and `clearPolicy: "always"`** (section 8, Rules 5-6, already specified —
+  `"utility": { "clearPolicy": "always" }` is the literal example already in that section). One
+  operation per invocation; state lives in the task's worktree/handoff/journal, never in the session's
+  own head. This is what "do and forget" is INTENDED to mean concretely: the session clearing itself
+  costs nothing to reload because there was never anything worth keeping in it past the one operation.
+  **CORRECTED 2026-09-13 (review-sol-2026-09-13.md finding 40) — this describes the TARGET behavior, not
+  current behavior.** `clearPolicy` is declared and validated on every role in
+  `config/harness-defaults.js` (schema-only, `HANDOFF.md`'s item 39), but nothing in the runtime reads
+  that field to actually call `clearContext()`/`resume()` at any point — a utility session does NOT
+  self-clear today, regardless of what its `clearPolicy` says. The decision module described here
+  (`domain/clear-policy.js`) does not exist yet.
+- **Delivers into the task's shared worktree** (section 7) when the job is git-shaped; a query-shaped job
+  (`awsquery-runner`) has no worktree to deliver into and just returns its answer.
+- **Never guesses on ambiguity — writes an `ask` instead, every time, no exception.** This is section 7's
+  existing `asks` mechanism, not new mechanism: "what region," "that table doesn't match any known
+  pattern," "which repo" all become a `blocked` task with a concrete question, answerable from the tree
+  UI without interrupting whichever session asked for the work. The hard rule this section adds is
+  specifically that a utility-task role has NO fallback interpretation to reach for — an under-specified
+  request is always a question, never a best guess, because the whole point of a narrow role is that it
+  has no judgment to spend guessing with.
+- **Is dispatched BY another session, not run inline**, which is the actual token-economy point: a
+  parent session that needs "what AWS region is this deployed to" delegates a small, cheap,
+  clears-itself-after task instead of spending its own context running the query and reading raw output.
+  The parent gets back a short structured answer (or an `ask` it can itself relay/answer), never the
+  small session's own transcript — tier 1/tier 2's existing "no agent reads tier 1" rule (section 8)
+  applies to a utility-task worker exactly as it does to any other.
+
+**Nothing here changes `harness-defaults.json`'s shape** (section 3/11) — these are just four more role
+keys with a cheap-model, always-clear default, the same file every other role's default already lives
+in.
+
+**Later, not now: a genuinely small resident model for this lane specifically.** The four roles above
+are mechanical enough that a 3-4B-parameter local model could plausibly run them (git push, ticket
+create, a scoped AWS read, a Slack post — Rule 6's "cheap and mostly deterministic" pushed further than
+the CTO). Not evaluated yet, and not required for the pattern above to work today with a normal
+harness/model at low effort — this is a future `harness-defaults.json` value once a viable local model
+for the deployment machine is chosen, not an architecture change.
 
 **The list-management agent from the original draft is deleted as an AI agent.** Its
 job — move a worker between teams, rename, pin a main session, hide a team — is a set
@@ -1326,3 +1600,301 @@ already applies to claude-mem/agentmemory and every optional integration.
   worked around.
 - **As-user posting requires a real `callerIdentity`, not a caller-supplied name**
   (section 14.5) — naming a person is not authorization; v1 posts as the bot only.
+- **A resource lease is arbitration between cooperating sessions, never a guarantee**
+  (section 20) — it cannot constrain a process the supervisor did not start, and a
+  design that assumes otherwise is wrong in exactly the way section 38.1 is careful
+  not to be about authorization.
+- **MCP pooling and the lazy tool router (section 21) are optimizations with a
+  fallback, not new hard dependencies.** A server that can't be pooled spawns
+  per-session exactly as today; a session with no router still works, it just carries
+  every configured server's full schema like it does now. Neither is allowed to become
+  something the plugin breaks without, same rule as every optional integration.
+
+## 20. Host resource arbitration & exclusive external resources
+
+Everything above arbitrates *tokens* and *state*. Two failures on 2026-09-09 were about
+neither: they were two sessions competing for one **machine**.
+
+1. **Host memory.** Two independent AI sessions each started a webpack build. Both were
+   individually reasonable; together they exhausted host memory. Section 8's Rule 7
+   admission control could not prevent it, because `maxConcurrentSessions` is enforced
+   per supervisor and each session's view of "how much is running" stops at itself.
+2. **Git identity.** This machine has two GitHub accounts and **one** global credential
+   state — `gh auth switch` rewrites shared config and HTTPS auth resolves through a
+   single keychain entry (see the git section of HANDOFF). Two sessions pushing
+   concurrently can therefore push as the wrong account, or one can flip the account out
+   from under the other mid-push. Serializing pushes is not politeness; it is the only
+   way the account a push lands under is knowable.
+
+Both are the same shape: a scarce resource that lives **outside** any one run, contended
+by parties that cannot see each other.
+
+### 20.1 The primitive: a lease over a named resource
+
+**BUILT, 2026-09-10.** One table, `resource_leases` (migration 0011, `release_reason`
+added by migration 0012), and three supervisor commands — `acquireLease` /
+`releaseLease` / `renewLease` (a third beyond this section's original pair, for a live
+holder to push its TTL out) — gated by one capability, `resource:lease`, per section 16.
+`config/resources.js` reads `resources.json` on demand, same contract as
+`harness-defaults.js` (missing file -> built-in defaults, malformed file -> throws
+loudly), with `git:identity` (exclusive) and `host:heavy-job` (counted, capacity 1,
+`memoryHeadroomPercent: 15` default) as the built-ins. **Proven concurrently, not just
+sequentially**: 8 real OS processes race an exclusive lease and a capacity-3 counted one
+(`db/test/leases.test.js`), using `BEGIN IMMEDIATE` — the same mechanism
+`db/migrate.js` already uses for its own schema-version race — because a plain
+transaction only escalates to a write lock at the FIRST WRITE, which is too late for a
+check-then-insert. Full record: ROADMAP Phase 7.
+
+**CORRECTED 2026-09-11 — "proven concurrently" covered ACQUISITION, not the whole lease lifecycle, and
+two independent codex reviews found real exclusivity/lifecycle gaps the initial acquire race did not
+exercise** (`codexdoc/review-phase7-uncommitted.md`, `codexdoc/REVIEW-NOTES.md`, both finding 1 — the
+same bug found twice, independently). **`renewLease` could resurrect an EXPIRED lease after a
+replacement holder had already acquired the resource** — renewal checked only `released_at IS NULL`,
+not that the TTL was still live, so a stale process's renewal could produce two active exclusive
+holders. **Fixed the same day**: renewal is now conditional on `ttl_expires_at >= now`, atomically with
+the update; an expired lease is never revived by ID and must go through normal admission control.
+Two related lifecycle gaps fixed alongside it: **acquisition now refuses a `holderRunId` that has
+already ended** (a lease could otherwise be granted for a closed run and never get released), and
+**`endRun`/`reconcileRun` now release a run's leases in the SAME transaction as its terminal write**
+(previously two separate statements — a crash or thrown error between them left an ended run with live
+claims, unrecoverable by a retry). All three proven with real reproductions, verified to fail against
+the pre-fix code (`db/test/leases.test.js` cases 10-13). **Two more fixed 2026-09-11**:
+`createTaskWorktree`'s cross-process creation race (§7 below) is closed with a compare-and-swap claim,
+and a worker-backed principal's `acquireLease`/`requestWorktree` now refuses a `runId` that resolves to
+a DIFFERENT worker (`db/index.js`'s `workerIdForRun`) — owner/CTO principals remain unrestricted, that
+delegation question is still not decided.
+**A second, independent review (`codexdoc/review-luna-2026-09-11.md`) found the same TTL gap this note
+used to list as deferred, plus a lock-timing detail — both fixed the same day.** `MAX_LEASE_TTL_MS` (30
+minutes) and a shared `validateTtlMs` now reject a non-finite-positive-integer or over-max `ttlMs` in
+BOTH `tryAcquireLease`/`renewLeaseRow` (throws — an in-process caller bypassing the wire layer is still
+refused) AND the `acquireLease`/`renewLease` wire handlers (a clean `{ok:false}`, not an exception, for
+ordinary wire traffic). `tryAcquireLease`'s expiry is now computed INSIDE its `BEGIN IMMEDIATE`
+transaction rather than before it, so write-lock wait time can no longer eat into a short TTL before the
+row is inserted. Proven with the exact `ttlMs: -1` → `granted: true` repro from the review, verified to
+fail against the pre-fix code (`runtime/test/leases.test.js` case 9). See the codex files for the full,
+still-growing fixed/deferred record — this note is not a substitute for reading them.
+
+- **Two kinds.** *Exclusive* (one holder) and *counted* (a semaphore with a configured
+  capacity). A resource is declared, not invented by its caller.
+- **A lease is claimed before the side effect**, never after — the same rule the
+  assignment path's idempotency keys already follow, and it must be tested
+  concurrently, because a sequential pair of calls passes even when the claim is in the
+  wrong place.
+- **TTL plus heartbeat, persisted.** A holder SIGKILLed mid-lease must expire, not
+  deadlock the queue. Same reasoning as `asks.auto_close_at` (section 4): an in-memory
+  timer dies with exactly the process whose death is the failure being handled.
+- **Visible, decided as a non-blocking refusal rather than a true FIFO queue.**
+  Corrected 2026-09-10 on contact with the build: this is a multi-process daemon with no
+  in-process wait to hold a caller's connection on, so `acquireLease` is a synchronous
+  check-and-claim that REFUSES immediately and names every current holder
+  (`blockedBy: [{leaseId, principalId, runId, reason, acquiredAt}, ...]`) rather than
+  making the caller hang. There is deliberately no "position in line" — a `counted`
+  resource is a semaphore, not a mutex queue, so "3rd in line" is not a well-defined
+  question when up to `capacity` holders can be admitted in any order the moment one
+  releases. "Nothing is happening" is still not an acceptable rendering of a wait — a
+  caller sees exactly who to wait behind, just not a promised order.
+
+Declared resources for v1:
+
+```jsonc
+// resources.json
+{
+  "host:heavy-job": { "kind": "counted", "capacity": 1 },   // builds, full suites, mutation runs
+  "git:identity":   { "kind": "exclusive" }                 // one push at a time, machine-wide
+}
+```
+
+`host:heavy-job` is claimed by anything a role declares heavy — a build, a full test
+suite, a mutation run. `git:identity` is *designed* to be held across the **whole**
+switch → push → restore triple, never across the push alone: the switch is the part that races.
+
+**CORRECTED 2026-09-13 (review-sol-2026-09-13.md finding 36) — only the middle third of that triple is
+actually built.** `git-create-push` (item 11, §16) acquires `git:identity`, runs `git push`, and
+releases it — there is no `gh auth switch` call, no account selection/verification, and no restoration
+of a prior identity anywhere in the fight loop. Serializing the push under the lease still prevents two
+pushes from racing EACH OTHER, but it does not itself guarantee a push used the INTENDED account — that
+still depends on whatever account `gh`/HTTPS auth already resolves to at push time, which this mechanism
+does not select or verify. Treat account selection as an external precondition the operator/caller must
+already have correct, not something this lease enforces.
+
+### 20.2 Waiting is a pause, not a kill
+
+Section 7's clean-vs-kill distinction governs here too. A worker that cannot get a lease
+stays alive and idle with its task state unchanged; its pane says which resource it is
+waiting for and who holds it. No silent retry loop, and never a kill-and-respawn — the
+worker did nothing wrong, and killing it is how a queue becomes a work-loss mechanism.
+When the lease is granted the worker resumes; if the wait exceeds its budget the result
+is a blocker in the tier-3 handoff, which is a retryable state, not a failure.
+
+**CORRECTED 2026-09-13 (review-sol-2026-09-13.md finding 39) — this whole subsection describes INTENDED
+behavior; NONE of the automatic waiting it describes is built.** `acquireLease('host:heavy-job', ...)`
+is the only real primitive: on contention it returns `{ granted: false, blockedBy: [...] }` immediately
+and synchronously — there is no build/test task path that automatically retries it, no idle-pane state a
+worker enters while waiting, no wait/resume loop, and no automatic handoff into a tier-3 blocker when a
+wait exceeds a budget. A caller that wants any of that behavior has to build it itself on top of the
+refusal today; this primitive alone does not prevent the concurrent-heavy-job incident this section's own
+motivation describes. Treat every sentence above as the target shape for a not-yet-built consumer, not a
+description of what `acquireLease` does now.
+
+### 20.3 The supervisor cannot arbitrate what it did not start
+
+This is the honest limit, and it is the same limit section 38.1 states about
+authorization. A session a human started in another terminal, or another tool's build,
+holds no lease and respects none. So:
+
+- **Observe, don't assume. BUILT, 2026-09-10** (`runtime/supervisor.js`'s `acquireLease`):
+  `os.freemem()`/`os.totalmem()` sampled on every `acquireLease('host:heavy-job')` call,
+  REFUSING (not granting-with-a-warning — decided, and why: a resource named specifically
+  to prevent an OOM incident that still granted under pressure would defeat its own
+  purpose) below the configured headroom, with the sampled `{freeBytes, totalBytes,
+  freePercent, headroomPercent}` surfaced on BOTH the grant and the refusal — a human
+  sees the number, not just a pass/fail, either way. **Not built**: periodic re-sampling
+  of a lease already held (only the moment of acquisition is checked today) — a real gap,
+  not silently dropped: a long-held `host:heavy-job` lease that outlives a memory
+  squeeze arriving mid-hold gets no warning until its next renew. Platform note: plain
+  `os.freemem()`/`os.totalmem()` were used rather than macOS `vm_stat`'s richer breakdown
+  — Node has no cross-platform binding for the latter, and adding a native one was
+  rejected for the same reason `node-pty` was (section 9): this project has exactly one
+  dependency on purpose.
+- **When an unmanaged process is in the way, the answer is an `ask`.** The human is
+  asked to pause the other sessions, as a machine-legible blocker on the task (section
+  3's `asks`), not as a line buried in a pane. That ask is answerable, auto-closable,
+  and queryable like every other one. **Not built**: `acquireLease` refusing/warning does
+  not yet CREATE an `ask` row automatically — a caller (or a future CTO) has to do that
+  itself today. The primitive exists; the wiring from "lease refused" to "ask raised" does
+  not.
+- **An adopted run can be asked to yield; it cannot be reaped for a lease.**
+  `runs.started_by` already makes the distinction, and "the supervisor only kills what
+  it started" is not negotiable for a resource dispute.
+
+### 20.4 What this is not
+
+Not accounting — section 19's existing carve-out for Rule 7's operational limits covers
+it, and nothing here measures cost. Not a sandbox, and not a guarantee: a lease keeps
+two *cooperating* sessions from colliding. A determined one, or a human with a terminal,
+is outside its reach — which is why 20.3 exists rather than being a caveat.
+
+## 21. MCP server pooling & lazy tool discovery
+
+A second host-resource problem, distinct from section 20's leases but living beside
+them: **every session that uses an MCP-backed tool spins its own copy of that MCP
+server**, harness-native (Claude Code, OpenCode each launch their configured servers
+per session) with no sharing. Ten concurrent workers each touching Jira duplicates ten
+Jira MCP server processes for one logical service — the same host-memory failure mode
+as section 20's webpack incident, just from configuration instead of a build. Separately,
+and independently worth fixing even on one session: **every MCP server a session is
+configured with puts its full tool schema set in front of the model up front**, whether
+or not that turn needs any of it — the same tokens-vs-work tradeoff section 8 already
+treats as a first-class problem for the transcript, just unaddressed for tool schemas.
+
+### 21.1 Pooling — one resident process per distinct MCP server config
+
+**BUILT 2026-09-11** (`runtime/mcp-pool.js`, migration 0013 adding `mcp_pool.status`/`.pgid` and a new
+`mcp_pool_attachments` table, `db/index.js`'s `claimPoolSlot`/`attachToPool`/`detachAndMaybeDrain`/
+`markPoolReady`/`markPoolFailed`/`markPoolStopped`/`listLivePoolRows`; `runtime/test/mcp-pool.test.js`,
+6 cases). One resident process per distinct `(name, config_hash)` — spawned on first attach, torn down
+by the LAST detach (never mid-use), and RESURRECTED (same row, same identity) on the next attach after
+a full drain rather than inserting a new row, which the unique index on `(name, config_hash)` would
+have refused anyway.
+
+**Refcount is DERIVED from attachment rows, not a bare integer** — `codexdoc/REVIEW-NOTES.md`'s "Before
+MCP pooling and lazy discovery" section named this explicitly ("a lone integer cannot explain a crash
+between attach and increment"), and migration 0011's original `refcount` column is kept but unused for
+exactly that reason.
+
+**The last-detach-vs-new-attach race the same review section calls out** is closed by construction, not
+by care: `attachToPool` only ever joins a row whose status is `starting`/`ready` (never `draining`), and
+`detachAndMaybeDrain` flips `draining` atomically inside the SAME `BEGIN IMMEDIATE` transaction as its
+"any attachments left" count — so a concurrent attach either committed its attachment row before the
+drain decision ran (correctly NOT drained) or runs after `draining` committed (correctly refused, and
+falls through to spawning a fresh cycle). Proved four ways: a deterministic interleaving test (manually
+driving the two DB calls to the exact decision point, not a timing-dependent race), a real 8-process
+race of the DB primitives alone, a 6-worker concurrent-async race of the FULL manager (real spawn/kill)
+within one process, and boot-time reconciliation killing a real orphaned-but-alive process from a
+"previous boot" it holds no in-memory handle for.
+
+**One thing this manager does NOT solve, written down rather than discovered later**: a pooled process
+serving multiple attachers gets ONE environment/credential set, fixed at spawn — it cannot hand a
+different credential to each attacher, the same limitation OpenCode's own private `opencode serve` pool
+already has. Only pool configurations whose credential/isolation semantics genuinely permit sharing.
+
+**This generalizes `team-slack-bridge`'s own plan** (its MCP surface is one of four surfaces over one
+core, per section 14) rather than replacing it — `leo-mcp` (section 16.1's new sibling repo, which
+already mounts `team-slack-bridge`'s tools) is the first real pooled config; `gitnexus`/`aws-mcp`/
+`agentmemory` are candidates for the same treatment once measured. **Fallback, not requirement:** an
+MCP server that cannot be pooled falls back to today's per-session spawn — pooling is an optimization
+layered on top of what already works, per section 19's rule for every optional integration, not a new
+hard dependency the plugin breaks without.
+**Wired into `start()`/`endRun` 2026-09-11 — the supervisor-side half is done.** A utility-task-lane
+role that declares an MCP need (`domain/mcp-manifest.js`'s `ROLE_MCP_NEEDS`) now attaches BEFORE its
+adapter spawns (`config/mcp-pools.js` resolves the pool's spawn config; `leo-mcp` is the real, working
+first entry), and is detached when its run ends — normally (`endRun`, `releaseSession`) or via
+boot-time reconciliation's `lost` path, matching the exact atomic-decision-then-async-teardown split
+leases already use. Proved with 6 real cases (`runtime/test/mcp-pool-wiring.test.js`): a real
+pool+attachment row exists after start; ending a run detaches it; a non-utility-task role is completely
+untouched; two CONCURRENT utility-task runs of the same role share exactly one pool row with two
+attachments; a run reconciled to `lost` gets its attachment detached by boot reconciliation; an
+`adapter.start()` throw before a runId exists still detaches whatever was attached, not just a
+`createRun()` failure.
+**Corrected 2026-09-11 (found by an independent review, `codexdoc/review-luna-2026-09-11.md` finding
+2) — an earlier version of this wiring ALSO put the pool-attachment marker onto `spec.mcpConfig` and
+handed it to the real adapter. That was not merely "not yet shared" as first written here — checked
+against the adapter's own `StartSpec` typedef (`mcpConfig?: string|string[]`, a real config FILE PATH
+per entry) and `worker-env.js`'s argv builder, it would have pushed a non-string object into a real
+`spawn()`'s argv the moment a utility-task role ever ran through the actual Claude Code adapter; OpenCode's
+adapter would have thrown outright on the same value. Neither existing test caught it because both used
+the fake harness, which never validates argv shape.** `start()` no longer sets `spec.mcpConfig` at all
+for a utility-task role. `leo-mcp` gained a non-stdio (Unix socket) transport the same day
+(`mcp/server-socket.js`) — a real, useful step, but it does not by itself answer whether Claude Code's
+`--mcp-config` accepts anything other than a stdio command or an SSE/HTTP url, and nothing has measured
+that yet; building a "real" config value here without measuring it first would have been another guess,
+not a fix. **What's real today: the attach/detach lifecycle, the one-process-per-config guarantee, dead
+processes no longer leaking stale attachments (see below) — everything EXCEPT a worker actually
+receiving a usable MCP connection from it.** `config/mcp-pools.js` and `domain/mcp-manifest.js`'s own
+header comments were corrected to stop describing a lever (`configPathFor`) that was never built.
+**Also fixed the same day**: `hashPoolConfig` used to hash only top-level key NAMES (a `JSON.stringify`
+replacer-array quirk), so two configs differing only in a nested `env` credential hashed identically —
+closed with a real recursive canonical stringifier. And a dead pooled process used to leave its
+attachment row live forever, blocking a resurrected replacement's own teardown — `markPoolFailed` now
+closes every live attachment for that pool atomically with the failure write, proved with a real killed
+child process.
+
+### 21.2 Lazy discovery — don't put every tool's schema in front of every turn
+
+**Investigated 2026-09-11, and the investigation changed the scope, honestly.** The original framing
+assumed a harness-level "defer tool schemas until asked for by name" mechanism (modeled on this very
+project's own `ToolSearch`-shaped deferred tools) might exist to hook into for a spawned worker session.
+Checked against the real code before designing anything: `adapters/claude-code/worker-env.js` (measured
+against the real `claude` CLI) shows the ONLY control this codebase has over a spawned session's MCP
+tooling is `spec.mcpConfig` — an explicit file list, combined with `--strict-mcp-config` so nothing
+outside it loads. **There is no per-turn, ask-for-it-by-name deferral available inside a spawned
+session for arbitrary MCP servers** — that is a property of THIS session's own harness driving itself,
+not something a sub-session's `--mcp-config` can opt into. OpenCode's adapter has no equivalent either.
+**This is an honest ceiling on what's possible today, not a gap in what got built.**
+
+**What's actually buildable given that ceiling, and BUILT**: `domain/mcp-manifest.js`'s `manifestForRole`
+(pure, 4 test cases) computes the MINIMAL `spec.mcpConfig` set a role needs, by declared pool name
+(section 21.1's pooled identities) — narrower than "every configured server," even though it is not
+per-turn lazy discovery. A role absent from the declared map needs none; a declared pool name with no
+registered config path is reported `missing`, never silently dropped, the same "never guess an
+underspecified request" discipline section 16.2's utility-task lane already applies one layer up.
+**Not wired into an actual spawned worker's `spec.mcpConfig` in this pass** — that needs a real decision
+about where role->manifest resolution happens in the assignment path (`domain/assignment.js` /
+`runtime/supervisor.js`'s `assignTask`), which is future work, not a design gap in this module.
+
+**The pooled MCP layer (21.1) and the manifest module (21.2) are complementary, not the same
+mechanism** — pooling saves host processes/RAM; a minimal manifest saves prompt tokens by bounding
+which servers a role's `--mcp-config` ever names — and either can ship without the other, which is
+exactly what happened here.
+
+### 21.3 Where this lands
+
+Utility agents (section 16) are the first and cleanest candidates: each already has a
+**fixed, narrow toolset by construction** (jira-automation only ever needs its skill +
+server; git-create-push only ever needs git/`gh`/`glab`), so a fixed capability router
+per agent is a direct fit with no discovery ambiguity to design around. Workers are the
+harder case — their tool needs vary by task — and come after, once the pattern is proven
+on the roster. Neither depends on section 20's leases; they can build in either order,
+though both are host-resource problems worth solving in the same pass as Phase 7's
+roster work, since utility agents are exactly where the duplicate-MCP-process and
+full-schema-dump costs are most avoidable.

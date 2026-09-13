@@ -24,6 +24,7 @@
 //      provisional prose rather than appending it
 //   7. the dev pane follows the MOST RECENTLY ACTIVE coder, unless pinned (FLOWS §5)
 //   8. a finished review CLEARS the review bar — a stale one states a condition the system has left
+//   9. a restarted worker's pane follows its LIVE run, not whichever old one the snapshot lists first
 //
 // Standing rule: every case asserts. This script cannot exit 0 with a broken claim.
 
@@ -35,7 +36,9 @@ import {
 import { createSupervisor } from "../supervisor.js";
 import { createIpcServer } from "../../ipc/server.js";
 import { createFakeHarness } from "./_fake-harness-adapter.js";
+import { EventEmitter } from "node:events";
 import { createTuiApp } from "../../tui/app.js";
+import { FOCUS } from "../../tui/state.js";
 import { makeScratchDir, rmScratchDir, runTest, sleep } from "./_helpers.js";
 import { sockPath } from "../../paths.js";
 
@@ -305,6 +308,163 @@ await runTest("tui replay by cursor", async () => {
       assert.equal(app.state.review, null,
         "tick two: the review is over, so the bar must CLEAR rather than keep the last evaluation");
       console.log("  8. a finished review clears the review bar");
+    }
+
+    // ── 9 ────────────────────────────────────────────────────────────────────────────
+    // Fixed 2026-09-11 (`codexdoc/REVIEW-NOTES.md` finding 15). `forWorker` used to be a bare
+    // `rows.find(...)`, which always returns whichever run for a worker comes first in the SNAPSHOT's
+    // own array order — and `listRunsForDisplay` returns runs in roughly historical/ascending order, so
+    // a restarted worker's OLD ended run kept showing even after a live replacement existed. The two
+    // real cases: prefer LIVE over ended regardless of array position, and among ended-only runs prefer
+    // the NEWEST one by `lastEventAt`, not the first one listed.
+    {
+      const snapshot = {
+        ok: true,
+        teams: [{ id: "team", name: "T" }],
+        tasks: [{ id: "task", title: "restarted worker", teamId: "team", state: "implementing", type: "feature" }],
+        workers: [{ workerId: "w1", nickname: "purus", role: "coder", taskId: "task" }],
+        // The OLD ended run comes FIRST — the exact array order that broke the bare `.find()`.
+        runs: [
+          { runId: "old", workerId: "w1", endedAt: "2026-09-08T09:00:00.000Z", exitReason: "finished", lastEventAt: "2026-09-08T09:00:00.000Z", controllable: true },
+          { runId: "new", workerId: "w1", endedAt: null, lastEventAt: "2026-09-09T10:00:00.000Z", controllable: true },
+        ],
+        transcripts: { old: ["OLD output"], new: ["NEW output"] },
+        provisional: {}, cursors: { old: 1, new: 1 }, gaps: {}, requests: [], asks: [],
+      };
+      const app = createTuiApp({
+        client: { request: async () => snapshot },
+        out: { write() {}, columns: 100, rows: 30, on() {} },
+        input: { on() {}, resume() {}, pause() {} },
+      });
+      await app.refresh();
+      assert.match(app.state.panes[0].title, /new/, `must prefer the LIVE run over the array-first ended one; got ${app.state.panes[0].title}`);
+      assert.equal(app.state.panes[0].status, "running", "the live run's pane must not read as crashed");
+
+      // No live run at all — two ended runs, the older one still listed first. Must pick the NEWER
+      // ended run (by lastEventAt), not simply "the last one in the array" either.
+      const bothEnded = {
+        ...snapshot,
+        runs: [
+          { runId: "older", workerId: "w1", endedAt: "2026-09-07T09:00:00.000Z", exitReason: "finished", lastEventAt: "2026-09-07T09:00:00.000Z", controllable: true },
+          { runId: "newer", workerId: "w1", endedAt: "2026-09-08T09:00:00.000Z", exitReason: "finished", lastEventAt: "2026-09-08T09:00:00.000Z", controllable: true },
+        ],
+        transcripts: { older: ["older output"], newer: ["newer output"] },
+        cursors: { older: 1, newer: 1 },
+      };
+      const app2 = createTuiApp({
+        client: { request: async () => bothEnded },
+        out: { write() {}, columns: 100, rows: 30, on() {} },
+        input: { on() {}, resume() {}, pause() {} },
+      });
+      await app2.refresh();
+      assert.match(app2.state.panes[0].title, /newer/, `with no live run, must prefer the NEWEST ended one; got ${app2.state.panes[0].title}`);
+      // The other half of finding 15, fixed 2026-09-11: an ended run used to be labelled the literal
+      // string "crashed" regardless of its actual `exitReason` — so a NORMAL finish read as a failure.
+      // Both runs here exited "finished"; the pane's status must be the neutral "ended", never "crashed".
+      assert.equal(app2.state.panes[0].status, "ended", "a normally-finished run must not be labelled crashed");
+      console.log("  9. a restarted worker's pane follows its LIVE run, not whichever old one the snapshot lists first, and a normal finish is never mislabelled as a crash");
+    }
+
+    // ── 10 ───────────────────────────────────────────────────────────────────────────
+    // review-sol-2026-09-13.md finding 16: `setInterval(refresh, refreshMs)` used to start a new async
+    // refresh on every tick with no serialization — if a round trip ever took longer than `refreshMs`,
+    // two requests were in flight, and whichever RESPONSE happened to arrive and apply LAST won,
+    // regardless of which request was actually newer. Real repro: a slow first request still in flight
+    // when a second `refresh()` fires; the second must be a no-op, not a second overlapping request.
+    {
+      let inFlight = 0;
+      let maxConcurrent = 0;
+      let requestCount = 0;
+      const slowThenFast = createTuiApp({
+        client: {
+          request: async () => {
+            inFlight += 1;
+            maxConcurrent = Math.max(maxConcurrent, inFlight);
+            requestCount += 1;
+            await sleep(80); // genuinely slow, so a second tick's refresh() call really does land mid-flight
+            inFlight -= 1;
+            return {
+              ok: true, teams: [], tasks: [], workers: [], runs: [],
+              transcripts: { r1: ["settled-once"] }, provisional: {}, cursors: { r1: 1 }, gaps: {},
+            };
+          },
+        },
+        out: { write() {}, columns: 100, rows: 30, on() {} },
+        input: { on() {}, resume() {}, pause() {} },
+      });
+
+      // Fire two refreshes without awaiting the first — exactly what an interval tick landing mid-flight
+      // does. Do NOT await the first individually; race them together so both are genuinely concurrent.
+      const first = slowThenFast.refresh();
+      const second = slowThenFast.refresh();
+      await Promise.all([first, second]);
+
+      assert.equal(maxConcurrent, 1, "the second refresh() must not have started an overlapping second request while the first was still in flight");
+      assert.equal(requestCount, 1, "exactly one real request must have been made for the two overlapping calls");
+      assert.deepEqual(slowThenFast.transcriptState().get("r1")?.lines, ["settled-once"], "the one real response must still have applied normally");
+
+      // The in-flight flag must be released once the request settles — a THIRD, later refresh() (not
+      // overlapping anything) must go through as a real request, not be permanently stuck as a no-op.
+      const third = await slowThenFast.refresh();
+      void third;
+      assert.equal(requestCount, 2, "a refresh() call after the in-flight one has settled must issue a real request again");
+      console.log("  10. overlapping refresh() calls are single-flight: a tick landing mid-flight is a no-op, and the flag releases once the request settles");
+    }
+
+    // ── 11 ───────────────────────────────────────────────────────────────────────────
+    // review-sol-2026-09-13.md finding 24: the Accept/Decline status message used to LEAD with
+    // "accepted"/"declined" (past-tense success wording), with "not yet wired" only tacked on
+    // afterward — an operator scanning just the start of the status line reads a real decision as
+    // recorded. It never was: no wire command exists yet to act on a request at all.
+    {
+      const noopApp = createTuiApp({
+        client: { request: async () => ({ ok: false }) },
+        out: { write() {}, columns: 100, rows: 30, on() {} },
+        input: { on() {}, resume() {}, pause() {} },
+      });
+      noopApp.state = {
+        ...noopApp.state,
+        focus: FOCUS.REQUEST_DETAIL,
+        requests: [{ id: "r-decision", from: "nj", channel: "#c", text: "please look" }],
+        selectedRequestId: "r-decision",
+      };
+      await noopApp.handleKey("a");
+      assert.equal(noopApp.state.status.startsWith("accepted"), false,
+        `the status message must not LEAD with past-tense success wording; got: ${JSON.stringify(noopApp.state.status)}`);
+      assert.match(noopApp.state.status, /not recorded/, "the message must say plainly that nothing was recorded");
+      assert.equal(noopApp.state.pendingRequestDecision, null, "the pending handoff must still be cleared either way");
+      console.log("  11. Accept/Decline's status message never claims a decision was recorded, since no backend command exists to record one");
+    }
+
+    // ── 12 ───────────────────────────────────────────────────────────────────────────
+    // review-sol-2026-09-13.md finding 30: `stop()` used to leave its `input`/`out` listeners
+    // registered (anonymous inline callbacks, nothing to remove) and never closed the socket client —
+    // restarting or embedding this TUI accumulated listeners without bound. Real `EventEmitter`
+    // fixtures here (not the usual no-op stubs) actually PROVE removal, not just that `stop()` didn't
+    // throw.
+    {
+      const fakeInput = new EventEmitter();
+      fakeInput.resume = () => {};
+      fakeInput.pause = () => {};
+      const fakeOut = new EventEmitter();
+      fakeOut.write = () => {};
+      fakeOut.columns = 100;
+      fakeOut.rows = 30;
+      let closed = false;
+      const listenerApp = createTuiApp({
+        client: { request: async () => ({ ok: false }), close: () => { closed = true; } },
+        out: fakeOut,
+        input: fakeInput,
+      });
+      await listenerApp.start();
+      assert.equal(fakeInput.listenerCount("data"), 1, "precondition: start() registered exactly one data listener");
+      assert.equal(fakeOut.listenerCount("resize"), 1, "precondition: start() registered exactly one resize listener");
+
+      listenerApp.stop();
+      assert.equal(fakeInput.listenerCount("data"), 0, "stop() must remove the input data listener, not leak it");
+      assert.equal(fakeOut.listenerCount("resize"), 0, "stop() must remove the resize listener, not leak it");
+      assert.equal(closed, true, "stop() must close the socket client, not leave it open past this app's lifetime");
+      console.log("  12. stop() removes its input/resize listeners and closes the socket client, rather than leaking both");
     }
   } finally {
     try { if (ipc) await ipc.shutdown(); } catch { /* teardown */ }

@@ -21,9 +21,25 @@
 //    process may have been replaced). A pane that offered an approve button off the event alone
 //    would let a human answer into a void.
 
+import fs from "node:fs";
+import path from "node:path";
 import { connect } from "../ipc/client.js";
 import { defaultSockPath, defaultStateDir } from "../ipc/paths.js";
 import { createTranscriptRenderer } from "./render.js";
+
+/**
+ * The owner's token from the state dir — the SAME file/mode `tui/cli.js`'s `readOwnerToken()` reads
+ * (0600, inside the 0700 state dir; `runtime/supervisor.js`'s `ensureOwnerPrincipal()` writes it).
+ * `null`, not a throw, when it's missing: a standalone pane run before the daemon has ever booted
+ * should fail at the socket connection (or at the first refused command), not here.
+ */
+export function readOwnerToken(stateDir) {
+  try {
+    return fs.readFileSync(path.join(stateDir, "owner.token"), "utf8").trim();
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Attach to a run.
@@ -31,6 +47,8 @@ import { createTranscriptRenderer } from "./render.js";
  * @param {{
  *   runId: string,
  *   sockPath?: string,
+ *   stateDir?: string,
+ *   token?: string,
  *   fromSeq?: number,
  *   color?: boolean,
  *   showThinking?: boolean,
@@ -41,7 +59,13 @@ import { createTranscriptRenderer } from "./render.js";
  */
 export async function attachPane({
   runId,
-  sockPath = defaultSockPath(defaultStateDir()),
+  stateDir = defaultStateDir(),
+  sockPath = defaultSockPath(stateDir),
+  // Fixed 2026-09-11 (`codexdoc/REVIEW-NOTES.md` finding 10): this used to connect with no principal
+  // token at all, so a standalone pane (unlike the interactive TUI, which has always read this) was
+  // refused by the real `authorizedCommandHandlers()` gate — every command failed with "no token
+  // sent". Explicit `token` still wins for a caller that holds a narrower (non-owner) principal.
+  token = readOwnerToken(stateDir),
   fromSeq = 0,
   color = true,
   showThinking = false,
@@ -51,7 +75,7 @@ export async function attachPane({
 } = {}) {
   if (!runId) throw new Error("attachPane: runId is required");
 
-  const client = await connect(sockPath);
+  const client = await connect(sockPath, { token });
   const renderer = createTranscriptRenderer({ color, showThinking, timestamps });
 
   // `out(line, { replacesPrevious })` — and the second argument is the whole point.

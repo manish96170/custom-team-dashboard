@@ -21,13 +21,22 @@ parallel. Tasks *within* a group that aren't independent of each other are marke
       Phase 1 below. 2 new review dimensions (`cross-file-consistency`,
       `claims-vs-evidence`) added to PLAN.md section 12.
 
-## Current state — 2026-09-09
+## Current state — 2026-09-13 (see `HANDOFF.md`'s own top header for the full, current-session detail;
+this section is a periodically-refreshed snapshot, not updated every pass)
 
-**Phases 0a, 0b, 1, 2, 3, 4, 5 and 6 are COMPLETE, and Phase 7's authorization GATE is done and reviewed.**
-`cd supervisor && npm test` runs **113 suites, exit 0**. Thirteen mutation harnesses, **185 mutations**, every
-one observed failing BY ASSERTION at the case that protects it (worker-env 22, approval 14, preflight 10,
-handoff 14, conformance 9, adoption 12, task-states 8, turn-digest 10, TUI 16, assignment 11, wrapper 10,
-review 27, auth 22).
+**Phases 0a-6 COMPLETE and reviewed. Phase 7 (authorization gate, resource leases, MCP pooling, the
+utility-task lane, `git-create-push`'s full fight loop) has its LIFECYCLE/FRAMEWORK COMPLETE — the
+git-push utility path works end to end, but Jira/Slack/awsquery utility roles have NO worker-side MCP
+tool transport yet (`spec.mcpConfig` deliberately unset — review-sol-2026-09-13.md finding 13/35,
+corrected 2026-09-13; see `HANDOFF.md`'s top header)**, independently
+reviewed multiple times (two codex passes, two `opencode luna` passes — see `HANDOFF.md` items
+16/18/22/24/25 for the ~20 real findings those found and fixed), and the OLDER should-fix backlog
+predating those reviews is now fully closed or explicitly, correctly deferred (`HANDOFF.md` items
+27-38). Phase 8 (CTO) has its first schema-only step started (`clearPolicy` on
+`harness-defaults.json` roles, item 39) — the actual decision logic is not built yet.
+`cd supervisor && npm test` runs **127 suites, exit 0**, re-verified repeatedly, zero leaked
+processes. The specific "113 suites" figure and mutation count below are a HISTORICAL snapshot from
+2026-09-09 (Phase 1/early Phase 7), kept for what they document, not as the current count.
 
 **Watch the suite COUNT, not just the exit code.** On 2026-09-08 it dropped from 109 to 104 because 202 files in
 this tree were overwritten by an older copy at 17:13:40 (cause never identified — not this session's edits, not
@@ -44,30 +53,51 @@ configurable reviews with revision-bound per-dimension verdicts, finding verific
 Detail for every decision is in `supervisor/runtime/FINDINGS.md` (§1-§37) — read that before changing any of
 the mechanisms it describes. `ROADMAP.md` has the per-phase checklists.
 
-### Phase 7 — where it stands
+### Phase 7 — where it stands (refreshed 2026-09-13 — see `HANDOFF.md`/`ROADMAP.md` for full detail)
 
 - [x] **The authorization gate** (2026-09-09, REVIEWED) — capability-based authorization with a real
       `callerIdentity`, enforced at the socket by `ipc/daemon.js`. Migration 0010, `domain/capabilities.js`,
       `supervisor.authorizedCommandHandlers()`. 22 mutations. `runtime/FINDINGS.md` §38 + §38.7,
       `review-phase7/verdicts.md`.
-- [ ] **The roster**: jira-automation, git-create-push, slack-message agents (PLAN.md §16). Each is a narrow
-      principal with a FIXED toolset — the presets already exist (`PRESETS["utility:git"]` etc.) and the
-      capabilities are already enforced, so what remains is each agent's own implementation.
-- [ ] **`git-create-push`'s full fight loop** (PLAN.md §8, Rule 2): real `git` access, not just `gh`/`glab` —
-      stage/commit/hook-failure/classify/autofix/re-run, returning a short structured result and never raw tool
-      output to the caller.
-- [ ] **Operation-intent journals per utility agent** — mostly done for free: `agent_journal` exists, records
-      allows and refusals, and `journalHasDone()` already answers §16's "did I already file this ticket".
-- [ ] **A test that drives the INSTALLED session hook against an authorized socket.** Known gap, recorded
-      rather than hidden: mutation **A21** is marked `expectSurvives` because nothing exercises the real hook
-      through the gate — `wire.test.js` uses the raw command map, and the slice that runs the hook for real
-      costs tokens and sits outside `npm test`. The production fix is in; the regression net is not.
-- [ ] **A real sandbox is NOT the gate.** Workers run as the same OS user and can read `owner.token`, so the
-      gate buys attribution, fixed toolsets and an audit trail — not confinement (§38.1). If that ever matters,
-      the fix is a separate uid per worker or OS-level confinement.
+- [x] **`git-create-push`'s full fight loop** (PLAN.md §8, Rule 2) — real `git` access:
+      stage/commit/hook-failure/classify/autofix/re-run, `gitPush`/`gitPushProtected` wire commands, `git:identity`
+      lease held across the whole loop. Built item 11; hardened repeatedly since (retry-after-partial-push-failure,
+      server-side protected-destination classification, async/non-blocking git calls — `HANDOFF.md` items 21/32).
+- [~] **The roster, decided differently than originally planned**: `leo-mcp` (`../leo-mcp/`, private sibling
+      repo, item 12) is a real, working, independently-tested MCP server providing Jira/Slack tool access —
+      instead of bespoke jira-automation/slack-message agents in THIS repo, since the skills were already
+      mature/conversational and `team-slack-bridge` had already grown a full MCP tool surface. **THAT DECISION
+      is done; wiring a dashboard worker session to actually REACH `leo-mcp` is not** (review-sol-2026-09-13.md
+      finding 13/35, corrected 2026-09-13) — `spec.mcpConfig` is deliberately left unset, so a jira-task/
+      slack-task run has no delivered channel to `leo-mcp` at all, only supervisor-side pool bookkeeping. This
+      dashboard's own utility-task lane (`git-push-task`/`jira-task`/`awsquery-task`/`slack-task`, item 13)
+      provides the role/capability/model machinery + a one-call dispatch helper (`createUtilityTask`, item 26)
+      + real per-role run instructions (item 26) on top of it — but only `git-push-task` has a real, DELIVERED
+      tool to call; the other three are role/capability/instruction scaffolding around a transport gap.
+- [~] **Operation-intent journals per utility agent — PRIMITIVE built, not wired into any caller.**
+      **CORRECTED 2026-09-13 (review-sol-2026-09-13.md finding 38) — this line previously read `[x]`,
+      contradicting `ROADMAP.md`'s own (correct) `[ ]` for the same item.** `agent_journal` +
+      `journalHasDone()` exist as a query primitive from the authorization gate, but NO side-effecting
+      caller — `git-create-push`, and Jira/Slack have no executable path at all yet — actually writes or
+      checks a stable intent key before acting. An append-only journal by itself does not give a retry
+      idempotency; a retried git push, Jira ticket, or Slack post can still repeat the real external
+      operation. Leave this open until every side-effecting operation records intent and checks a stable
+      dedup key before retrying.
+- [ ] **A test that drives the INSTALLED session hook against an authorized socket.** Still open. Known gap,
+      recorded rather than hidden: mutation **A21** is marked `expectSurvives` because nothing exercises the
+      real hook through the gate — `wire.test.js` uses the raw command map, and the slice that runs the hook
+      for real costs tokens and sits outside `npm test`. The production fix is in; the regression net is not.
+- [ ] **A real sandbox is NOT the gate.** Still true, documented rather than fixed. Workers run as the same
+      OS user and can read `owner.token`, so the gate buys attribution, fixed toolsets and an audit trail — not
+      confinement (§38.1). If that ever matters, the fix is a separate uid per worker or OS-level confinement.
+- [x] **The OLDER should-fix backlog predating Phase 7's reviews** — `HANDOFF.md` items 27-38, fully closed or
+      explicitly, correctly deferred across `db/`, `lock/`, `ipc/`, `adapters/` (entirely closed), and
+      `runtime/` (one genuinely real fix — adapter-iterator cancellation, reproduced empirically before fixing
+      — one deliberately-deferred design tradeoff, one stale note).
 
-Then Phase 8 (CTO), 9 (Slack outbound), 10 (Slack inbound, gated on §14.6's fix), 11 (onboarding
-generalization), 12 (packaging).
+Then Phase 8 (CTO — first schema-only step started, item 39: `clearPolicy` vocabulary on
+`harness-defaults.json`, no decision logic yet), 9 (Slack outbound), 10 (Slack inbound, gated on §14.6's
+fix), 11 (onboarding generalization), 12 (packaging).
 
 ### Parallel, in another repo: the Slack bridge
 
@@ -119,7 +149,13 @@ interface; only needs to integrate with Group 1's real schema before Group 5)*
 - [x] Daemon must never die from a peer: `error` handlers on every socket and every
       adapter `child.stdin`, top-level `uncaughtException`/`unhandledRejection` net,
       guarded writes, bounded per-connection input buffer. (same session as above)
-- [x] `SO_PEERCRED`/`getpeereid` uid check on socket accept. (same session as above)
+- [x] `SO_PEERCRED`/`getpeereid` uid check on socket accept — **checkbox corrected 2026-09-13: this
+      does NOT mean the OS-level uid check was literally built.** Investigated and re-verified
+      (`adapters/claude-code/probe/peercred-probe.mjs`, evidence 17): Node exposes no such API on a
+      Unix socket at all, confirmed again on the current Node version. The gap this line was meant
+      to close is closed a different, decided way instead — see `ipc/FINDINGS.md`'s entry — so the
+      checkbox stays checked for what actually got decided, not for a native addon that was never
+      written and is not needed.
 
 ### Group 4 — Adapter normalization
 *(independent of Groups 1-3 — pure adapter-level code, touches

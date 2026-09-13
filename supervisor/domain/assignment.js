@@ -24,7 +24,7 @@
 // §16's typed commands). A role with no worker is reported as UNFILLABLE, with a reason a human can act
 // on, rather than papered over.
 
-import { profileFor, rolesFor } from "./workflow-profiles.js";
+import { profileFor, rolesFor, workRolesFor } from "./workflow-profiles.js";
 import { assignmentFor } from "../config/harness-defaults.js";
 
 /**
@@ -153,15 +153,22 @@ export function planAssignment({ task, workers = [], config, overrides = {}, ope
 /**
  * Is this plan worth acting on at all?
  *
- * The CODER slot is the gate. A task whose reviewers cannot be filled is still worth starting — the work
- * can begin and the reviewers can be retried — but a task with nobody to do the work is not a degraded
- * start, it is no start, and beginning it would move the task out of `created` for no reason.
+ * A WORK-BEARING slot is the gate — which roles count as "work" is looked up from the CURRENT profile
+ * (`workflow-profiles.js`'s `workRoles`), not a hardcoded two-name check. That hardcode was real: it only
+ * ever recognized `coder`/`parentReviewer`, so the four utility-task roles added in PLAN.md §16.2
+ * (`git-push-runner`/`jira-runner`/`awsquery-runner`/`slack-runner`) were refused before launch even with
+ * a correctly-configured worker present — nobody could do the work, according to a condition that had
+ * never heard of them. Codex review (`codexdoc/REVIEW-NOTES.md` finding 7), fixed 2026-09-11. A task
+ * whose reviewers cannot be filled is still worth starting — the work can begin and the reviewers can be
+ * retried — but a task with nobody to do the WORK is not a degraded start, it is no start, and beginning
+ * it would move the task out of `created` for no reason.
  *
- * `reviewRequired: false` profiles (adhoc, chore) have no reviewers to miss, so the same rule reads
- * correctly for them without a special case.
+ * `reviewRequired: false` profiles (adhoc, chore, the utility-task lane) have no reviewers to miss, so
+ * the same rule reads correctly for them without a special case.
  */
 export function isActionable(plan) {
-  const hasWork = plan.slots.some((s) => s.role === "coder" || s.role === "parentReviewer");
+  const workRoles = workRolesFor(plan.type);
+  const hasWork = plan.slots.some((s) => workRoles.includes(s.role));
   if (hasWork) return { ok: true };
   const why = plan.unfillable.map((u) => u.reason).join("; ") || "the workflow profile asked for no roles";
   return {

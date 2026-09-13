@@ -26,6 +26,8 @@
 //   8. a task with nobody to do the work is refused, and stays in `created`
 //   9. profiles: an adhoc task needs no verdicts to be approved; a feature task needs two
 //  10. a failed role reaches the tier-3 handoff as a BLOCKER
+//  11. a utility-task-lane task type (PLAN.md §16.2) actually starts a real run through assignTask,
+//      not just its pieces tested in isolation (added 2026-09-11)
 //
 // Standing rule: every case asserts. This script cannot exit 0 with a broken claim.
 
@@ -109,6 +111,16 @@ await runTest("harness/model assignment", async () => {
         "a misspelled key must be reported, not ignored — ignoring it makes the setting appear to have no effect",
       );
       assert.throws(() => loadHarnessDefaults({ fileText: '{"global":{"coder":{"harnessId":42}}}' }), /must be a string/);
+      // clearPolicy is a real ASSIGNMENT_KEYS member (so it isn't reported as an unknown key), but its
+      // VALUE was never checked against CLEAR_POLICIES until now — a typo used to pass silently, which
+      // is exactly the "malformed file throws" asymmetry this case is about.
+      assert.throws(
+        () => loadHarnessDefaults({ fileText: '{"global":{"coder":{"clearPolicy":"on-demandd"}}}' }),
+        /clearPolicy.*must be one of/,
+        "an unrecognized clearPolicy value must be reported, not silently accepted",
+      );
+      const validPolicy = loadHarnessDefaults({ fileText: '{"global":{"coder":{"clearPolicy":"always"}}}' });
+      assert.equal(validPolicy.global.coder.clearPolicy, "always", "a recognized clearPolicy value must load through unchanged");
       console.log("  2. a malformed config throws and names the mistake; a missing one does not");
     }
 
@@ -343,6 +355,30 @@ await runTest("harness/model assignment", async () => {
       assert.match(blockers, /reviewer/);
       assert.match(blockers, /retry the assignment/, "and the document says what to do about it");
       console.log("  10. a failed role reaches the tier-3 handoff as a blocker");
+    }
+
+    // ── 11 ───────────────────────────────────────────────────────────────────────────
+    // THE UTILITY-TASK LANE (PLAN.md §16.2) IS ACTUALLY REACHABLE THROUGH assignTask, not just its
+    // pieces in isolation. Testing rolesFor()/ensureWorkerPrincipal() separately (as the first pass of
+    // this lane did) was NOT sufficient — `isActionable` had never heard of these roles and refused
+    // every one of these four task types before launch, even with a correctly-configured worker present.
+    // Codex review (`codexdoc/REVIEW-NOTES.md` finding 7), fixed 2026-09-11.
+    {
+      createTask(db, { id: "t-util", title: "a real git-push-task", type: "git-push-task" });
+      createWorker(db, { workerId: "w-util", nickname: "runner", role: "git-push-runner", taskId: "t-util" });
+
+      const preview = supervisor.assignmentPreview("t-util");
+      assert.deepEqual(preview.slots.map((s) => s.role), ["git-push-runner"]);
+
+      const res = await supervisor.assignTask("t-util", {
+        overrides: { "git-push-runner": { harnessId: "fake" } }, actor: "tester", cwd: stateDir,
+      });
+      assert.equal(res.assigned, true, `a real run must actually start for a utility task; got ${JSON.stringify(res)}`);
+      assert.equal(res.started.length, 1);
+      assert.equal(res.started[0].role, "git-push-runner");
+      assert.equal(res.state, "planning", "created -> starting -> planning, the same real state machine every task walks");
+      assert.equal(db.prepare("SELECT state FROM tasks WHERE id='t-util'").get().state, "planning");
+      console.log("  11. a git-push-task's real run starts through assignTask — the utility-task lane is actually reachable");
     }
   } finally {
     try { await supervisor?.shutdown({ timeoutMs: 3000 }); } catch { /* teardown */ }

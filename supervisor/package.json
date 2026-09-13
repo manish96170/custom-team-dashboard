@@ -8,17 +8,19 @@
     "node": ">=18"
   },
   "scripts": {
-    "test:db": "node db/test/concurrent-write.test.js && node db/test/concurrent-startup.test.js && node db/test/wal-conversion.test.js && node db/test/redaction.test.js && node db/test/permissions.test.js && node db/test/migrations.test.js && node db/test/asks-round-trip.test.js",
+    "test:db": "node db/test/concurrent-write.test.js && node db/test/concurrent-startup.test.js && node db/test/wal-conversion.test.js && node db/test/redaction.test.js && node db/test/permissions.test.js && node db/test/migrations.test.js && node db/test/asks-round-trip.test.js && node db/test/migration-0011.test.js && node db/test/migration-0012.test.js && node db/test/leases.test.js && node db/test/open-db-error-path.test.js",
     "bench:db": "node db/bench/event-log-insert.bench.js",
-    "test:lock": "node lock/test/write-gap.test.js && node lock/test/race.test.js && node lock/test/stale-recovery.test.js && node lock/test/stale-takeover-toctou.test.js && node lock/test/graceful-release.test.js && node lock/test/state-dir-unified.test.js",
+    "test:lock": "node lock/test/write-gap.test.js && node lock/test/race.test.js && node lock/test/stale-recovery.test.js && node lock/test/stale-takeover-toctou.test.js && node lock/test/graceful-release.test.js && node lock/test/state-dir-unified.test.js && node lock/test/cleanup-failure.test.js",
     "test:ipc": "node ipc/test/bounded-buffer.test.js && node ipc/test/correlation.test.js && node ipc/test/resilience-peer-crash.test.js && node ipc/test/teardown.test.js",
-    "test:adapters": "node adapters/opencode/test/test-opencode-adapter.mjs && node adapters/claude-code/test/test-worker-env.mjs && node adapters/claude-code/test/test-claude-code-adapter.mjs",
+    "test:adapters": "node adapters/opencode/test/stderr-ring.test.mjs && node adapters/opencode/test/test-opencode-adapter.mjs && node adapters/claude-code/test/test-worker-env.mjs && node adapters/claude-code/test/test-claude-code-adapter.mjs",
     "test:runtime": "node runtime/test/process-group.test.js && node runtime/test/event-pump.test.js && node runtime/test/reconcile.test.js && node runtime/test/integration.test.js && node runtime/test/review-three.test.js",
-    "test": "npm run test:db && npm run test:lock && npm run test:ipc && npm run test:adapters && npm run test:runtime && npm run test:pane && npm run test:crash && npm run test:tui && npm run test:domain",
-    "test:crash": "node runtime/test/crash-recovery.test.js && node runtime/test/concurrency.test.js && node runtime/test/daemon-crash.test.js && node runtime/test/asks.test.js && node runtime/test/approval.test.js && node runtime/test/review-0003.test.js && node runtime/test/preflight.test.js && node runtime/test/handoff.test.js && node runtime/test/conformance.test.js && node runtime/test/adoption.test.js && node runtime/test/wire.test.js && node runtime/test/turn-digest-wiring.test.js && node runtime/test/assignment.test.js && node runtime/test/wrapper-tier.test.js && node runtime/test/review.test.js && node runtime/test/authorization.test.js",
-    "test:pane": "node pane/test/render.test.js && node pane/test/pane-e2e.test.js",
+    "test": "npm run test:db && npm run test:lock && npm run test:ipc && npm run test:adapters && npm run test:runtime && npm run test:pane && npm run test:crash && npm run test:tui && npm run test:domain && npm run test:agents && npm run test:config",
+    "test:crash": "node runtime/test/crash-recovery.test.js && node runtime/test/concurrency.test.js && node runtime/test/daemon-crash.test.js && node runtime/test/asks.test.js && node runtime/test/approval.test.js && node runtime/test/review-0003.test.js && node runtime/test/preflight.test.js && node runtime/test/handoff.test.js && node runtime/test/conformance.test.js && node runtime/test/adoption.test.js && node runtime/test/wire.test.js && node runtime/test/turn-digest-wiring.test.js && node runtime/test/assignment.test.js && node runtime/test/wrapper-tier.test.js && node runtime/test/review.test.js && node runtime/test/authorization.test.js && node runtime/test/worktree.test.js && node runtime/test/leases.test.js && node runtime/test/git-create-push.test.js && node runtime/test/utility-task-lane.test.js && node runtime/test/mcp-pool.test.js && node runtime/test/mcp-pool-wiring.test.js",
+    "test:agents": "node agents/test/git-create-push.test.js",
+    "test:pane": "node pane/test/render.test.js && node pane/test/pane-e2e.test.js && node pane/test/pane-auth.test.js",
     "test:tui": "node tui/test/tui.test.js && node runtime/test/tui-replay.test.js",
-    "test:domain": "node domain/test/task-states.test.js && node domain/test/turn-digest.test.js && node domain/test/review.test.js && node domain/test/capabilities.test.js"
+    "test:domain": "node domain/test/task-states.test.js && node domain/test/turn-digest.test.js && node domain/test/review.test.js && node domain/test/capabilities.test.js && node domain/test/mcp-manifest.test.js && node domain/test/utility-instructions.test.js",
+    "test:config": "node config/test/protected-branches.test.js && node config/test/resources.test.js && node config/test/mcp-pools.test.js"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3"

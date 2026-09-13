@@ -1,0 +1,11 @@
+-- 0016_worktree_claim_token.sql — a per-claim identity for the worktree-claim pending marker.
+--
+-- review-sol-2026-09-13.md finding 9: every claimant wrote the SAME sentinel (`WORKTREE_CLAIM_PENDING`),
+-- with nothing distinguishing "my claim" from "a claim someone else made and I just reclaimed as stale."
+-- `reclaimStaleTaskWorktreeClaim` only bumped `updated_at` — the marker itself never changed identity — so
+-- the ORIGINAL claimant, if it was only slow rather than actually dead, could still call
+-- `finalizeTaskWorktreeSlot`/`releaseTaskWorktreeClaim` successfully after being reclaimed, silently
+-- overwriting whatever the reclaimer's own (possibly different) git work had already finalized. This
+-- column is that identity: a fresh random token minted at every claim AND at every reclaim, required by
+-- finalize/release in addition to the pending marker, so only the CURRENT claim's holder can ever resolve it.
+ALTER TABLE tasks ADD COLUMN worktree_claim_token TEXT;

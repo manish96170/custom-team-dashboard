@@ -22,6 +22,13 @@ const EXPECTED_TABLES = [
   "outbox",
   // migration 0003: the orphan sightings journal (a log, not a second source of truth).
   "orphan_sightings",
+  // migration 0010: capability-based authorization.
+  "principals",
+  "agent_journal",
+  "sensitive_approvals",
+  // migration 0011: resource leases (PLAN.md section 20) and MCP server pooling (section 21).
+  "resource_leases",
+  "mcp_pool",
 ];
 
 await runTest("migrations", async () => {

@@ -19,6 +19,8 @@
 import {
   openDb,
   closeDb,
+  createTask,
+  createWorker,
   createRun,
   endRun,
   closeOpenAsksForRun,
@@ -41,6 +43,13 @@ import {
   listPendingAsks,
   listUndeliveredAnswers,
   taskIdForRun,
+  workerIdForRun,
+  claimTaskWorktreeSlot,
+  finalizeTaskWorktreeSlot,
+  releaseTaskWorktreeClaim,
+  reclaimStaleTaskWorktreeClaim,
+  WORKTREE_CLAIM_PENDING,
+  sleepSync,
   parseJsonColumn,
   redactResolvedAskPayload,
   listRunsForDisplay,
@@ -79,7 +88,20 @@ import {
   listTaskTurnDigests,
   latestTaskHandoff,
   listTaskHandoffs,
+  tryAcquireLease,
+  getLease,
+  releaseLeaseRow,
+  renewLeaseRow,
+  sweepExpiredLeases,
+  listActiveLeases,
+  setAttachmentRunId,
+  listOpenAttachmentsForRun,
+  MAX_LEASE_TTL_MS,
 } from "../db/index.js";
+import { loadResources } from "../config/resources.js";
+import { loadProtectedBranches } from "../config/protected-branches.js";
+import { runFightLoop, resolvePushDestination } from "../agents/git-create-push.js";
+import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { createEventPump } from "./event-pump.js";
 import { generateTaskHandoff } from "../handoff/generate.js";
@@ -90,14 +112,31 @@ import {
   authorize, canGrantApproval, argsHash, requireArgs, PRESETS, COMMAND_CAPABILITIES, isSensitive,
 } from "../domain/capabilities.js";
 import { randomBytes, createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+// review-sol-2026-09-13.md finding 23: the worktree lifecycle (create/status/discard/request) used to
+// run every git call through `execFileSync` — blocking the WHOLE daemon event loop for as long as the
+// child runs (a real `git worktree add`/`remove` can legitimately take up to its own internal timeout).
+// Not just this call's own logic — every socket command, ask, digest, and lease-renewal timer on the
+// SAME daemon process stalls too, for however long the git process takes. `execFile` (promisified) waits
+// on the child via libuv without blocking the event loop — the exact fix `agents/git-create-push.js`
+// already applies to its own git calls (see that file's own `execFileAsync`). The sequence of git calls
+// and what they mean is UNCHANGED here too — only how each one is awaited.
+const execFileAsync = promisify(execFile);
 import fs from "node:fs";
 import { planAssignment, isActionable } from "../domain/assignment.js";
+import { isTerminal, autoBlockTarget } from "../domain/task-states.js";
+import { instructionForRole } from "../domain/utility-instructions.js";
+import { rolesFor } from "../domain/workflow-profiles.js";
 import path from "node:path";
 import { extractiveDigest, DIGEST_BUDGET_CHARS } from "../domain/turn-digest.js";
 import { runConformance, formatReport } from "../conformance/suite.js";
 import { reconcileOnBoot, reap as reapRun } from "./reconcile.js";
 import { readProcInfo } from "./procinfo.js";
+import { createMcpPool } from "./mcp-pool.js";
+import { manifestForRole, ROLE_MCP_NEEDS } from "../domain/mcp-manifest.js";
+import { poolConfigFor } from "../config/mcp-pools.js";
 
 /** turn.end status (derived by the pump) -> the `runs.exit_reason` written when the
  * adapter's own stream ends. `finished` is written ONLY from here -- the adapter's
@@ -107,6 +146,22 @@ const EXIT_REASON_FOR_STATUS = {
   error: "errored",
   aborted: "interrupted",
 };
+
+/**
+ * The utility-task lane's role -> capability-preset map (PLAN.md §16.2). Module-scoped (not local to
+ * `ensureWorkerPrincipal`) so `start()`'s MCP-pool wiring can ask "is this a utility-task role" using
+ * the SAME signal `ensureWorkerPrincipal` already uses, rather than inventing a second way to detect
+ * the same four roles. `domain/mcp-manifest.js`'s `ROLE_MCP_NEEDS` answers a different question (which
+ * pool configs a role wants) and deliberately is not merged with this one — a role can be a utility-task
+ * role with no declared MCP need (`awsquery-runner` today), and the two maps drifting independently is
+ * more honest than forcing one to imply the other.
+ */
+const UTILITY_TASK_PRESETS = Object.freeze({
+  "git-push-runner": "utility:git",
+  "jira-runner": "utility:jira",
+  "awsquery-runner": "utility:awsquery",
+  "slack-runner": "utility:slack",
+});
 
 /**
  * @param {{
@@ -165,6 +220,9 @@ export function createSupervisor({
     },
   };
   const pump = createEventPump({ persistence, logger });
+  // PLAN.md §21.1, wired into a real start/end path 2026-09-11. One manager per supervisor process,
+  // same lifetime as `pump` — its `_liveChildren` map is only meaningful for THIS process's own spawns.
+  const mcpPool = createMcpPool({ db: database, logger });
 
   /**
    * Where this supervisor's state directory is.
@@ -199,6 +257,29 @@ export function createSupervisor({
     return row.harness_id;
   }
 
+  /**
+   * Detach every MCP-pool attachment a run held, best-effort, after the run's terminal write has
+   * already committed. NOT awaited by callers on purpose — `detach()` may have to kill a real process
+   * (`killProcessGroup`'s grace period), and a run ending must not block on that any more than a lease
+   * release does. Failures are logged, never thrown: a stuck detach is a pool-hygiene problem for the
+   * next `reconcileOnBoot`/idle-drain sweep to catch, not a reason to fail the run's own terminal write,
+   * which has already committed by the time this is called.
+   */
+  function scheduleAttachmentDetach(runId) {
+    let ids;
+    try {
+      ids = listOpenAttachmentsForRun(database, runId);
+    } catch (err) {
+      logger.warn?.(`[supervisor] could not list mcp-pool attachments for run ${runId}: ${err.message}`);
+      return;
+    }
+    for (const id of ids) {
+      mcpPool.detach(id).catch((err) => {
+        logger.warn?.(`[supervisor] mcp-pool detach ${id} for run ${runId} failed (best-effort): ${err.message}`);
+      });
+    }
+  }
+
   function routeOrThrow(runId) {
     const harnessId = harnessOf(runId);
     if (!harnessId) throw new Error(`unknown runId: ${runId}`);
@@ -223,12 +304,27 @@ export function createSupervisor({
     for (const row of open) harnessCache.set(row.run_id, row.harness_id);
     logger.log?.(`[supervisor] rehydrated routing for ${open.length} open run(s) from persisted rows`);
     const reconciliation = reconcile ? await reconcileOnBoot({ db: database, hasHandle, logger }) : null;
+    // Boot reconciliation closes asks for every run it reconciles (`reconcile.js`), which can leave a
+    // task `blocked` with nothing left open if that was its only run — same reconcile this file's other
+    // ask-closing paths already do.
+    if (reconcile) reconcileAutoBlockedTasks();
+    // A run reconciled to `lost` is no longer cooperating (same reasoning `endRun` already applies to
+    // leases) — its MCP-pool attachments, if any, must not wait for the pool's own idle sweep.
+    for (const runId of reconciliation?.lost ?? []) scheduleAttachmentDetach(runId);
+    // §21.1's own boot-time reconciliation: every `mcp_pool` row claiming `starting`/`ready` predates
+    // THIS process's in-memory child map, so it's either genuinely dead or an orphan from a previous
+    // boot of this same daemon — see `mcp-pool.js`'s `reconcileOnBoot` for why neither case is reusable.
+    const mcpPoolReconciliation = reconcile ? await mcpPool.reconcileOnBoot() : null;
     // The grace period is persisted precisely so a crash during it does not strand the ask, so
     // boot has to be one of the places that sweeps — a timer alone would only ever fire in
     // processes that stayed alive.
     const asksAutoClosed = sweepAsksOnBoot ? sweepAsks() : 0;
+    // Same reasoning, same timer: a lease holder SIGKILLed mid-hold must not deadlock every future
+    // waiter, and re-using `askSweepTimer`'s interval rather than starting a second one is deliberate —
+    // this codebase's own review rule against building a mechanism that already exists a few lines away.
+    const leasesSwept = sweepAsksOnBoot ? sweepLeases() : 0;
     if (askSweepIntervalMs > 0 && !askSweepTimer) {
-      askSweepTimer = setInterval(sweepAsks, askSweepIntervalMs);
+      askSweepTimer = setInterval(() => { sweepAsks(); sweepLeases(); }, askSweepIntervalMs);
       // Bookkeeping must not be the reason a process refuses to exit.
       askSweepTimer.unref?.();
     }
@@ -261,7 +357,10 @@ export function createSupervisor({
       reviews = { error: err.message };
       logger.warn?.(`[supervisor] review-profiles.json could not be imported: ${err.message}`);
     }
-    return { rehydrated: open.map((r) => r.run_id), reconciliation, asksAutoClosed, redelivery, preflights, reviews, owner };
+    return {
+      rehydrated: open.map((r) => r.run_id), reconciliation, asksAutoClosed, leasesSwept, redelivery,
+      preflights, reviews, owner, mcpPoolReconciliation,
+    };
   }
 
   /**
@@ -282,6 +381,7 @@ export function createSupervisor({
       // it has already killed it. The run is over before it began; say so honestly.
       logger.warn?.(`[supervisor] run ${runId} could not be owned: ${err.message}`);
       endRun(database, runId, { exitReason: "errored" });
+      scheduleAttachmentDetach(runId);
       pump.closeRun(runId);
       throw err;
     }
@@ -369,7 +469,10 @@ export function createSupervisor({
     // theirs stands.
     if (closed !== 1) return closed;
     if (SELF_ENDED_REASONS.has(reason)) scheduleAskAutoClose(database, runId, { graceMs: askGraceMs });
-    else closeOpenAsksForRun(database, runId, { reason });
+    else { closeOpenAsksForRun(database, runId, { reason }); reconcileAutoBlockedTasks(); }
+    // Fires async detaches without awaiting them — safe inside this synchronous transaction callback
+    // because `scheduleAttachmentDetach` itself never awaits, only kicks work off. See its own comment.
+    scheduleAttachmentDetach(runId);
     return closed;
   });
 
@@ -462,6 +565,65 @@ export function createSupervisor({
     }
   }
 
+  /**
+   * The ask/task lifecycle wiring `codexdoc/REVIEW-NOTES.md` finding 16 found missing:
+   * `domain/task-states.js`'s `autoBlockTarget` was built and tested in isolation, but nothing in
+   * this file ever called it — a task could sit in `implementing` with a real open ask, or in
+   * `blocked` with nothing left open, forever, because "entered automatically when an ask is
+   * created, clears automatically when answered" (PLAN.md section 6) was a sentence, not a wire.
+   *
+   * Two hooks below, not one: opening an ask names its OWN task (from the event that just parked),
+   * so that side calls `recordTransition` directly. Closing an ask can happen from several different
+   * places (`answerAsk`, `closeOpenAsksForRun`'s two call sites, the grace-expiry sweep,
+   * `withdrawApprovalAsk`), and "was this the LAST open ask for the task" is cheaper and more
+   * robust to answer by RE-QUERYING current state than by threading a running tally through every
+   * one of them — `blocked` tasks are rare, so a full scan of just that set after any closure is
+   * effectively free.
+   */
+  function anyOpenAskForTask(taskId) {
+    if (!taskId) return false;
+    return !!database.prepare(`SELECT 1 FROM asks WHERE task_id = ? AND resolved = 0 LIMIT 1`).get(taskId);
+  }
+
+  /** Called once, right after an ask row is actually created — the one place that already knows
+   *  exactly which task just gained an open ask. */
+  function syncBlockedOnAskOpened(taskId) {
+    if (!taskId) return;
+    const task = database.prepare(`SELECT state FROM tasks WHERE id = ?`).get(taskId);
+    if (!task) return;
+    const target = autoBlockTarget(task.state, { askOpen: true });
+    if (!target) return;
+    try {
+      recordTransition(database, {
+        id: `tr-autoblock-${taskId}-${Date.now()}`, taskId, fromState: task.state, toState: target,
+        actor: "supervisor:ask", askOpen: true,
+      });
+    } catch (err) {
+      // Best-effort: a legality/staleness refusal just means the task already moved on (a human
+      // transitioned it in the same instant) — not fatal to the ask-recording path that triggered this.
+      logger.warn?.(`[supervisor] syncBlockedOnAskOpened(${taskId}): ${err.message}`);
+    }
+  }
+
+  /** Called after ANY ask-closing operation. Re-checks every currently-`blocked` task rather than
+   *  trusting the caller to know whether IT was the last open ask. */
+  function reconcileAutoBlockedTasks() {
+    const blocked = database.prepare(`SELECT id, state FROM tasks WHERE state = 'blocked'`).all();
+    for (const t of blocked) {
+      const askOpen = anyOpenAskForTask(t.id);
+      const target = autoBlockTarget(t.state, { askOpen });
+      if (!target) continue;
+      try {
+        recordTransition(database, {
+          id: `tr-autounblock-${t.id}-${Date.now()}`, taskId: t.id, fromState: t.state, toState: target,
+          actor: "supervisor:ask", askOpen,
+        });
+      } catch (err) {
+        logger.warn?.(`[supervisor] reconcileAutoBlockedTasks(${t.id}): ${err.message}`);
+      }
+    }
+  }
+
   /** Turn a live parked harness request into an `asks` row. */
   function recordApprovalAsk(runId, event) {
     const run = getRun(database, runId);
@@ -484,11 +646,12 @@ export function createSupervisor({
       return null;
     }
 
+    const taskId = taskIdForRun(database, runId);
     try {
       createAsk(database, {
         id: askId,
         runId,
-        taskId: taskIdForRun(database, runId),
+        taskId,
         // The wire tells these apart by `requires_user_interaction`, so we record the
         // distinction the harness makes rather than inventing one of our own.
         kind: event.requiresUserInteraction ? "question" : "tool-approval",
@@ -512,6 +675,7 @@ export function createSupervisor({
         graceMs: askGraceMs,
       });
       logger.log?.(`[supervisor] run ${runId} is blocked on ${event.toolName} (ask ${askId})`);
+      syncBlockedOnAskOpened(taskId);
       return askId;
     } catch (err) {
       // A UNIQUE violation usually means the pump re-delivered an event we have already
@@ -574,7 +738,10 @@ export function createSupervisor({
     if (!row) return;
     const reason = event.reason ?? "harness-withdrew";
     const changed = withdrawAsk(database, row.id, { reason });
-    if (changed > 0) logger.log?.(`[supervisor] ask ${row.id} was withdrawn by the harness (${reason})`);
+    if (changed > 0) {
+      logger.log?.(`[supervisor] ask ${row.id} was withdrawn by the harness (${reason})`);
+      reconcileAutoBlockedTasks();
+    }
   }
 
   /**
@@ -828,6 +995,7 @@ export function createSupervisor({
       const now = getAsk(database, askId);
       return { askId, answered: false, reason: `ask ${askId} was resolved by ${now?.answered_by ?? "someone else"} first`, delivered: false };
     }
+    reconcileAutoBlockedTasks();
 
     const delivery = await deliverAnswer(getAsk(database, askId));
     // Only once the payload is no longer needed for delivery: `buildAnsweredInput` reads
@@ -877,11 +1045,27 @@ export function createSupervisor({
   function sweepAsks() {
     try {
       const closed = sweepExpiredAsks(database);
-      if (closed > 0) logger.log?.(`[supervisor] auto-closed ${closed} ask(s) whose grace period expired`);
+      if (closed > 0) {
+        logger.log?.(`[supervisor] auto-closed ${closed} ask(s) whose grace period expired`);
+        reconcileAutoBlockedTasks();
+      }
       return closed;
     } catch (err) {
       // A sweep that throws must never take the daemon down — it is bookkeeping on a timer.
       logger.warn?.(`[supervisor] ask sweep failed (non-fatal): ${err.message}`);
+      return 0;
+    }
+  }
+
+  /** Release every resource lease whose TTL expired without a renewal (PLAN.md §20). Same shape as
+   *  `sweepAsks`, called from the same boot/timer sites rather than a second mechanism. */
+  function sweepLeases() {
+    try {
+      const released = sweepExpiredLeases(database);
+      if (released > 0) logger.log?.(`[supervisor] released ${released} resource lease(s) whose TTL expired unrenewed`);
+      return released;
+    } catch (err) {
+      logger.warn?.(`[supervisor] lease sweep failed (non-fatal): ${err.message}`);
       return 0;
     }
   }
@@ -957,7 +1141,76 @@ export function createSupervisor({
       logger.warn?.(`[supervisor] run for ${workerId} starts without a principal: ${err.message}`);
     }
 
-    const runId = await adapter.start(spec);
+    // PLAN.md §21.1/§21.2, wired 2026-09-11: a utility-task-lane role (§16.2) that declares an MCP need
+    // (`domain/mcp-manifest.js`'s `ROLE_MCP_NEEDS`) attaches to its pooled server(s) BEFORE the adapter
+    // spawns — the attach/detach LIFECYCLE bookkeeping is real and tested (`mcp-pool.js`,
+    // `mcp-pool-wiring.test.js`).
+    //
+    // CORRECTED 2026-09-11 (`codexdoc/review-luna-2026-09-11.md` finding 2) — this used to also put the
+    // pool-attachment marker (`{name, poolId}` objects) onto `spec.mcpConfig` and hand THAT to the real
+    // adapter. Checked against the adapter's own contract before this fix, not assumed: both
+    // `adapters/claude-code/adapter.js`'s `StartSpec` typedef and `worker-env.js`'s
+    // `settingSourcesArgv()` (`for (const cfg of spec.mcpConfig ...) args.push('--mcp-config', cfg)`)
+    // declare `mcpConfig` as `string | string[]` — a real config FILE PATH per entry, spawned by the
+    // adapter itself. Handing it a plain object instead would push a non-string into a real `spawn()`
+    // argv array the moment a utility-task role ever ran through the REAL Claude Code adapter (the
+    // existing tests never caught this because they only exercise the fake harness, which doesn't
+    // validate argv shape). OpenCode's adapter is stricter and simply THROWS on any `spec.mcpConfig` at
+    // all (`adapters/opencode/adapter.js`), so it would have failed loudly there instead — but "silently
+    // malformed on one harness, hard failure on the other" is not a state to ship either way.
+    // No probe in this repo has ever measured what a genuinely valid `--mcp-config` VALUE looks like for
+    // a pooled server with no on-disk config file (leo-mcp's socket transport, added the same day, is
+    // not something the MCP spec's own transport types — stdio command, or an SSE/HTTP url — describe a
+    // raw Unix socket as), so building a real one here would be guessing at a CLI contract rather than
+    // verifying it, which this project does not do. Until that is actually measured, `spec.mcpConfig` is
+    // simply never set here — the attach/detach bookkeeping below still runs for real (proving the pool
+    // manager itself, and keeping the lifecycle groundwork PLAN.md §21.1 is actually built on), but a
+    // utility-task run gets no MCP tool from it yet. `manifest.missing`'s diagnostic value is unaffected.
+    const mcpAttachmentIds = [];
+    const workerRow = database.prepare(`SELECT role FROM workers WHERE worker_id = ?`).get(workerId);
+    const declaredMcpNeeds = ROLE_MCP_NEEDS[workerRow?.role] ?? [];
+    if (declaredMcpNeeds.length) {
+      const registeredConfigs = {};
+      for (const name of declaredMcpNeeds) {
+        if (poolConfigFor(name, { stateDir: stateDirOf() })) registeredConfigs[name] = name;
+      }
+      const manifest = manifestForRole(workerRow.role, { registeredConfigs });
+      if (manifest.missing.length) {
+        logger.warn?.(`[supervisor] role "${workerRow.role}" declares MCP need(s) [${manifest.missing.join(", ")}] with no registered pool config`);
+      }
+      for (const poolName of manifest.pools) {
+        const poolConfig = poolConfigFor(poolName, { stateDir: stateDirOf() });
+        if (!poolConfig) continue; // already warned above via `manifest.missing`
+        try {
+          const attached = await mcpPool.attach(poolName, poolConfig, { principalId: workerPrincipal?.id ?? null, runId: null });
+          mcpAttachmentIds.push(attached.attachmentId);
+        } catch (err) {
+          // Non-fatal, same posture as a missing principal above: a utility-task run that can't attach
+          // to its declared pool still starts (it just won't have that tool), logged rather than
+          // failing the whole run over a pooling concern.
+          logger.warn?.(`[supervisor] run for ${workerId} could not attach to mcp pool "${poolName}": ${err.message}`);
+        }
+      }
+    }
+
+    // `mcpAttachmentIds` (if any) were made BEFORE this call, because the pooled config has to be in
+    // `spec` at spawn time — so a throw HERE, not just a `createRun` failure afterward, must also
+    // detach them. Before this fix there was no try/catch around this call at all: an adapter.start()
+    // failure propagated straight out of `start()`, leaking every attachment made above with no run
+    // ID for anything to ever clean them up by (`endRun`/reconciliation only look up attachments BY
+    // run_id, and none exists yet at this point). Found in review
+    // (`codexdoc/review-luna-2026-09-11.md` finding 4), fixed 2026-09-11.
+    let runId;
+    try {
+      runId = await adapter.start(spec);
+    } catch (err) {
+      for (const attachmentId of mcpAttachmentIds) {
+        mcpPool.detach(attachmentId).catch((detachErr) => {
+          logger.warn?.(`[supervisor] mcp-pool detach ${attachmentId} after failed adapter.start() for ${workerId} failed (best-effort): ${detachErr.message}`);
+        });
+      }
+      throw err;
+    }
     // The child is ALIVE from here on, so every failure below has to kill it. Without this, a
     // persistence failure (e.g. an unknown `workerId` tripping the `runs.worker_id` foreign key)
     // left a running detached process with no row at all: not in `list()`, not routable by
@@ -977,6 +1230,15 @@ export function createSupervisor({
       });
     } catch (err) {
       logger.warn?.(`[supervisor] could not persist run ${runId} (${err.message}); killing the child rather than orphaning it`);
+      // `mcp_pool_attachments.run_id` has a REAL foreign key to `runs.run_id` (migration 0013) — these
+      // attachments were made with `run_id: NULL` and never backfilled (that happens below, only once
+      // `createRun` has actually succeeded), so they must be detached by ID directly here, not via a
+      // `WHERE run_id = ?` lookup that would find nothing.
+      for (const attachmentId of mcpAttachmentIds) {
+        mcpPool.detach(attachmentId).catch((detachErr) => {
+          logger.warn?.(`[supervisor] mcp-pool detach ${attachmentId} after failed createRun for ${runId} failed (best-effort): ${detachErr.message}`);
+        });
+      }
       try {
         await adapter.stop(runId);
       } catch (stopErr) {
@@ -985,6 +1247,12 @@ export function createSupervisor({
       }
       throw err;
     }
+    // Backfill now that `runs.run_id` actually exists — attaching had to happen BEFORE `adapter.start()`
+    // returned a runId (the pooled config needs to be in `spec` at spawn time), and backfilling had to
+    // wait until AFTER `createRun()` committed, or this UPDATE would itself violate the same foreign
+    // key. See `setAttachmentRunId`'s own doc comment for the (accepted, sub-millisecond) crash window
+    // between here and there.
+    for (const attachmentId of mcpAttachmentIds) setAttachmentRunId(database, attachmentId, runId);
     harnessCache.set(runId, harnessId);
 
     pump.attach(runId, adapter.observe(runId), { onEvent: onEventHook(runId), onEnd: onEndHook(runId) });
@@ -1078,6 +1346,10 @@ export function createSupervisor({
         logger,
       }),
     );
+    // `reapRun` (`reconcile.js`) closes the run's open asks itself on a real reap/stop — this file's
+    // ask/task-blocking wiring lives here, not there, so the reconcile is done on return rather than
+    // inside a module that has no notion of task state at all.
+    reconcileAutoBlockedTasks();
     // Only tear down the pump when the run actually ended. A refused reap (shared process
     // group, pid-reuse mismatch, a kill that didn't take) leaves a LIVE process behind;
     // closing its pump would stop persisting and fanning out the events of a run that is
@@ -1534,11 +1806,20 @@ export function createSupervisor({
     }
     const worker = database.prepare(`SELECT worker_id, nickname, role FROM workers WHERE worker_id = ?`).get(workerId);
     if (!worker) throw new Error(`ensureWorkerPrincipal: no such worker ${workerId}`);
-    const preset = worker.role === "reviewer" ? PRESETS.reviewer : PRESETS.worker;
+    // The utility-task lane (PLAN.md §16.2, added 2026-09-11): these four roles are spawned exactly like
+    // any other worker (a run under a task), but their fixed toolset is a UTILITY preset, not the
+    // generic worker one — a git-push-runner needs `git:push`/`git:push-protected`, which `PRESETS.worker`
+    // deliberately does not carry. `kind: "utility"` too, matching migration 0010's own description of
+    // that kind ("a narrow single-purpose agent") rather than the generic "worker" kind, even though it
+    // is dispatched through the same run/task machinery as a coder or reviewer. (Map is module-scoped —
+    // see its own comment above — so `start()`'s MCP-pool wiring reuses this exact signal.)
+    const utilityPresetName = UTILITY_TASK_PRESETS[worker.role];
+    const preset = utilityPresetName ? PRESETS[utilityPresetName] : worker.role === "reviewer" ? PRESETS.reviewer : PRESETS.worker;
+    const kind = utilityPresetName ? "utility" : "worker";
     const token = randomBytes(32).toString("hex");
     const id = `p-w-${workerId}-${randomUUID().slice(0, 6)}`;
     mintPrincipal(database, {
-      id, kind: "worker", displayName: `${worker.nickname} (${worker.role})`, workerId,
+      id, kind, displayName: `${worker.nickname} (${worker.role})`, workerId,
       capabilities: [...preset], tokenSha256: sha256(token),
     });
     return { principal: getPrincipal(database, id), token, minted: true };
@@ -1761,6 +2042,21 @@ export function createSupervisor({
       // caller supplies is the judgement.
       const task = database.prepare(`SELECT id, state FROM tasks WHERE id = ?`).get(v.taskId);
       if (!task) throw new Error(`recordVerdict: no such task ${v.taskId}`);
+      // The AUTHENTICATED principal, not the request, decides which worker's verdict this is — same
+      // "identity is a registry fact, not a request field" reasoning as the slot/dimension checks below,
+      // extended to cover a gap those checks did not: without this, a single reviewer token could submit
+      // verdicts under TWO DIFFERENT valid `workerId`s (both real reviewers on the task) and manufacture
+      // the "two distinct reviewers" quorum by itself. Found by both codex reviews
+      // (`codexdoc/review-phase7-uncommitted.md`'s scope excluded this file; `codexdoc/REVIEW-NOTES.md`
+      // finding 3), fixed 2026-09-11. A principal with no `workerId` (owner/CTO) is not restricted here —
+      // an owner/CTO recording on a worker's behalf is a future, separately-audited capability, not
+      // something to silently allow OR silently block by accident while fixing worker impersonation.
+      if (v._principal?.workerId && v._principal.workerId !== v.workerId) {
+        throw new Error(
+          `recordVerdict: principal is authenticated as worker ${v._principal.workerId}, not ${v.workerId} — `
+          + "a reviewer can only record a verdict under its OWN worker identity",
+        );
+      }
       const worker = database
         .prepare(`SELECT worker_id AS workerId, nickname, role, task_id AS taskId FROM workers WHERE worker_id = ?`)
         .get(v.workerId);
@@ -2096,8 +2392,25 @@ export function createSupervisor({
    */
   async function assignTask(taskId, { overrides = {}, actor = "operator", idempotencyKey = null, cwd = null } = {}) {
     if (!taskId) throw new Error("assignTask: taskId is required");
-    const task = database.prepare(`SELECT id, type, team_id, state, worktree_id FROM tasks WHERE id = ?`).get(taskId);
+    const task = database.prepare(`SELECT id, title, type, team_id, state, worktree_id FROM tasks WHERE id = ?`).get(taskId);
     if (!task) throw new Error(`assignTask: no such task ${taskId}`);
+
+    // Refuse a terminal task outright — `codexdoc/review-luna-2026-09-11.md` finding 7: without this,
+    // `assignTask` could start a brand-new open run for a task already in `merged`/`cancelled`/etc. with
+    // no coordination against `discardTaskWorktree`'s own (point-in-time) open-run check, so a discard
+    // that observed zero open runs and a start landing right after it could delete a worktree out from
+    // under the run it just created. There is no "reopen a terminal task" transition today, so this is
+    // not yet the general "one lifecycle reservation for create/discard/assign" the finding asks for —
+    // it closes the specific race by removing the only way assignTask could ever race a terminal-task
+    // discard in the first place.
+    if (isTerminal(task.state)) {
+      return {
+        ok: false, assigned: false, refused: "task-terminal",
+        error: `task ${taskId} is "${task.state}" — assignTask refuses to start new runs on a terminal task; `
+          + "there is no reopen transition, so a terminal task must not grow a new open run for "
+          + "discardTaskWorktree's open-run check to remain meaningful",
+      };
+    }
 
     // ── the idempotency claim, BEFORE anything is spawned ────────────────────────────────
     const existing = readAssignmentRecord(taskId);
@@ -2167,7 +2480,9 @@ export function createSupervisor({
           workerId: slot.workerId,
           spec: {
             cwd: cwd ?? task.worktree_id ?? process.cwd(),
-            prompt: `Task ${taskId} (${task.type ?? "task"}), role ${slot.role}.`,
+            // A utility role (§16.2) gets REAL instructions naming its own tool and repeating the
+            // "raise an ask, don't guess" rule — every other role keeps the existing generic sentence.
+            prompt: instructionForRole(slot.role, task) ?? `Task ${taskId} (${task.type ?? "task"}), role ${slot.role}.`,
             ...(slot.model ? { model: slot.model } : {}),
             ...(slot.effort ? { effort: slot.effort } : {}),
           },
@@ -2221,6 +2536,33 @@ export function createSupervisor({
     }
 
     return { taskId, plan, ...report };
+  }
+
+  /**
+   * createUtilityTask({ type, title, teamId, actor }) -> one call for the whole utility-task lane
+   * dispatch (PLAN.md §16.2) — item 13's own "not built, deliberately out of scope" note named exactly
+   * this gap: creating the task, minting its one worker, and assigning it were three separate calls a
+   * caller had to make itself, in the right order, with the right role name. This is a thin composition
+   * in front of `assignTask` — the same idempotency, partial-start compensation and terminal-task guard
+   * apply, because this calls it rather than reimplementing any part of it.
+   */
+  async function createUtilityTask({ type, title, teamId = null, actor = "operator", overrides = {}, cwd = null } = {}) {
+    if (!type) throw new Error("createUtilityTask: type is required");
+    if (!title) throw new Error("createUtilityTask: title is required");
+    const roles = rolesFor(type);
+    if (roles.length !== 1 || !UTILITY_TASK_PRESETS[roles[0]]) {
+      throw new Error(
+        `createUtilityTask: "${type}" is not a utility task type `
+        + `(have: git-push-task, jira-task, awsquery-task, slack-task)`,
+      );
+    }
+    const role = roles[0];
+    const taskId = `t-${type}-${randomUUID().slice(0, 8)}`;
+    const workerId = `w-${type}-${randomUUID().slice(0, 6)}`;
+    createTask(database, { id: taskId, title, type, teamId });
+    createWorker(database, { workerId, nickname: role, role, teamId, taskId });
+    const assigned = await assignTask(taskId, { actor, overrides, ...(cwd ? { cwd } : {}) });
+    return { taskId, workerId, role, ...assigned };
   }
 
   /**
@@ -2403,7 +2745,11 @@ export function createSupervisor({
     if (!row) return { released: false, reason: `no adopted session ${sessionId} for ${harnessId}` };
     if (row.ended_at) return { released: false, runId: row.run_id, reason: "already closed" };
     const closed = endRun(database, row.run_id, { exitReason: reason });
-    if (closed) closeOpenAsksForRun(database, row.run_id, { reason });
+    if (closed) {
+      closeOpenAsksForRun(database, row.run_id, { reason });
+      reconcileAutoBlockedTasks();
+      scheduleAttachmentDetach(row.run_id);
+    }
     return { released: closed === 1, runId: row.run_id };
   }
 
@@ -2461,6 +2807,15 @@ export function createSupervisor({
         } catch (err) {
           result.adapters[harnessId] = { error: String(err?.message ?? err) };
         }
+      }
+      // review-sol-2026-09-13.md finding 22 (shutdown half): pooled MCP processes were never disposed
+      // on shutdown at all — this call, BEFORE `closeDb()` below, is what closes that gap. Same
+      // best-effort, never-block-teardown-on-a-write-failure discipline `mcp-pool.js`'s own `disposeAll`
+      // already applies internally.
+      try {
+        result.mcpPool = await mcpPool.disposeAll();
+      } catch (err) {
+        result.mcpPool = { error: String(err?.message ?? err) };
       }
       return true;
     })();
@@ -2702,6 +3057,622 @@ export function createSupervisor({
   }
 
   /**
+   * Resolve a linked worktree's main repo root by asking git, rather than assuming a path convention.
+   *
+   * Used by `discardTaskWorktree`/`requestWorktree`, which only have a worktree path in hand (not the
+   * original `repoPath` a caller supplied to `createTaskWorktree`) — `git worktree remove`/`git worktree add`
+   * both need to run with the repo root as `cwd`, and re-deriving it via git is robust to whatever path
+   * convention `createTaskWorktree` uses, rather than hard-coding "three `dirname()` calls up".
+   */
+  async function repoRootFromWorktree(worktreePath) {
+    try {
+      const { stdout } = await execFileAsync("git", ["rev-parse", "--git-common-dir"], {
+        cwd: worktreePath, encoding: "utf8", timeout: 10_000,
+      });
+      const raw = String(stdout).trim();
+      const commonDir = path.isAbsolute(raw) ? raw : path.resolve(worktreePath, raw);
+      return path.dirname(commonDir); // commonDir is "<repoRoot>/.git"
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * createTaskWorktree(taskId, { repoPath, branch }) -> the shared per-task worktree (PLAN.md §7).
+   *
+   * ONE worktree per task, not one per session or run: a task's coder(s) and reviewer(s) are deliberately
+   * looking at the same revision (§13's quorum on one commit), so every worker later assigned to the task
+   * attaches to this same path through `assignTask`'s existing `cwd ?? task.worktree_id` fallback — nothing
+   * downstream needs to change for that to work.
+   *
+   * `repoPath` is caller-supplied on purpose. `tasks.repo_id` exists in the schema but nothing anywhere reads
+   * or writes it (checked, not assumed) — inventing a repo-path registry here would be a second, unrequested
+   * design decision. This follows the same pattern `assignTask({ cwd })` already uses for the same reason.
+   *
+   * Idempotent: if the task already has a `worktree_id` and that path still exists on disk, this returns it
+   * rather than re-running `git worktree add` — a retried `start`, or a caller that doesn't know whether an
+   * earlier attempt actually landed, is safe to call again.
+   */
+  /**
+   * Cross-process creation race, added 2026-09-11 (`codexdoc/review-phase7-uncommitted.md` finding 2,
+   * blocking): two processes could both read `worktree_id = NULL` for the same task, both run real
+   * `git worktree add` in parallel, and both get `created: true` back — Git's per-repo lock has nothing
+   * to say about the per-TASK invariant "one worktree, one registered path." Fixed with the same
+   * "claim a status marker before doing the real work, only the winner proceeds" pattern already proven
+   * for `mcp-pool.js`'s `claimPoolSlot`: `claimTaskWorktreeSlot` reserves the slot with
+   * `WORKTREE_CLAIM_PENDING` inside a `BEGIN IMMEDIATE` compare-and-swap, so exactly one caller ever runs
+   * git for a given task at a time. A caller that loses the claim polls (bounded, ~2s total) for the
+   * winner's real result rather than racing it or hanging forever.
+   */
+  // How long a PENDING claim can sit unfinalized before another caller is allowed to try recovering it
+  // (`codexdoc/review-luna-2026-09-11.md` finding 6). Deliberately far above the poll budget below (a
+  // real `git worktree add` has its own 30s timeout) — this is "the claimant probably crashed", not
+  // "the claimant is slow."
+  const STALE_WORKTREE_CLAIM_MS = 60_000;
+
+  /** `.git/ctd-worktrees/<taskId>` is the one deterministic path every claimant for a given
+   *  `(repoPath, taskId)` pair computes — used both by a normal claim and by stale-claim recovery to
+   *  check whether a dead claimant's git work already landed before deciding whether to redo it. */
+  function taskWorktreePath(resolvedRepoPath, taskId) {
+    return path.join(resolvedRepoPath, ".git", "ctd-worktrees", taskId);
+  }
+
+  /** A real linked worktree has a `.git` FILE (not a repo) pointing back at the main repo's gitdir —
+   *  cheap, local, no git invocation needed, sufficient to tell "the crashed claimant already finished"
+   *  from "nothing happened yet." */
+  function looksLikeRealWorktree(worktreePath) {
+    try {
+      return fs.existsSync(worktreePath) && fs.existsSync(path.join(worktreePath, ".git"));
+    } catch {
+      return false;
+    }
+  }
+
+  async function runGitWorktreeAdd({ resolvedRepoPath, worktreePath, worktreeBranch }) {
+    try {
+      await execFileAsync("git", ["worktree", "add", "-b", worktreeBranch, worktreePath], {
+        cwd: resolvedRepoPath, timeout: 30_000,
+      });
+      return { ok: true };
+    } catch {
+      // The branch may already exist — a prior partial attempt, or one created out of band — so retry
+      // attaching to it before giving up, rather than treating "branch exists" as a hard failure.
+      try {
+        await execFileAsync("git", ["worktree", "add", worktreePath, worktreeBranch], {
+          cwd: resolvedRepoPath, timeout: 30_000,
+        });
+        return { ok: true };
+      } catch (err2) {
+        return { ok: false, error: err2 };
+      }
+    }
+  }
+
+  async function createTaskWorktree(taskId, { repoPath, branch, principal = null } = {}) {
+    if (!taskId) throw new Error("createTaskWorktree: taskId is required");
+    // review-sol-2026-09-13.md finding 2 (create side): same ownership boundary as `discardTaskWorktree`
+    // below — a worker/reviewer principal may create a worktree only for the task it is assigned to.
+    if (principal?.workerId) {
+      const assignedTaskId = database.prepare(`SELECT task_id FROM workers WHERE worker_id = ?`).get(principal.workerId)?.task_id ?? null;
+      if (assignedTaskId !== taskId) {
+        return {
+          ok: false, refused: "not-your-task",
+          error: `principal is authenticated as worker ${principal.workerId}, assigned to task ${assignedTaskId ?? "(none)"}, `
+            + `not ${taskId} — a worker may only create the worktree of its own currently-assigned task`,
+        };
+      }
+    }
+    if (!repoPath) {
+      throw new Error(
+        "createTaskWorktree: repoPath is required — there is no repo-path registry (tasks.repo_id is unused), "
+        + "so the caller must say where the repo lives",
+      );
+    }
+    // Canonicalized once, up front — this is both the identity a mismatch is checked against
+    // (`codexdoc/review-luna-2026-09-11.md` finding 5) and the value persisted alongside the claim.
+    const resolvedRepoPath = path.resolve(repoPath);
+
+    const POLL_ATTEMPTS = 40;
+    const POLL_INTERVAL_MS = 50;
+
+    for (let attempt = 0; attempt <= POLL_ATTEMPTS; attempt += 1) {
+      const task = database
+        .prepare(`SELECT id, worktree_id, branch, worktree_repo_path FROM tasks WHERE id = ?`)
+        .get(taskId);
+      if (!task) throw new Error(`createTaskWorktree: no such task ${taskId}`);
+
+      // Finding 5: a conflicting caller must be refused, not handed someone else's repo/branch as if it
+      // were idempotent success — checked against BOTH an already-finalized worktree (below) and a
+      // still-pending claim (further down), because the row now carries this identity from claim time.
+      const repoMismatch = task.worktree_repo_path && task.worktree_repo_path !== resolvedRepoPath;
+      const branchMismatch = branch && task.branch && branch !== task.branch;
+      const mismatchResult = (kind) => ({
+        ok: false, refused: kind,
+        error: kind === "worktree-repo-mismatch"
+          ? `task ${taskId}'s worktree is bound to ${task.worktree_repo_path}, not ${resolvedRepoPath} — `
+            + "refusing to hand a conflicting caller a different repository's worktree"
+          : `task ${taskId}'s worktree is bound to branch "${task.branch}", not "${branch}"`,
+      });
+
+      if (task.worktree_id && task.worktree_id !== WORKTREE_CLAIM_PENDING && fs.existsSync(task.worktree_id)) {
+        if (repoMismatch) return mismatchResult("worktree-repo-mismatch");
+        if (branchMismatch) return mismatchResult("worktree-branch-mismatch");
+        return { taskId, worktreeId: task.worktree_id, branch: task.branch, created: false };
+      }
+
+      if (task.worktree_id === WORKTREE_CLAIM_PENDING) {
+        if (repoMismatch) return mismatchResult("worktree-repo-mismatch");
+        if (branchMismatch) return mismatchResult("worktree-branch-mismatch");
+
+        // A DIFFERENT caller is claiming right now — wait for its result rather than racing it.
+        if (attempt === POLL_ATTEMPTS) {
+          // Finding 6: the poll budget alone can't tell "a real, still-running claimant" from "a dead
+          // one" — a real `git worktree add` can legitimately take up to its own 30s timeout. Only
+          // treat this as recoverable once the claim has sat unfinalized far longer than any real
+          // attempt should.
+          const staleBeforeIso = new Date(Date.now() - STALE_WORKTREE_CLAIM_MS).toISOString();
+          const reclaim = reclaimStaleTaskWorktreeClaim(database, taskId, { staleBeforeIso });
+          if (!reclaim.reclaimed) {
+            return {
+              ok: false, refused: "worktree-claim-pending",
+              error: `another process is creating task ${taskId}'s worktree — retry shortly`,
+            };
+          }
+
+          // We now own the previously-stale claim, under a FRESH token (finding 9) — the original
+          // claimant, if it wakes up later and still holds only its OLD token, can no longer finalize or
+          // release this claim; only this reclaim's own `claimToken` can from this point on. The dead
+          // claimant may have finished the real `git worktree add` before it died — check disk before
+          // redoing work that already landed.
+          const worktreeBranch = task.branch ?? branch ?? `ctd/${taskId}`;
+          const worktreePath = taskWorktreePath(resolvedRepoPath, taskId);
+          if (looksLikeRealWorktree(worktreePath)) {
+            const finalizedAdopt = finalizeTaskWorktreeSlot(database, taskId, {
+              worktreeId: worktreePath, branch: worktreeBranch, repoPath: resolvedRepoPath, claimToken: reclaim.claimToken,
+            });
+            // review-sol-2026-09-13.md finding 9's other half: a `finalized: false` here means a THIRD
+            // party reclaimed this same claim out from under us (our own reclaim itself sat unfinalized
+            // past the stale window) — retry rather than reporting success for a write that did not land.
+            if (!finalizedAdopt.finalized) {
+              return {
+                ok: false, refused: "worktree-claim-superseded",
+                error: `task ${taskId}'s worktree claim was reclaimed by another process before this adoption could finalize — retry`,
+              };
+            }
+            return {
+              taskId, worktreeId: worktreePath, branch: worktreeBranch, created: false,
+              recoveredFromCrashedClaim: true,
+            };
+          }
+
+          fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+          const added = await runGitWorktreeAdd({ resolvedRepoPath, worktreePath, worktreeBranch });
+          if (!added.ok) {
+            releaseTaskWorktreeClaim(database, taskId, { previousValue: null, claimToken: reclaim.claimToken });
+            return { ok: false, error: added.error.message, refused: "git-worktree-add-failed" };
+          }
+          const finalizedRedo = finalizeTaskWorktreeSlot(database, taskId, {
+            worktreeId: worktreePath, branch: worktreeBranch, repoPath: resolvedRepoPath, claimToken: reclaim.claimToken,
+          });
+          if (!finalizedRedo.finalized) {
+            return {
+              ok: false, refused: "worktree-claim-superseded",
+              error: `task ${taskId}'s worktree claim was reclaimed by another process before this redo could finalize — retry`,
+            };
+          }
+          return {
+            taskId, worktreeId: worktreePath, branch: worktreeBranch, created: true,
+            recoveredFromCrashedClaim: true,
+          };
+        }
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+        continue;
+      }
+
+      // `task.worktree_id` is NULL, or a stale path nothing exists at any more — attempt the claim.
+      const worktreeBranch = branch ?? task.branch ?? `ctd/${taskId}`;
+      const claim = claimTaskWorktreeSlot(database, taskId, {
+        previousValue: task.worktree_id, repoPath: resolvedRepoPath, branch: worktreeBranch,
+      });
+      if (!claim.claimed) {
+        // Something changed between our read and our claim attempt (another claim landed, or a result
+        // did) — re-read and decide again rather than assuming we permanently lost.
+        continue;
+      }
+
+      // We hold the claim: we are the ONLY caller running git for this task right now.
+      const worktreePath = taskWorktreePath(resolvedRepoPath, taskId);
+      fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+
+      const added = await runGitWorktreeAdd({ resolvedRepoPath, worktreePath, worktreeBranch });
+      if (!added.ok) {
+        releaseTaskWorktreeClaim(database, taskId, {
+          previousValue: task.worktree_id, previousBranch: task.branch, previousRepoPath: task.worktree_repo_path,
+          claimToken: claim.claimToken,
+        });
+        return { ok: false, error: added.error.message, refused: "git-worktree-add-failed" };
+      }
+
+      const finalized = finalizeTaskWorktreeSlot(database, taskId, {
+        worktreeId: worktreePath, branch: worktreeBranch, repoPath: resolvedRepoPath, claimToken: claim.claimToken,
+      });
+      if (!finalized.finalized) {
+        // finding 9's other half: our own claim sat unfinalized long enough that a later caller's
+        // `reclaimStaleTaskWorktreeClaim` minted a NEW token and took it over before this real `git
+        // worktree add` (which just succeeded) could finalize. The work on disk is real and will be
+        // discovered/adopted by whoever now holds the claim (`looksLikeRealWorktree`, above) — reporting
+        // success here for a write that did not land would be the exact lie this fix exists to prevent.
+        return {
+          ok: false, refused: "worktree-claim-superseded",
+          error: `task ${taskId}'s worktree claim was reclaimed by another process before this could finalize — retry`,
+        };
+      }
+      return { taskId, worktreeId: worktreePath, branch: worktreeBranch, created: true };
+    }
+
+    // Unreachable in practice — the pending-poll branch above returns at its own budget — but a loop
+    // that could theoretically fall through must not return `undefined`.
+    return { ok: false, refused: "worktree-claim-timeout", error: `could not claim task ${taskId}'s worktree slot` };
+  }
+
+  /**
+   * discardTaskWorktree(taskId) -> removes the shared worktree once the task no longer needs it.
+   *
+   * Refuses on a non-terminal task, the same "refuse rather than silently do something surprising" pattern
+   * `reap` already uses for an adopted run — a worker or reviewer could still be attached to this path, and
+   * removing it out from under a live run is exactly the accident §7's clean-vs-kill rule exists to prevent
+   * elsewhere.
+   */
+  /** `git status --porcelain` against a worktree path — empty output means clean. Returns `false` (not
+   *  dirty) if git itself can't answer, since a discard should not be blocked on an unreadable tree; the
+   *  caller-facing consequence is the same "refuse rather than guess" posture as everywhere else here. */
+  /**
+   * review-sol-2026-09-13.md finding 7: this used to return a bare boolean, and its `catch` returned
+   * `false` — meaning "clean" — for a `git status` failure OR timeout, not just a genuinely clean
+   * worktree. `discardTaskWorktree`'s caller then ran `git worktree remove --force` on that "clean"
+   * verdict, so a permissions error, repo corruption, or a slow disk authorized destroying real
+   * uncommitted work that was never actually checked. Now returns one of three states so "could not
+   * tell" is a distinguishable, refusable outcome rather than silently downgraded to "clean".
+   */
+  async function worktreeStatus(worktreePath) {
+    try {
+      const { stdout } = await execFileAsync("git", ["status", "--porcelain"], {
+        cwd: worktreePath, encoding: "utf8", timeout: 10_000,
+      });
+      return { state: String(stdout).trim().length > 0 ? "dirty" : "clean" };
+    } catch (err) {
+      return { state: "error", error: err.message };
+    }
+  }
+
+  async function discardTaskWorktree(taskId, { actor = "owner", force = false, principal = null } = {}) {
+    if (!taskId) throw new Error("discardTaskWorktree: taskId is required");
+    // review-sol-2026-09-13.md finding 2: `task:worktree` is granted to `worker`/`reviewer` so a run can
+    // `requestWorktree` its own overlay (that self-service case is already ownership-bound, see
+    // `requestWorktree` above) — but `discardTaskWorktree` took ANY taskId with no ownership check at
+    // all, so a worker assigned to task A could force-discard task B's worktree, and `force: true` was
+    // reachable by a worker-backed principal at all. A worker/reviewer principal may act only on the
+    // task it is CURRENTLY assigned to (`workers.task_id`), and may never pass `force: true` — that is
+    // reserved for owner/CTO (no `workerId` on the principal), same boundary `requestWorktree` draws.
+    if (principal?.workerId) {
+      if (force) {
+        return {
+          ok: false, refused: "force-not-permitted",
+          error: "a worker/reviewer principal may not force-discard a worktree — force is reserved for owner/CTO",
+        };
+      }
+      const assignedTaskId = database.prepare(`SELECT task_id FROM workers WHERE worker_id = ?`).get(principal.workerId)?.task_id ?? null;
+      if (assignedTaskId !== taskId) {
+        return {
+          ok: false, refused: "not-your-task",
+          error: `principal is authenticated as worker ${principal.workerId}, assigned to task ${assignedTaskId ?? "(none)"}, `
+            + `not ${taskId} — a worker may only discard the worktree of its own currently-assigned task`,
+        };
+      }
+    }
+    const task = database.prepare(`SELECT id, state, worktree_id FROM tasks WHERE id = ?`).get(taskId);
+    if (!task) throw new Error(`discardTaskWorktree: no such task ${taskId}`);
+    if (!isTerminal(task.state)) {
+      return {
+        ok: false, refused: "not-terminal",
+        error: `task ${taskId} is "${task.state}", not terminal — refusing to discard a worktree work may still be attached to`,
+      };
+    }
+    if (!task.worktree_id) return { taskId, discarded: false, reason: "no worktree to discard" };
+
+    // TASK STATE AND RUN TERMINATION ARE SEPARATE MECHANISMS — `mergeTask` itself moves a task to
+    // `merged` without stopping any run using it, so "terminal task state" was never actually the safety
+    // backstop this function's comment above claimed. An open run can still be writing into this exact
+    // worktree when the task above it is already cancelled/failed/merged. Found by both codex reviews
+    // (`codexdoc/review-phase7-uncommitted.md` finding 3, `codexdoc/REVIEW-NOTES.md` finding 4), fixed
+    // 2026-09-11. `runs` carries no task_id of its own (task attribution is via the worker's CURRENT
+    // assignment) — same join `changedPathsFor`/other task-scoped run lookups already use.
+    const openRuns = database.prepare(
+      `SELECT r.run_id AS runId FROM runs r JOIN workers w ON r.worker_id = w.worker_id
+        WHERE w.task_id = ? AND r.ended_at IS NULL`,
+    ).all(taskId);
+    if (openRuns.length > 0) {
+      return {
+        ok: false, refused: "open-run",
+        error: `task ${taskId} has ${openRuns.length} open run(s) still assigned (${openRuns.map((r) => r.runId).join(", ")}) — `
+          + "terminal task state alone is not a filesystem-lifecycle lock; stop or reap them first",
+      };
+    }
+
+    // The open-run check above protects a LIVE worker, not the DATA a dead one already produced —
+    // `codexdoc/review-luna-2026-09-11.md` finding 8: a terminal task with no open run can still have an
+    // uncommitted file sitting in its worktree, and the unconditional `--force` below deleted it with no
+    // trace. Refuse by default; `force: true` is the explicit, named override, not a default no one chose.
+    // Note: `force` reaching this point at all means the caller was owner/CTO — the check above already
+    // refused it for a worker/reviewer principal.
+    if (!force) {
+      const status = await worktreeStatus(task.worktree_id);
+      if (status.state !== "clean") {
+        return {
+          ok: false, refused: status.state === "dirty" ? "worktree-dirty" : "worktree-status-unknown",
+          error: status.state === "dirty"
+            ? `task ${taskId}'s worktree has uncommitted changes — pass { force: true } to discard them anyway`
+            : `could not determine whether task ${taskId}'s worktree is clean (${status.error}) — `
+              + "refusing to discard on an unverified status; pass { force: true } to discard anyway",
+        };
+      }
+    }
+
+    const repoRoot = await repoRootFromWorktree(task.worktree_id);
+    if (!repoRoot) {
+      return { ok: false, refused: "git-error", error: `could not resolve the repo root for ${task.worktree_id}` };
+    }
+    try {
+      await execFileAsync("git", ["worktree", "remove", "--force", task.worktree_id], {
+        cwd: repoRoot, timeout: 30_000,
+      });
+    } catch (err) {
+      return { ok: false, error: err.message, refused: "git-worktree-remove-failed" };
+    }
+
+    database
+      .prepare(`UPDATE tasks SET worktree_id = NULL, branch = NULL, worktree_repo_path = NULL, updated_at = ? WHERE id = ?`)
+      .run(new Date().toISOString(), taskId);
+
+    return { taskId, discarded: true, actor };
+  }
+
+  /**
+   * requestWorktree(runId, { reason }) -> an isolated OVERLAY worktree for one run (PLAN.md §7's explicit
+   * opt-out from the task's shared worktree).
+   *
+   * The default is the task's ONE shared worktree, created by `createTaskWorktree`; this exists only for a
+   * run that needs isolated testing/experimentation it does not want landing in the shared tree. `reason` is
+   * required — §16's "never guess an underspecified request" — and logged to `agent_journal`, the same
+   * "task history, not memory" log every other command already writes through `authorizedCommandHandlers()`,
+   * so it is queryable later: which runs branched off for isolated work, and why. (That wrapper already
+   * journals this call generically on every outcome; the extra call below mirrors `grantApproval`'s own
+   * pattern of a SECOND, human-readable entry carrying detail the generic one does not capture — here, the
+   * actual reason text, not just the command name and taskId.)
+   *
+   * Branches off the task's CURRENT HEAD, at a path alongside the shared worktree rather than nested inside
+   * it, so discarding one never touches the other.
+   */
+  async function requestWorktree(runId, { reason, principal = null } = {}) {
+    if (!runId) throw new Error("requestWorktree: runId is required");
+    if (!reason) {
+      return { ok: false, refused: "missing-reason", error: "a reason is required for an isolated worktree request" };
+    }
+    // Cross-run ownership binding, added 2026-09-11 (`codexdoc/review-phase7-uncommitted.md` finding 4):
+    // a worker-backed principal may only request an overlay for ITS OWN run — without this, worker A's
+    // token could request (and later be journaled as the requester of) an overlay for worker B's run. A
+    // principal with no `workerId` (owner/CTO) is unrestricted — that delegation question is deliberately
+    // not decided here, same boundary `recordVerdict`'s sibling fix drew.
+    if (principal?.workerId && workerIdForRun(database, runId) !== principal.workerId) {
+      return {
+        ok: false, refused: "not-your-run",
+        error: `principal is authenticated as worker ${principal.workerId}, which does not own run ${runId} — `
+          + "a worker may only request an overlay for its own run",
+      };
+    }
+
+    const taskId = taskIdForRun(database, runId);
+    if (!taskId) return { ok: false, refused: "no-task", error: `no task found for run ${runId}` };
+    const task = database.prepare(`SELECT id, worktree_id FROM tasks WHERE id = ?`).get(taskId);
+    if (!task?.worktree_id) {
+      return { ok: false, refused: "no-shared-worktree", error: `task ${taskId} has no shared worktree yet — create one first` };
+    }
+
+    const repoRoot = await repoRootFromWorktree(task.worktree_id);
+    if (!repoRoot) {
+      return { ok: false, refused: "git-error", error: `could not resolve the repo root for ${task.worktree_id}` };
+    }
+
+    const overlayPath = path.join(repoRoot, ".git", "ctd-overlays", runId);
+    // A DIFFERENT top-level ref namespace than the task branch (`ctd/<taskId>`), not a child of it: git
+    // refs are a filesystem-like hierarchy, so `refs/heads/ctd/<taskId>/overlay-<runId>` cannot coexist
+    // with `refs/heads/ctd/<taskId>` — "cannot lock ref ... refs/heads/ctd/<taskId> exists" (measured, not
+    // assumed; hit this exact collision while building this).
+    const overlayBranch = `ctd-overlay/${taskId}/${runId}`;
+    fs.mkdirSync(path.dirname(overlayPath), { recursive: true });
+
+    try {
+      await execFileAsync("git", ["worktree", "add", "-b", overlayBranch, overlayPath, "HEAD"], {
+        cwd: task.worktree_id, timeout: 30_000,
+      });
+    } catch (err) {
+      return { ok: false, error: err.message, refused: "git-worktree-add-failed" };
+    }
+
+    if (principal) {
+      const hash = argsHash({ runId, reason });
+      journalAppend(database, {
+        principalId: principal.id, action: "task:worktree", argsSha256: hash, taskId,
+        argsPreview: `requestWorktree ${runId}: ${reason}`.slice(0, 200), outcome: "done", detail: reason,
+      });
+    }
+
+    return { runId, taskId, worktreePath: overlayPath, branch: overlayBranch, sharedWorktreePath: task.worktree_id };
+  }
+
+  /**
+   * gitCreatePush(taskId, { runId, principal, message, remote, targetBranch, ttlMs }) -> PLAN.md §8 Rule
+   * 2's `push()` contract (Phase 7 step 5, 2026-09-10): `{ status: 'pushed'|'blocked'|'failed', mrUrl?,
+   * attempts, unresolved? }`.
+   *
+   * The actual stage/commit/classify/autofix/push mechanics live in `agents/git-create-push.js`'s
+   * `runFightLoop` — pure with respect to the database, so it's testable against a real repo with no
+   * supervisor at all. This function is the glue: resolve the task's shared worktree (§7), acquire
+   * `git:identity` (§20) BEFORE anything else, run the loop, and release the lease in a `finally` no
+   * matter how the loop ends — a thrown error mid-loop must not leave `git:identity` held until its TTL
+   * sweep catches up, the same reasoning `endRun`'s lease release exists for on the run side.
+   *
+   * TWO WIRE COMMANDS CALL THIS, `gitPush` and `gitPushProtected` — see `agents/git-create-push.js`'s own
+   * header for why the protected/non-protected split is which command you call, not a flag in here.
+   *
+   * `mrUrl` is never set here — opening a PR/MR needs real credentials and network, which is exactly the
+   * class of thing this project keeps out of `npm test` (see `real-*.slice.mjs` elsewhere in this repo).
+   * `real-git-create-push.slice.mjs` is the manual-run counterpart for a human to exercise that path
+   * against a real sandbox repo.
+   */
+  async function gitCreatePush(taskId, {
+    runId = null, principal = null, message, remote = "origin", targetBranch = null, ttlMs, paths = null,
+  } = {}) {
+    if (!taskId) throw new Error("gitCreatePush: taskId is required");
+    if (!message) throw new Error("gitCreatePush: message is required");
+    const task = database.prepare(`SELECT id, worktree_id FROM tasks WHERE id = ?`).get(taskId);
+    if (!task) throw new Error(`gitCreatePush: no such task ${taskId}`);
+    if (!task.worktree_id) {
+      return {
+        status: "failed",
+        attempts: [],
+        unresolved: {
+          class: "hook-other",
+          oneParagraphDiagnosis: `task ${taskId} has no shared worktree yet — create one with createTaskWorktree first.`,
+          files: [],
+        },
+      };
+    }
+
+    const lease = acquireLease({
+      resourceName: "git:identity", principal, runId, reason: `git-create-push:${taskId}`,
+      ...(ttlMs ? { ttlMs } : {}),
+    });
+    if (!lease.granted) {
+      const holder = lease.blockedBy?.[0];
+      return {
+        status: "blocked",
+        attempts: [],
+        unresolved: {
+          class: "hook-other",
+          oneParagraphDiagnosis: holder
+            ? `git:identity is held by principal ${holder.principalId} (acquired ${holder.acquiredAt}) — retry once it is released.`
+            : `git:identity could not be acquired (${lease.refused ?? "unknown reason"}) — retry later.`,
+          files: [],
+        },
+      };
+    }
+
+    try {
+      return await runFightLoop({ cwd: task.worktree_id, message, remote, targetBranch, paths });
+    } finally {
+      releaseLease({ leaseId: lease.lease.id, principal });
+    }
+  }
+
+  /**
+   * The declared-resources config (PLAN.md §20.1), read on demand — same reasoning as
+   * `harness-defaults.js`: a human lowering `memoryHeadroomPercent` mid-session expects the very
+   * next `acquireLease` to see it, not the next restart.
+   */
+  function resourcesConfig() {
+    return loadResources({ stateDir: stateDirOf() });
+  }
+
+  /**
+   * acquireLease({ resourceName, principal, runId, reason, ttlMs }) -> a claim, or a refusal naming
+   * who holds it (PLAN.md §20). Claim-BEFORE-side-effect: the caller must call this before doing the
+   * thing the lease protects, never after — the same rule every idempotency key in this codebase
+   * already follows.
+   *
+   * §20.2's queue visibility, without a blocking wait: this is a multi-process daemon with no
+   * in-process queue to block a caller's connection on, so a refusal is a NON-BLOCKING check that
+   * names every current holder (`blockedBy`) rather than making the caller hang. There is no FIFO
+   * "position" concept here on purpose — a `counted` resource is a semaphore, not a mutex queue, so
+   * "3rd in line" is not a well-defined question when up to `capacity` holders can be admitted in any
+   * order the moment one releases. A caller that needs to wait retries later (or the pane surfaces
+   * `blockedBy` and lets a human decide), rather than this function inventing an ordering promise it
+   * cannot keep for a semaphore.
+   *
+   * `host:heavy-job` specifically samples `os.freemem()`/`os.totalmem()` and REFUSES below the
+   * configured headroom, rather than granting-with-a-warning: this resource exists to prevent the
+   * exact OOM incident PLAN.md §20 documents, and a resource named for that purpose that still grants
+   * under pressure would defeat its own point. The sampled numbers are surfaced either way (§20.3:
+   * "a human sees the number, not just a refusal"), on the grant path too, so a healthy grant is
+   * still informative about how much headroom is left.
+   */
+  function acquireLease({ resourceName, principal, runId = null, reason = null, ttlMs } = {}) {
+    if (!resourceName) return { granted: false, refused: "missing-resource-name" };
+    if (!principal) return { granted: false, refused: "no-principal" };
+    // Cross-run ownership binding, added 2026-09-11 (`codexdoc/review-phase7-uncommitted.md` finding 4):
+    // without this, worker A's token could acquire a lease "for" worker B's run — and since a lease is
+    // released alongside the RUN it names (`endRun`), ending B's run would release A's lease while A
+    // remained its recorded holder, an ownership mismatch the whole way through. A principal with no
+    // `workerId` (owner/CTO) is unrestricted — same boundary `recordVerdict`'s sibling fix drew; that
+    // delegation question is deliberately not decided here.
+    if (runId && principal.workerId && workerIdForRun(database, runId) !== principal.workerId) {
+      return {
+        granted: false, refused: "not-your-run",
+        error: `principal is authenticated as worker ${principal.workerId}, which does not own run ${runId} — `
+          + "a worker may only acquire a lease naming its own run",
+      };
+    }
+    const config = resourcesConfig();
+    const declared = config.resources[resourceName];
+    if (!declared) {
+      return { granted: false, refused: "unknown-resource", error: `"${resourceName}" is not declared in resources.json (PLAN.md §20.1)` };
+    }
+
+    let memory = null;
+    if (resourceName === "host:heavy-job") {
+      const freeBytes = os.freemem();
+      const totalBytes = os.totalmem();
+      const freePercent = (freeBytes / totalBytes) * 100;
+      memory = { freeBytes, totalBytes, freePercent, headroomPercent: config.memoryHeadroomPercent };
+      if (freePercent < config.memoryHeadroomPercent) {
+        return {
+          granted: false, refused: "host-memory-pressure", memory,
+          error: `free memory ${freePercent.toFixed(1)}% is below the configured headroom of `
+            + `${config.memoryHeadroomPercent}% — refusing "host:heavy-job" to avoid the OOM incident §20 exists for`,
+        };
+      }
+    }
+
+    const result = tryAcquireLease(database, {
+      resourceName, kind: declared.kind, capacity: declared.capacity ?? null,
+      holderPrincipalId: principal.id, holderRunId: runId, reason, ttlMs,
+    });
+    return memory ? { ...result, memory } : result;
+  }
+
+  /** releaseLease({ leaseId, principal }) — refuses on a lease it does not hold, or one already released. */
+  function releaseLease({ leaseId, principal } = {}) {
+    if (!leaseId) return { released: false, refused: "missing-lease-id" };
+    const lease = getLease(database, leaseId);
+    if (!lease) return { released: false, refused: "no-such-lease" };
+    if (!principal || lease.holderPrincipalId !== principal.id) {
+      return { released: false, refused: "not-the-holder", error: "only the principal that acquired a lease may release it" };
+    }
+    return releaseLeaseRow(database, leaseId);
+  }
+
+  /** renewLease({ leaseId, principal, ttlMs }) — bumps the heartbeat/TTL of a live lease this principal holds. */
+  function renewLease({ leaseId, principal, ttlMs } = {}) {
+    if (!leaseId) return { renewed: false, refused: "missing-lease-id" };
+    const lease = getLease(database, leaseId);
+    if (!lease) return { renewed: false, refused: "no-such-lease" };
+    if (!principal || lease.holderPrincipalId !== principal.id) {
+      return { renewed: false, refused: "not-the-holder", error: "only the principal that acquired a lease may renew it" };
+    }
+    return renewLeaseRow(database, leaseId, { ttlMs });
+  }
+
+  /**
    * Grant a second-signature approval for one sensitive action on one set of arguments.
    *
    * The granter is resolved from a TOKEN, like every other principal, and `canGrantApproval` enforces the two
@@ -2761,7 +3732,11 @@ export function createSupervisor({
         if (!s) return { id: cmd.id, ok: false, error: `unknown runId: ${cmd.runId}` };
         return { id: cmd.id, ok: true, status: s };
       },
-      reconcile: async (cmd) => ({ id: cmd.id, ok: true, reconciliation: await reconcileOnBoot({ db: database, hasHandle, logger }) }),
+      reconcile: async (cmd) => {
+        const reconciliation = await reconcileOnBoot({ db: database, hasHandle, logger });
+        reconcileAutoBlockedTasks();
+        return { id: cmd.id, ok: true, reconciliation };
+      },
 
       /**
        * Every question a worker is currently blocked on. This is the command the tree badge
@@ -2813,6 +3788,24 @@ export function createSupervisor({
         // Tier 1 ONLY: `event_log` also holds tier-2 digests now (Rule 4), and a digest is a summary
         // written FOR AGENTS. Rule 4's hard rule is about the other direction, but showing a digest in a
         // human's pane would still be wrong — the human has the transcript it was made from, right there.
+        // `tuiSnapshot` requires only `read:registry` (COMMAND_CAPABILITIES) so that a utility principal's
+        // own registry-adjacent tooling can call it, but the transcript fields below hand over a worker's
+        // RAW tier-1 output — the exact thing `observe:run` exists to gate (`observe`'s own capability).
+        // `codexdoc/REVIEW-NOTES.md` finding 9: an AUTHENTICATED registry-only principal (any `utility:*`
+        // preset, or the plain `worker` preset — neither holds `observe:run`) could call this command over
+        // the real socket and get every run's transcript despite never holding the capability that gates
+        // transcript access everywhere else. Checked in the PRODUCER, not left to the TUI's own rendering
+        // to decide.
+        //
+        // NO principal at all (`cmd._principal` undefined) is UNRESTRICTED here — same boundary
+        // `requestWorktree`'s cross-run binding fix already drew ("a principal with no workerId is
+        // unrestricted — that delegation question is deliberately not decided here"): this only binds an
+        // AUTHENTICATED principal to what it actually holds, it does not newly require authentication on a
+        // caller that never had it (the raw, unauthenticated `commandHandlers()` map several existing
+        // tests exercise directly, never through the real socket a real attacker would use).
+        const canObserveTranscripts = !cmd._principal
+          || (cmd._principal.capabilities ?? []).includes("observe:run");
+
         const cursorsIn = cmd.cursors ?? {};
         const transcriptLimit = Number.isInteger(cmd.transcriptLimit) && cmd.transcriptLimit > 0
           ? Math.min(cmd.transcriptLimit, 2000)
@@ -2821,13 +3814,15 @@ export function createSupervisor({
         const provisional = {};
         const cursors = {};
         const gaps = {};
-        for (const r of listRunsForDisplay(database, { openOnly: false })) {
-          const after = Number.isInteger(cursorsIn[r.run_id]) ? cursorsIn[r.run_id] : 0;
-          const slice = transcriptSince(r.run_id, after, transcriptLimit);
-          transcripts[r.run_id] = slice.lines;
-          provisional[r.run_id] = slice.provisional;
-          cursors[r.run_id] = slice.cursor;
-          if (slice.skipped) gaps[r.run_id] = slice.skipped;
+        if (canObserveTranscripts) {
+          for (const r of listRunsForDisplay(database, { openOnly: false })) {
+            const after = Number.isInteger(cursorsIn[r.run_id]) ? cursorsIn[r.run_id] : 0;
+            const slice = transcriptSince(r.run_id, after, transcriptLimit);
+            transcripts[r.run_id] = slice.lines;
+            provisional[r.run_id] = slice.provisional;
+            cursors[r.run_id] = slice.cursor;
+            if (slice.skipped) gaps[r.run_id] = slice.skipped;
+          }
         }
         // The runs, projected for the TUI. NOT reused from `list()`: that projection has no
         // `workerId` and no `endedAt`, so a pane could never match a run to its worker and every pane
@@ -2907,6 +3902,9 @@ export function createSupervisor({
           ...(await recordVerdict({
             taskId: v.taskId, workerId: v.workerId, slot: v.slot, round: v.round,
             commitSha: v.commitSha, dimension: v.dimension, verdict: v.verdict, findings: v.findings,
+            // The RESOLVED principal, same pattern `mergeTask`'s `actor` already uses — not from `v`,
+            // which is exactly the payload a forged identity would try to smuggle it through.
+            _principal: cmd._principal ?? null,
           })),
         };
       },
@@ -2953,6 +3951,156 @@ export function createSupervisor({
         const actor = cmd._principal?.id ?? cmd.actor ?? "owner";
         return { id: cmd.id, ok: true, ...mergeTask(cmd.taskId, { actor }) };
       },
+      // §7's worktree lifecycle (added 2026-09-10). `createTaskWorktree`/`discardTaskWorktree` operate on the
+      // task's ONE shared worktree; `requestWorktree` is a run's explicit opt-out for isolated testing.
+      createTaskWorktree: async (cmd) => {
+        const missing = requireArgs(cmd, ["taskId", "repoPath"]);
+        if (!missing.ok) return { id: cmd.id, ok: false, error: missing.reason };
+        return {
+          id: cmd.id, ok: true,
+          ...(await createTaskWorktree(cmd.taskId, { repoPath: cmd.repoPath, branch: cmd.branch ?? null, principal: cmd._principal ?? null })),
+        };
+      },
+      discardTaskWorktree: async (cmd) => {
+        const missing = requireArgs(cmd, ["taskId"]);
+        if (!missing.ok) return { id: cmd.id, ok: false, error: missing.reason };
+        const actor = cmd._principal?.id ?? cmd.actor ?? "owner";
+        return {
+          id: cmd.id, ok: true,
+          ...(await discardTaskWorktree(cmd.taskId, { actor, force: cmd.force === true, principal: cmd._principal ?? null })),
+        };
+      },
+      requestWorktree: async (cmd) => {
+        const missing = requireArgs(cmd, ["runId", "reason"]);
+        if (!missing.ok) return { id: cmd.id, ok: false, error: missing.reason };
+        return { id: cmd.id, ok: true, ...(await requestWorktree(cmd.runId, { reason: cmd.reason, principal: cmd._principal ?? null })) };
+      },
+      // §20's resource leases (added 2026-09-10). `_principal` is always the wrapper-resolved one
+      // (`authorizedCommandHandlers`'s own note above `mergeTask`: a caller-supplied identity cannot
+      // survive the spread) — the same reason the holder is never trusted from the raw command.
+      acquireLease: async (cmd) => {
+        const missing = requireArgs(cmd, ["resourceName"]);
+        if (!missing.ok) return { id: cmd.id, ok: false, error: missing.reason };
+        // Refused HERE as a clean `{ok:false}`, not left to the DB primitive's throw — a caller sending
+        // a bad ttlMs gets the same refusal shape every other expected-refusal case in this handler
+        // returns, not an exception. `tryAcquireLease` itself ALSO validates (defense in depth, per
+        // review finding 5: "don't rely on just one layer" — this wire check is bypassable by any
+        // direct in-process caller, the DB-level one is not).
+        if (cmd.ttlMs !== undefined && (!Number.isInteger(cmd.ttlMs) || cmd.ttlMs <= 0 || cmd.ttlMs > MAX_LEASE_TTL_MS)) {
+          return { id: cmd.id, ok: false, error: `ttlMs must be a positive integer no greater than ${MAX_LEASE_TTL_MS}ms, got ${JSON.stringify(cmd.ttlMs)}` };
+        }
+        const result = acquireLease({
+          resourceName: cmd.resourceName, principal: cmd._principal ?? null, runId: cmd.runId ?? null,
+          reason: cmd.reason ?? null, ...(cmd.ttlMs !== undefined ? { ttlMs: cmd.ttlMs } : {}),
+        });
+        return { id: cmd.id, ok: result.granted === true, ...result };
+      },
+      releaseLease: async (cmd) => {
+        const missing = requireArgs(cmd, ["leaseId"]);
+        if (!missing.ok) return { id: cmd.id, ok: false, error: missing.reason };
+        const result = releaseLease({ leaseId: cmd.leaseId, principal: cmd._principal ?? null });
+        return { id: cmd.id, ok: result.released === true, ...result };
+      },
+      renewLease: async (cmd) => {
+        const missing = requireArgs(cmd, ["leaseId"]);
+        if (!missing.ok) return { id: cmd.id, ok: false, error: missing.reason };
+        // Same wire-level check as acquireLease, same reasoning — fixed 2026-09-11 (review finding 5).
+        if (cmd.ttlMs !== undefined && (!Number.isInteger(cmd.ttlMs) || cmd.ttlMs <= 0 || cmd.ttlMs > MAX_LEASE_TTL_MS)) {
+          return { id: cmd.id, ok: false, error: `ttlMs must be a positive integer no greater than ${MAX_LEASE_TTL_MS}ms, got ${JSON.stringify(cmd.ttlMs)}` };
+        }
+        const result = renewLease({
+          leaseId: cmd.leaseId, principal: cmd._principal ?? null,
+          ...(cmd.ttlMs !== undefined ? { ttlMs: cmd.ttlMs } : {}),
+        });
+        return { id: cmd.id, ok: result.renewed === true, ...result };
+      },
+      // §16's git-create-push agent (added 2026-09-10). Two commands, one fight loop
+      // (`agents/git-create-push.js`'s own header explains why): `gitPush` needs only `git:push`;
+      // `gitPushProtected` needs `git:push-protected`, which is SENSITIVE — reaching this handler at all
+      // means the authorization wrapper already consumed a second principal's approval bound to these
+      // exact arguments, the same guarantee `mergeTask` relies on for `task:merge`.
+      gitPush: async (cmd) => {
+        const missing = requireArgs(cmd, ["taskId", "message"]);
+        if (!missing.ok) return { id: cmd.id, ok: false, error: missing.reason };
+        // review-sol-2026-09-13.md finding 4: neither git command bound the CALLER to a task at all —
+        // any worker-backed principal (including the git-utility runner ITSELF, if its token leaked or
+        // its model was compromised) could name any task's worktree, not just the one it was actually
+        // dispatched to work on. A worker/utility principal may push only the task it is currently
+        // assigned to (`workers.task_id`); owner/CTO (no `workerId`) remain unrestricted, same boundary
+        // `createTaskWorktree`/`discardTaskWorktree` already draw.
+        if (cmd._principal?.workerId) {
+          const assignedTaskId = database.prepare(`SELECT task_id FROM workers WHERE worker_id = ?`).get(cmd._principal.workerId)?.task_id ?? null;
+          if (assignedTaskId !== cmd.taskId) {
+            return {
+              id: cmd.id, ok: false,
+              error: `principal is authenticated as worker ${cmd._principal.workerId}, assigned to task ${assignedTaskId ?? "(none)"}, `
+                + `not ${cmd.taskId} — a worker may only push the task it is currently assigned to`,
+            };
+          }
+        }
+        // Classify the ACTUAL destination server-side before doing anything else — which command a
+        // caller invoked used to be the ONLY thing deciding whether a push needed `gitPushProtected`'s
+        // second signature, so a caller could always choose the cheap path for a push that should have
+        // required it. Found by both codex reviews, fixed 2026-09-11. `gitPushProtected` needs no
+        // equivalent check: reaching ITS handler already required the sensitive approval regardless of
+        // the destination, which is the strictly stricter path and is never the one being bypassed.
+        const taskRow = database.prepare(`SELECT worktree_id FROM tasks WHERE id = ?`).get(cmd.taskId);
+        // review-sol-2026-09-13.md finding 6: this classified `destination` and then passed the
+        // CALLER'S ORIGINAL `targetBranch` (often null) through to `gitCreatePush` -> `runFightLoop`,
+        // which — when given null — re-resolves the worktree's current branch INDEPENDENTLY at push
+        // time via its own `rev-parse`. Anything that switched the worktree's checked-out branch
+        // between this classification and that later push (another process, a concurrent operation)
+        // meant the authorization decision above was made about a branch name that was no longer the
+        // one actually pushed. Fixed: the classified `destination` is now PINNED as the explicit
+        // `targetBranch` passed onward, so the fight loop's push step uses exactly the name that was
+        // just checked against the protected list, never re-derives it from a HEAD that may have moved.
+        let pinnedTargetBranch = cmd.targetBranch ?? null;
+        if (taskRow?.worktree_id) {
+          let destination;
+          try {
+            destination = await resolvePushDestination({ cwd: taskRow.worktree_id, targetBranch: cmd.targetBranch ?? null });
+          } catch (err) {
+            // Can't resolve the destination (a broken worktree, e.g.) -- fail closed rather than push
+            // blind. `gitCreatePush` below will hit the same git call and report it properly either way.
+            return { id: cmd.id, ok: false, error: `could not resolve the push destination: ${err.message}` };
+          }
+          const { branches: protectedBranches } = loadProtectedBranches({ stateDir: stateDirOf() });
+          if (protectedBranches.includes(destination)) {
+            return {
+              id: cmd.id, ok: false,
+              error: `"${destination}" is a protected destination — use gitPushProtected, which requires a second principal's approval`,
+            };
+          }
+          pinnedTargetBranch = destination;
+        }
+        const result = await gitCreatePush(cmd.taskId, {
+          runId: cmd.runId ?? null, principal: cmd._principal ?? null, message: cmd.message,
+          remote: cmd.remote ?? "origin", targetBranch: pinnedTargetBranch, paths: cmd.paths ?? null,
+        });
+        return { id: cmd.id, ok: result.status === "pushed", ...result };
+      },
+      gitPushProtected: async (cmd) => {
+        const missing = requireArgs(cmd, ["taskId", "message"]);
+        if (!missing.ok) return { id: cmd.id, ok: false, error: missing.reason };
+        // Same task-ownership boundary as `gitPush` above (finding 4) — reaching this handler already
+        // required the sensitive second-signature approval, but that approves WHICH push, not whether
+        // the caller was ever dispatched to this task's worktree at all.
+        if (cmd._principal?.workerId) {
+          const assignedTaskId = database.prepare(`SELECT task_id FROM workers WHERE worker_id = ?`).get(cmd._principal.workerId)?.task_id ?? null;
+          if (assignedTaskId !== cmd.taskId) {
+            return {
+              id: cmd.id, ok: false,
+              error: `principal is authenticated as worker ${cmd._principal.workerId}, assigned to task ${assignedTaskId ?? "(none)"}, `
+                + `not ${cmd.taskId} — a worker may only push the task it is currently assigned to`,
+            };
+          }
+        }
+        const result = await gitCreatePush(cmd.taskId, {
+          runId: cmd.runId ?? null, principal: cmd._principal ?? null, message: cmd.message,
+          remote: cmd.remote ?? "origin", targetBranch: cmd.targetBranch ?? null, paths: cmd.paths ?? null,
+        });
+        return { id: cmd.id, ok: result.status === "pushed", ...result };
+      },
       grantApproval: async (cmd) => {
         const missing = requireArgs(cmd, ["forPrincipal", "action"]);
         if (!missing.ok) return { id: cmd.id, ok: false, error: missing.reason };
@@ -2976,6 +4124,22 @@ export function createSupervisor({
           ...(cmd.cwd ? { cwd: cmd.cwd } : {}),
         }),
       }),
+      // The utility-task lane's dispatch convenience (§16.2, item 13's own "not built" note) — one call
+      // instead of createTask + createWorker + assignTask done separately, in the right order, by hand.
+      createUtilityTask: async (cmd) => {
+        const missing = requireArgs(cmd, ["type", "title"]);
+        if (!missing.ok) return { id: cmd.id, ok: false, error: missing.reason };
+        try {
+          const result = await createUtilityTask({
+            type: cmd.type, title: cmd.title, teamId: cmd.teamId ?? null,
+            actor: cmd._principal?.id ?? cmd.actor ?? "operator",
+            overrides: cmd.overrides ?? {}, cwd: cmd.cwd ?? null,
+          });
+          return { id: cmd.id, ok: true, ...result };
+        } catch (err) {
+          return { id: cmd.id, ok: false, error: err.message };
+        }
+      },
       taskHandoff: async (cmd) => ({
         id: cmd.id,
         ok: true,
@@ -2992,9 +4156,48 @@ export function createSupervisor({
        */
       answerAsk: async (cmd) => {
         try {
+          // `codexdoc/REVIEW-NOTES.md` finding 6: `ask:answer` is on the plain `worker`/`reviewer`
+          // presets (so a run is never stuck if its own principal disappears), but the wire handler
+          // used to forward the caller's `answeredBy` verbatim, defaulting to "human" — a worker
+          // could answer its OWN parked ask (a tool approval, or a question) and have that recorded
+          // as if a human had decided it. Same cross-run ownership boundary `requestWorktree`/
+          // `acquireLease` already draw: a WORKER-backed principal may not resolve a decision on the
+          // run IT OWNS — that decision is what the ask exists to reserve for a human/CTO.
+          const ask = getAsk(database, cmd.askId);
+          if (!ask) return { id: cmd.id, ok: false, error: `unknown askId: ${cmd.askId}` };
+          if (cmd._principal?.workerId && workerIdForRun(database, ask.run_id) === cmd._principal.workerId) {
+            return {
+              id: cmd.id, ok: false,
+              error: `principal is authenticated as worker ${cmd._principal.workerId}, which owns run ${ask.run_id} — `
+                + "a worker may not answer its own ask; that decision is reserved for a human/CTO",
+            };
+          }
+          // review-sol-2026-09-13.md finding 3: the self-run check above closes ONE worker approving
+          // its own parked ask, but said nothing about worker A deciding worker B's — and a
+          // "tool-approval" ask (a side-effecting tool the harness itself parked for a decision, kind
+          // "tool-approval" — see `createAsk`'s call site) is exactly the decision `ask:answer`'s own
+          // preset comment says is "reserved for a human/CTO". A `kind: "worker"`/`"utility"` principal
+          // may still answer a plain `"question"` ask (the collaborative-unblock case that capability
+          // grant exists for), but never a tool-approval, regardless of whose run it is.
+          if (ask.kind === "tool-approval" && (cmd._principal?.kind === "worker" || cmd._principal?.kind === "utility")) {
+            return {
+              id: cmd.id, ok: false,
+              error: `principal ${cmd._principal.id} (${cmd._principal.kind}) may not decide a tool-approval ask — `
+                + "that decision is reserved for a human/CTO regardless of which run raised it",
+            };
+          }
+          // Attribution is DERIVED from the authenticated principal, never trusted from the request —
+          // the same "nothing the decision reads from the request" rule already enforced elsewhere
+          // (the capability set itself, `recordVerdict`'s workerId binding). A caller-supplied
+          // `answeredBy` is honored only when there is NO principal at all — the unauthenticated
+          // in-process path several existing tests call directly (`supervisor.answerAsk(...)`, not
+          // through the wire), which this fix does not newly require authentication on.
+          const answeredBy = cmd._principal
+            ? (cmd._principal.kind === "human" ? "human" : cmd._principal.id)
+            : (cmd.answeredBy ?? "human");
           // Awaited inside the try, so a rejected delivery becomes an `ok: false` reply rather
           // than an unhandled rejection that the client never hears about.
-          return { id: cmd.id, ok: true, ...(await answerAsk(cmd.askId, cmd)) };
+          return { id: cmd.id, ok: true, ...(await answerAsk(cmd.askId, { ...cmd, answeredBy })) };
         } catch (err) {
           return { id: cmd.id, ok: false, error: String(err?.message ?? err) };
         }
@@ -3058,6 +4261,15 @@ export function createSupervisor({
     journalHasDone: (q) => journalHasDone(database, q),
     grantApproval,
     mergeTask,
+    createTaskWorktree,
+    discardTaskWorktree,
+    requestWorktree,
+    acquireLease,
+    releaseLease,
+    renewLease,
+    gitCreatePush,
+    sweepLeases,
+    listActiveLeases: (resourceName) => listActiveLeases(database, resourceName),
     importReviewProfiles,
     reviewProfiles: () => listReviewProfiles(database),
     reviewProfileForTask,
@@ -3066,6 +4278,7 @@ export function createSupervisor({
     reviewFindings,
     approveTask,
     assignTask,
+    createUtilityTask,
     assignmentPreview,
     taskHandoff,
     currentTaskHandoff,

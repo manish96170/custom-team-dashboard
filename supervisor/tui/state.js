@@ -16,7 +16,12 @@
 // The chat bar is the sharpest case: while focus is `chat`, letters must be TEXT. A TUI where typing
 // "help" into a chat box toggles fullscreen, hides reviewers, and quits is not a chat box.
 
-export const FOCUS = { TREE: "tree", PANE: "pane", CHAT: "chat", REQUESTS: "requests" };
+// `REQUEST_DETAIL` added 2026-09-11 (PLAN.md §14.4 correction 3 / FLOWS §6c): a request too long to
+// show inline expands to a full-width view that REPLACES the tree + pane area, not a pane and not a
+// fullscreen of one. It gets its own focus value for the same reason `REQUESTS` did — `a`/`d` mean
+// something here that they don't mean elsewhere (`d` in particular already means "toggle direct chat"
+// under `PANE` focus; scoping by focus is what lets both exist without colliding, same as `h`).
+export const FOCUS = { TREE: "tree", PANE: "pane", CHAT: "chat", REQUESTS: "requests", REQUEST_DETAIL: "requestDetail" };
 
 /** A fresh state. Everything the layout reads has a defined value here — no `undefined` in render. */
 export function initialState(overrides = {}) {
@@ -31,6 +36,11 @@ export function initialState(overrides = {}) {
     focus: FOCUS.TREE,
     focusedPane: 0,
     fullscreen: false,
+    // The TREE panel's own show/hide (PLAN.md §5, added 2026-09-11) — same idea as `reviewersHidden`
+    // letting the dev pane auto-expand: hiding the tree should free its width for the pane area, and
+    // selection state must survive the hide (it's a view change, not a navigation reset), so nothing
+    // else here needs to change when this flips.
+    treeHidden: false,
     // Which reviewer slots are shown, and the memory `r` restores. FLOWS §5: pressing `r` again
     // "restores last-shown reviewer pane state", so hiding must not be lossy.
     visibleReviewers: ["parent"],
@@ -82,16 +92,32 @@ export function keyToAction(key, state) {
     return null;
   }
 
+  // ── request-detail focus: a request too long to show inline, expanded full-width ──────
+  //
+  // Added 2026-09-11 (PLAN.md §14.4 correction 3 / FLOWS §6c). `d` here means Decline, never "toggle
+  // direct chat" — there is no worker pane to target while this view is open, so the two meanings
+  // never actually compete, the same reasoning that already lets `h` mean two different things by
+  // focus. Everything else falls through, same "don't make this a trap" rule `REQUESTS` already follows.
+  if (state.focus === FOCUS.REQUEST_DETAIL) {
+    if (key === "a") return { type: "acceptRequest" };
+    if (key === "d") return { type: "declineRequest" };
+    if (key === "escape") return { type: "closeRequestDetail" };
+  }
+
   // ── requests focus: `h` HIDES the panel here, and moves teams everywhere else ─────────
   //
   // This is the collision FLOWS §5 opens by ruling out ("all keybindings act on the currently focused
   // pane context, not globally"), and it is the reason focus is a field rather than a mode flag. Same
   // key, two meanings, no ambiguity — because the lookup is scoped.
   if (state.focus === FOCUS.REQUESTS) {
-    if (key === "h" || key === "escape") return { type: "hideRequests" };
+    if (key === "h") return { type: "hideRequests" };
+    // `return` OPENS the detail view (FLOWS §6c: "a request too long to fit inline, or `return` on
+    // it") rather than blurring — `escape`/`tab` still leave the panel, unchanged.
+    if (key === "return") return { type: "openRequestDetail" };
+    if (key === "escape") return { type: "hideRequests" };
     if (key === "up" || key === "k") return { type: "requestUp" };
     if (key === "down" || key === "j") return { type: "requestDown" };
-    if (key === "tab" || key === "return") return { type: "blurRequests" };
+    if (key === "tab") return { type: "blurRequests" };
     // Everything else falls through to the global table on purpose: `/`, `q` and the pane toggles are
     // still the right thing to do from here, and swallowing them would make the panel a trap.
   }
@@ -113,6 +139,14 @@ export function keyToAction(key, state) {
     case "g": return { type: "toggleGrouped" };
     case "m": return { type: "pinSelected" };
     case "d": return { type: "toggleChatTarget" };
+    // Both added 2026-09-11, picked for what FLOWS §5 marked "TBD at build time" — `t` for the TREE
+    // toggle (PLAN.md §5) and capital `R` for the Requests-panel toggle (PLAN.md §14.4), distinct from
+    // lowercase `r` (toggle all reviewers) the same way this codebase's own `decodeKey` already returns
+    // shifted letters as distinct strings (verified: it returns `chunk.toString()` unchanged for a
+    // single printable character, so `R` and `r` never collide). Both work from anywhere, matching
+    // FLOWS §5's own "Anywhere" situation for each row.
+    case "t": return { type: "toggleTreeHidden" };
+    case "R": return { type: "toggleRequestsHidden" };
     default: return null;
   }
 }
@@ -244,6 +278,67 @@ export function applyAction(state, action) {
       s.grouped = !s.grouped;
       return s;
 
+    // Added 2026-09-11 (PLAN.md §5). Nothing else changes — `selectedNodeId`/`treeScroll` are left
+    // exactly as they are, which is what makes this a view toggle rather than a navigation reset.
+    case "toggleTreeHidden":
+      s.treeHidden = !s.treeHidden;
+      return s;
+
+    // Added 2026-09-11 (PLAN.md §14.4 correction 2) — unlike `hideRequests` (bound to `h` while the
+    // panel is focused), this works from ANYWHERE and regardless of pending count, and TOGGLES rather
+    // than only hiding. Leaving `REQUESTS` focus on hide is the same reasoning `hideRequests` already
+    // uses: a hidden panel with focus still on it would make every keypress hit an invisible table.
+    case "toggleRequestsHidden":
+      s.requestsHidden = !s.requestsHidden;
+      if (s.requestsHidden) {
+        if (s.focus === FOCUS.REQUESTS) s.focus = FOCUS.TREE;
+        s.status = "requests panel hidden — press R to show it again";
+      } else {
+        s.status = "requests panel shown";
+      }
+      return s;
+
+    // ── the Request Detail view (PLAN.md §14.4 correction 3 / FLOWS §6c), added 2026-09-11 ──────────
+    //
+    // Deliberately does NOT snapshot/restore anything: entering and leaving this view only ever
+    // changes `focus`. Nothing about the tree or the panes is touched, so "restore the pane area
+    // exactly as it was" falls out for free the same way `fullscreen`/`reviewersHidden` already work —
+    // they filter what `layout.js` draws without altering the state those draws are based on.
+    case "openRequestDetail": {
+      const id = action.requestId ?? s.selectedRequestId;
+      if (!id) return s; // nothing selected — there is no detail to show
+      s.selectedRequestId = id;
+      s.focus = FOCUS.REQUEST_DETAIL;
+      return s;
+    }
+
+    // review-sol-2026-09-13.md finding 26: this used to set focus to REQUESTS unconditionally — but the
+    // panel could have been hidden (`R`) WHILE the detail view was open (`toggleRequestsHidden` only
+    // redirects focus away from REQUESTS when focus is ALREADY on REQUESTS at the moment of hiding; it
+    // has no idea focus is currently on REQUEST_DETAIL instead). Closing detail then left focus on a
+    // panel that is not drawn at all — every subsequent keypress in that state targeted an invisible
+    // component. Route to TREE instead when the panel is actually hidden, same as `toggleRequestsHidden`/
+    // `hideRequests` already do for exactly this reason.
+    // review-sol-2026-09-13.md finding 26: this used to set focus to REQUESTS unconditionally — but the
+    // panel could have been hidden (`R`) WHILE the detail view was open (`toggleRequestsHidden` only
+    // redirects focus away from REQUESTS when focus is ALREADY on REQUESTS at the moment of hiding; it
+    // has no idea focus is currently on REQUEST_DETAIL instead). Closing detail then left focus on a
+    // panel that is not drawn at all — every subsequent keypress in that state targeted an invisible
+    // component. Route to TREE instead when the panel is actually hidden, same as `toggleRequestsHidden`/
+    // `hideRequests` already do for exactly this reason.
+    case "closeRequestDetail":
+      s.focus = s.requestsHidden ? FOCUS.TREE : FOCUS.REQUESTS;
+      return s;
+
+    // Accept/Decline hand off to `app.js` as `pendingRequestDecision`, the same split `submitChat`
+    // already uses for `pendingChat` — this file is pure, and acting on a decision (today: nothing yet
+    // wired server-side, per PLAN.md §14.4's own "none of this is built" note) is I/O.
+    case "acceptRequest":
+    case "declineRequest":
+      s.pendingRequestDecision = { requestId: s.selectedRequestId, decision: action.type === "acceptRequest" ? "accept" : "decline" };
+      s.focus = FOCUS.REQUESTS;
+      return s;
+
     case "pinSelected": {
       const isWorker = treeRows(s).some((r) => r.kind === "worker" && r.id === s.selectedNodeId);
       if (!isWorker) { s.status = "pin (m) applies to a worker — select one in the tree"; return s; }
@@ -301,6 +396,15 @@ export function applyAction(state, action) {
         return s;
       }
       if (t.kind === "requests") {
+        // Clicking a request too long to fit inline opens its detail view directly (FLOWS §6c: "a
+        // request too long to fit inline, or `return` on it" — the two are equivalent). One that
+        // already fits just selects/focuses, same as before `fits` existed — expanding a message
+        // that was already fully visible would be a surprising thing for a click to do.
+        if (t.requestId && t.fits === false) {
+          s.selectedRequestId = t.requestId;
+          s.focus = FOCUS.REQUEST_DETAIL;
+          return s;
+        }
         s.focus = FOCUS.REQUESTS;
         if (t.requestId) s.selectedRequestId = t.requestId;
         s.status = "requests panel focused — h hides it";
@@ -364,11 +468,27 @@ export function withRequests(state, requests = []) {
     s.requestsHidden = false;
     s.selectedRequestId = null;
     s.requestScroll = 0;
-    // Nothing to focus. Leaving focus here would make every keypress hit the requests table above.
-    if (s.focus === FOCUS.REQUESTS) s.focus = FOCUS.TREE;
+    // Nothing to focus. Leaving focus here would make every keypress hit the requests table above —
+    // and the detail view is even less sensible to leave open once its own request is simply gone.
+    if (s.focus === FOCUS.REQUESTS || s.focus === FOCUS.REQUEST_DETAIL) s.focus = FOCUS.TREE;
     return s;
   }
-  if (!requests.some((r) => r.id === s.selectedRequestId)) s.selectedRequestId = requests[0].id;
+  // review-sol-2026-09-13.md finding 18: if the request an operator has OPEN in the detail view
+  // disappears while others remain, this used to silently retarget `selectedRequestId` to whatever
+  // request happens to be first, while leaving `focus` at REQUEST_DETAIL — so the content on screen
+  // changed to a DIFFERENT request the operator never opened, and the next Accept/Decline keypress
+  // would act on it. Detail view must close back to the list instead, same as the "nothing left at
+  // all" branch above already does.
+  // review-sol-2026-09-13.md finding 18: if the request an operator has OPEN in the detail view
+  // disappears while others remain, this used to silently retarget `selectedRequestId` to whatever
+  // request happens to be first, while leaving `focus` at REQUEST_DETAIL — so the content on screen
+  // changed to a DIFFERENT request the operator never opened, and the next Accept/Decline keypress
+  // would act on it. Detail view must close back to the list instead, same as the "nothing left at
+  // all" branch above already does.
+  if (!requests.some((r) => r.id === s.selectedRequestId)) {
+    s.selectedRequestId = requests[0].id;
+    if (s.focus === FOCUS.REQUEST_DETAIL) s.focus = FOCUS.REQUESTS;
+  }
   return s;
 }
 

@@ -97,6 +97,118 @@ async function test_turnEnd_status_aborted() {
 }
 
 // ---------------------------------------------------------------------------
+// Older should-fix backlog: "a Claude Code process exiting with no `result`
+// object produces no turn.end at all." A crash mid-turn (or a kill before
+// the CLI prints its result line) must still leave the run with a real,
+// synthesized turn.end — not silence at the transcript layer, even though
+// observe() itself already terminates fine via run.status.
+// ---------------------------------------------------------------------------
+async function test_process_exit_with_no_result_synthesizes_turn_end() {
+  process.env.FAKE_CLAUDE_MODE = 'crash';
+  try {
+    const runId = adapter.start({ prompt: 'hi', cwd: process.cwd() });
+    const events = await drain(runId);
+    const turnEnd = events.find((e) => e.type === 'turn.end');
+    assert.ok(
+      turnEnd,
+      `a process that exits with no result line must still get a synthesized turn.end; got events: ${JSON.stringify(events)}`,
+    );
+    assert.equal(turnEnd.status, 'error', 'a silent crash with no result is reported as an error, regardless of exit code');
+    assert.equal(turnEnd.isError, true);
+    assert.match(turnEnd.error, /without ever emitting a result/);
+    const processExit = events.find((e) => e.type === 'process.exit');
+    assert.ok(processExit, 'the real process.exit event must still be present alongside the synthesized turn.end');
+  } finally {
+    delete process.env.FAKE_CLAUDE_MODE;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// review-sol-2026-09-13.md finding 19: the fallback-status logic above used to read `run.status`
+// AFTER it had already been overwritten to 'completed'/'errored' by this same handler, so (a) a
+// clean exit code (0) with no result line was reported as a completed turn instead of an error,
+// directly contradicting this codebase's own stated protocol rule, and (b) a deliberate stop()
+// (which sets `run.status = 'stopped'` BEFORE the process actually exits) was clobbered by that
+// same overwrite before the fallback check ever saw it, so a genuine abort was misreported as a
+// raw error instead of 'aborted'.
+// ---------------------------------------------------------------------------
+async function test_clean_exit_with_no_result_is_still_an_error() {
+  process.env.FAKE_CLAUDE_MODE = 'crash-clean-exit';
+  try {
+    const runId = adapter.start({ prompt: 'hi', cwd: process.cwd() });
+    const events = await drain(runId);
+    const turnEnd = events.find((e) => e.type === 'turn.end');
+    assert.ok(turnEnd, `expected a synthesized turn.end; got events: ${JSON.stringify(events)}`);
+    assert.equal(turnEnd.status, 'error', 'exit code 0 with no result line must NOT be reported as completed');
+    assert.equal(turnEnd.isError, true);
+    const processExit = events.find((e) => e.type === 'process.exit');
+    assert.equal(processExit.code, 0, 'precondition: the process really did exit cleanly');
+  } finally {
+    delete process.env.FAKE_CLAUDE_MODE;
+  }
+}
+
+async function test_deliberate_stop_with_no_result_is_aborted_not_error() {
+  process.env.FAKE_CLAUDE_MODE = 'stall';
+  try {
+    const runId = adapter.start({ prompt: 'hi', cwd: process.cwd() });
+    // Let the fake process print its opening delta and settle into "never finishing" before stopping it.
+    await new Promise((r) => setTimeout(r, 150));
+    adapter.stop(runId);
+    // NOT `drain()`: `observe()` itself already terminates as soon as `run.status` leaves "running"
+    // (set SYNCHRONOUSLY by `stop()`, above), which is BEFORE the SIGINT-triggered process exit and its
+    // synthesized turn.end land — draining the iterator would return too early and miss both. Poll the
+    // real event log instead, the same pattern the approval tests already use for a post-action event.
+    const turnEnd = await waitForEvent(runId, (e) => e.type === 'turn.end', { what: 'a synthesized turn.end after a deliberate stop' });
+    assert.equal(turnEnd.status, 'aborted', 'a deliberate stop with no result line must be "aborted", not a raw error');
+    assert.equal(turnEnd.isError, false);
+  } finally {
+    delete process.env.FAKE_CLAUDE_MODE;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Older should-fix backlog: "full adapter-iterator cancellation needs an
+// AbortSignal on both adapters' observe() — iterator.return() is invoked
+// now, but return() on an async generator suspended inside an await is
+// queued until it resumes, so a generator blocked on a socket read cannot
+// be cancelled at all." MEASURED against a minimal repro of observe()'s
+// exact loop shape: a bare `while (true) { await X }` async generator with
+// no yield between successive idle-poll awaits never delivers a queued
+// `.return()` — proven against a real, genuinely-stalled run here, not a
+// synthetic iterator.
+// ---------------------------------------------------------------------------
+async function test_iterator_return_settles_a_parked_next_within_bounded_time() {
+  process.env.FAKE_CLAUDE_MODE = 'stall';
+  try {
+    const runId = adapter.start({ prompt: 'this turn never naturally finishes', cwd: process.cwd() });
+    const iter = adapter.observe(runId);
+    // Drain whatever is already buffered so the next next() call is genuinely the one that
+    // parks — a call answered instantly by an already-buffered event would not exercise the
+    // cancellation path being measured here at all.
+    let parkedNext;
+    for (;;) {
+      const candidate = iter.next();
+      const raced = await Promise.race([candidate.then(() => 'resolved'), sleep(60).then(() => 'pending')]);
+      if (raced === 'pending') { parkedNext = candidate; break; }
+      if ((await candidate).done) { parkedNext = candidate; break; }
+    }
+    const start = Date.now();
+    const returned = iter.return();
+    const settled = await Promise.race([
+      Promise.all([parkedNext, returned]).then(() => 'settled'),
+      sleep(1000).then(() => 'timeout'),
+    ]);
+    const elapsedMs = Date.now() - start;
+    assert.equal(settled, 'settled', `the parked next() must settle once return() is called, not hang; waited ${elapsedMs}ms`);
+    assert.ok(elapsedMs < 500, `expected cancellation well within the 200ms safety-net window (plus margin); took ${elapsedMs}ms`);
+    adapter.stop(runId); // 'stall' mode never exits on its own — clean up the real child process
+  } finally {
+    delete process.env.FAKE_CLAUDE_MODE;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Finding S7: stop()'s SIGKILL fallback timer must not kill a process that
 // resume() rebinds run.child to within the timer's window. This actually
 // triggers the race (a quick death on SIGINT, then an immediate resume())
@@ -537,6 +649,10 @@ const tests = [
   ['turn.end status: completed', test_turnEnd_status_completed],
   ['turn.end status: error', test_turnEnd_status_error],
   ['turn.end status: aborted', test_turnEnd_status_aborted],
+  ['process exit with no result synthesizes a turn.end', test_process_exit_with_no_result_synthesizes_turn_end],
+  ['a clean (code 0) exit with no result is still reported as an error, not completed', test_clean_exit_with_no_result_is_still_an_error],
+  ['a deliberate stop with no result line is reported as aborted, not a raw error', test_deliberate_stop_with_no_result_is_aborted_not_error],
+  ['iterator.return() settles a parked next() within bounded time', test_iterator_return_settles_a_parked_next_within_bounded_time],
   ['stop/resume race does not kill the new child', test_stop_resume_race_does_not_kill_new_child],
   ['resume() installs child error handler', test_resume_installs_error_handler],
   ['preflight()', test_preflight],

@@ -55,21 +55,73 @@ const SESSIONLESS_EVENT_ALLOWLIST = new Set(['server.connected', 'server.heartbe
 // Bounded ring buffer for a process's stderr, for diagnostics (finding S6).
 // Keeps memory bounded without silently discarding all diagnostic value the
 // way `stdio: 'ignore'` would.
-const STDERR_RING_LIMIT = 200; // lines
+//
+// Bounded by BYTES, not by line count (older should-fix backlog: "the stderr
+// ring is bounded by line count not bytes, so one huge line is unbounded").
+// `line.length` entries have no upper bound of their own -- a process that
+// writes one enormous line with no newline (a giant JSON dump, garbage
+// binary output with no '\n' for megabytes) stored the WHOLE thing as a
+// single ring entry, so 200 such lines could still exhaust memory even
+// though "200" sounds bounded. `STDERR_RING_MAX_LINE_BYTES` also truncates
+// any one absurd line before it's ever stored, so a single line can't blow
+// the byte budget on its own either.
+const STDERR_RING_MAX_BYTES = 64 * 1024; // 64 KiB total, regardless of line count or length
+const STDERR_RING_MAX_LINE_BYTES = 4 * 1024; // no single stored line exceeds this
 
 // How long to wait for the /event subscription to prove itself live (via
 // OpenCode's own `server.connected` event) before proceeding anyway. See
 // _startServerEventDemuxer() for why this is a bounded degrade, not a hard fail.
 const SSE_CONNECT_TIMEOUT_MS = 5000;
 
-class StderrRing {
-  constructor(limit = STDERR_RING_LIMIT) {
-    this.limit = limit;
+// Exported so its byte bound can be proven in a direct, isolated unit test — no real `opencode`
+// process needs to write megabytes of stderr just to check a pure buffer's arithmetic.
+export class StderrRing {
+  constructor(maxBytes = STDERR_RING_MAX_BYTES) {
+    // review-sol-2026-09-13.md finding 33's other half: a non-positive-integer budget (0, negative,
+    // NaN, a string) would make the eviction loop below either never trigger or behave nonsensically —
+    // fail loud here rather than silently accepting garbage that only breaks later, at push time.
+    if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
+      throw new Error(`StderrRing: maxBytes must be a positive integer, got ${JSON.stringify(maxBytes)}`);
+    }
+    this.maxBytes = maxBytes;
     this.lines = [];
+    this.bytes = 0;
   }
   push(line) {
-    this.lines.push(line);
-    if (this.lines.length > this.limit) this.lines.shift();
+    // Relative to THIS instance's own budget, not just the module-level constant — a ring
+    // constructed with a smaller `maxBytes` than `STDERR_RING_MAX_LINE_BYTES` must still end up
+    // with a truncated line it can actually KEEP, or the eviction loop below would immediately
+    // shift its only entry back out for still exceeding the budget, leaving the ring empty right
+    // after a push that should have kept something.
+    const lineBudget = Math.min(STDERR_RING_MAX_LINE_BYTES, this.maxBytes);
+    let stored = line;
+    if (Buffer.byteLength(stored, 'utf8') > lineBudget) {
+      // review-sol-2026-09-13.md finding 33: both the truncation point AND the suffix's own length
+      // used to be computed with `.slice()`/`.length` — UTF-16 CODE UNIT operations, not bytes. A
+      // multibyte character (an emoji is 4 UTF-8 bytes but only 2 UTF-16 code units) meant `lineBudget`
+      // "code units" kept far more than `lineBudget` BYTES (measured: a 1,024-byte ring retained 2,038
+      // bytes of emoji input) — the exact byte bound this class exists to enforce, silently violated.
+      // Truncate the real UTF-8 BYTES via a Buffer, and count the suffix's real byte length too.
+      const suffix = '…(truncated)';
+      const suffixBytes = Buffer.byteLength(suffix, 'utf8');
+      const keepBytes = Math.max(0, lineBudget - suffixBytes);
+      // `Buffer#toString('utf8')` decodes a byte sequence truncated mid-multibyte-character as ONE
+      // Unicode replacement character (U+FFFD, itself 3 UTF-8 bytes) rather than throwing — best-effort
+      // at the boundary, never invalid UTF-16 in the resulting JS string. But that replacement can be
+      // BIGGER than the partial bytes it replaced (up to 3 bytes for as little as 1 partial byte cut
+      // off), so the decoded result can end up slightly OVER `keepBytes` — shrink a character at a time
+      // until it genuinely fits, rather than trusting the byte slice point alone.
+      let kept = Buffer.from(stored, 'utf8').subarray(0, keepBytes).toString('utf8');
+      while (Buffer.byteLength(kept, 'utf8') + suffixBytes > lineBudget && kept.length > 0) {
+        kept = kept.slice(0, -1);
+      }
+      stored = `${kept}${suffix}`;
+    }
+    this.lines.push(stored);
+    this.bytes += Buffer.byteLength(stored, 'utf8');
+    while (this.bytes > this.maxBytes && this.lines.length > 1) {
+      this.bytes -= Buffer.byteLength(this.lines.shift(), 'utf8');
+    }
   }
   toString() {
     return this.lines.join('\n');
@@ -111,6 +163,20 @@ class Run {
     this._eventLog = [];
     this._readCursor = 0;
     this._waiters = []; // resolve callbacks for observe()'s wake-on-event
+    // Older should-fix backlog: "OpenCode abort can emit two terminal events
+    // (session.error then session.idle, both mapped to turn.end)". Measured, not
+    // guessed (see interrupt()'s own doc comment): a real abort produces BOTH a
+    // `session.error` (MessageAbortedError -> turn.end status:'aborted') AND a
+    // `session.idle` (-> turn.end status:'completed') for the SAME logical turn
+    // ending. Without this flag, both land in `_eventLog`, and any consumer that
+    // just takes "the last turn.end it saw" (event-pump.js's `updateDerived` does
+    // exactly this) reports the run as cleanly `completed` when it was actually
+    // aborted. Reset at the start of each new turn (start()/sendInput()), set the
+    // first time a turn.end is actually emitted for the CURRENT turn.
+    this._turnEndedForCurrentTurn = false;
+    // Set by observe()'s returned wrapper when its `.return()` is called (the pump's iterator
+    // cancellation contract) — see observe()'s own doc comment for why this exists at all.
+    this._cancelled = false;
   }
 
   _emitEvent(evt) {
@@ -431,6 +497,23 @@ function _demuxOneEvent(entry, evt) {
   if (SESSIONLESS_EVENT_ALLOWLIST.has(eventType)) {
     for (const run of runs.values()) {
       if (run.baseUrl !== entry.baseUrl) continue;
+      // `mapEvent()` returns `null` for `server.instance.disposed` — by design, it's a liveness
+      // broadcast, not itself a turn-relevant event. But for a run still mid-turn on THIS server,
+      // nothing else will EVER tell it the turn is over: the server that would have emitted its
+      // `session.idle`/`session.error` just tore itself down. Without this, `observe()` (whose
+      // only exit condition is seeing a real `turn.end`) waits forever (older should-fix backlog:
+      // "server.instance.disposed maps to null, so a disposed server produces no terminal event
+      // and can hang observe()"). `server.connected`/`server.heartbeat` need no such handling —
+      // they say nothing about whether any run is still in progress.
+      if (eventType === 'server.instance.disposed' && !run._turnEndedForCurrentTurn) {
+        run._turnEndedForCurrentTurn = true;
+        run.status = 'errored';
+        run._emitEvent({
+          type: 'turn.end', status: 'error', isError: true,
+          error: 'opencode server instance disposed mid-run — the server this run depended on tore itself down',
+        });
+        continue;
+      }
       const mapped = mapEvent(evt, props);
       if (mapped) run._emitEvent(mapped);
     }
@@ -453,6 +536,17 @@ function _demuxOneEvent(entry, evt) {
     const mapped = mapEvent(evt, props);
     if (mapped) {
       if (mapped.type === 'turn.end') {
+        // An abort produces BOTH session.error and session.idle for the SAME logical
+        // ending (see Run's own `_turnEndedForCurrentTurn` doc comment) — only the
+        // FIRST turn.end for this turn is real; a second one would silently overwrite
+        // an honest 'aborted'/'error' status with 'completed' in any last-wins consumer.
+        if (run._turnEndedForCurrentTurn) {
+          entry.stderrRing.push(
+            `[adapter] dropped redundant turn.end (status: ${mapped.status}) for an already-ended turn on session ${sessionID}`,
+          );
+          continue;
+        }
+        run._turnEndedForCurrentTurn = true;
         run.status = mapped.status === 'completed' ? 'completed' : 'errored';
       }
       run._emitEvent(mapped);
@@ -607,6 +701,7 @@ export async function start(spec) {
       return res.text().then((body) => {
         run.status = 'errored';
         run.lastError = new Error(`prompt_async rejected: ${res.status} ${body}`);
+        run._turnEndedForCurrentTurn = true;
         // Synthesize the terminating event ourselves — the server will
         // never emit session.idle/session.error for a turn it rejected
         // before starting, so without this, observe() would hang forever
@@ -617,6 +712,7 @@ export async function start(spec) {
   }).catch((err) => {
     run.status = 'errored';
     run.lastError = err;
+    run._turnEndedForCurrentTurn = true;
     run._emitEvent({ type: 'turn.end', status: 'error', isError: true, error: String(err) });
   });
 
@@ -642,6 +738,9 @@ export async function sendInput(runId, input) {
   const run = runs.get(runId);
   if (!run) throw new Error(`unknown runId: ${runId}`);
   run.status = 'running';
+  // A NEW turn starts here — the previous turn's terminal-event guard must not carry over, or
+  // this turn's own real termination would be wrongly suppressed as "redundant."
+  run._turnEndedForCurrentTurn = false;
   const body = { parts: [{ type: 'text', text: input }], model: run.modelSel };
   if (run.effort) body.variant = run.effort;
   const res = await fetch(`${run.baseUrl}/session/${run.sessionID}/prompt_async`, {
@@ -674,25 +773,53 @@ export async function sendInput(runId, input) {
  * per-server demuxer above), and observe() just replays from a cursor over
  * that log — the same shape the Claude Code adapter already used.
  */
-export async function* observe(runId) {
+export function observe(runId) {
   const run = runs.get(runId);
   if (!run) throw new Error(`unknown runId: ${runId}`);
 
-  const isTerminal = (evt) => evt.type === 'turn.end';
-  let sawTerminal = false;
+  async function* realObserve() {
+    const isTerminal = (evt) => evt.type === 'turn.end';
+    let sawTerminal = false;
 
-  while (true) {
-    while (run._readCursor < run._eventLog.length) {
-      const evt = run._eventLog[run._readCursor++];
-      if (isTerminal(evt)) sawTerminal = true;
-      yield evt;
+    while (true) {
+      while (run._readCursor < run._eventLog.length) {
+        const evt = run._eventLog[run._readCursor++];
+        if (isTerminal(evt)) sawTerminal = true;
+        yield evt;
+      }
+      if (sawTerminal || run._cancelled) return;
+      await new Promise((res) => {
+        run._waiters.push(res);
+        setTimeout(res, 200); // safety-net poll, same rationale as the Claude Code adapter
+      });
     }
-    if (sawTerminal) return;
-    await new Promise((res) => {
-      run._waiters.push(res);
-      setTimeout(res, 200); // safety-net poll, same rationale as the Claude Code adapter
-    });
   }
+
+  // Older should-fix backlog: "full adapter-iterator cancellation needs an AbortSignal ...
+  // iterator.return() is invoked now, but return() on an async generator suspended inside an
+  // await is queued until it resumes, so a generator blocked on a socket read cannot be
+  // cancelled at all." MEASURED, not assumed: a bare `while (true) { await X }` generator with
+  // no `yield` between successive awaits genuinely never delivers a queued `.return()` at all —
+  // it just keeps re-entering the next await forever, so `runtime/event-pump.js`'s
+  // `cancelIterator()` (which only ever calls `.return()`) could hang indefinitely on exactly the
+  // "nothing new is happening" idle-poll state this loop sits in most of the time. Wrapped so
+  // `.return()` (the pump's ONLY cancellation call) is intercepted: mark cancelled AND wake the
+  // wait immediately (same mechanism `_emitEvent` already uses), so the generator's OWN code runs
+  // a genuine, synchronous `return;` on its very next tick — completing normally, which needs no
+  // generator-protocol delivery of a queued external completion at all.
+  const inner = realObserve();
+  return {
+    next: (...args) => inner.next(...args),
+    return(value) {
+      run._cancelled = true;
+      const waiters = run._waiters;
+      run._waiters = [];
+      for (const w of waiters) w();
+      return inner.return(value);
+    },
+    throw: (err) => inner.throw(err),
+    [Symbol.asyncIterator]() { return this; },
+  };
 }
 
 function mapEvent(evt, props) {
@@ -882,13 +1009,25 @@ export async function discardSession(runId, { timeoutMs = 5000 } = {}) {
   const baseUrl = run?.baseUrl ?? runId.split('::')[0];
   const sessionID = run?.sessionID ?? runId.split('::')[1];
   if (!baseUrl || !sessionID) return { discarded: false, reason: `cannot derive session from runId ${runId}` };
+  // `entry.sessionsKnown` is `verifyRunIdentity()`'s FALLBACK signal for exactly the moment the
+  // real server can't be reached — looked up by cwd normally, but a stopped run is already out of
+  // `runs`, so fall back to matching by baseUrl (the one thing still recoverable from the runId).
+  const entry = run ? serverPool.get(run.cwd) : [...serverPool.values()].find((e) => e.baseUrl === baseUrl);
   try {
     const res = await fetch(`${baseUrl}/session/${sessionID}`, {
       method: 'DELETE',
       signal: AbortSignal.timeout(timeoutMs),
     });
     // A 404 means it is already gone, which is the desired end state rather than a failure.
-    if (res.ok || res.status === 404) return { discarded: true, sessionID, status: res.status };
+    if (res.ok || res.status === 404) {
+      // Older should-fix backlog: "verifyRunIdentity()'s HTTP-unavailable fallback can
+      // false-positive sessionKnown:true." `sessionsKnown` used to be add-only — nothing here ever
+      // removed an entry once discarded, so a LATER identity check landing during a transient HTTP
+      // outage would fall back to this stale local cache and report a genuinely-deleted session as
+      // still known. Removed the instant the real server confirms it's gone (or was already gone).
+      entry?.sessionsKnown.delete(sessionID);
+      return { discarded: true, sessionID, status: res.status };
+    }
     return { discarded: false, sessionID, reason: `DELETE /session/${sessionID} -> ${res.status}` };
   } catch (err) {
     return { discarded: false, sessionID, reason: String(err?.message ?? err) };

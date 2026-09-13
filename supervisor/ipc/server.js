@@ -262,6 +262,10 @@ export function createIpcServer({
               id: null,
               ok: false,
               error: `line exceeds max size (${maxLineBytes} bytes); closing connection`,
+              // A structured twin of the message above, same shape as the shutdown notice below — a
+              // client's UNSOLICITED-frame handler (`ipc/client.js`'s `onNotice`) can dispatch on
+              // `event.type` instead of pattern-matching `error` text.
+              event: { type: "connection.overflow", maxLineBytes },
             }),
             destroyNow,
           );
@@ -338,11 +342,33 @@ export function createIpcServer({
     return [...sockets];
   }
 
-  /** Force-close every accepted socket immediately, writing a shutdown notice first where possible. */
+  /**
+   * Force-close every accepted socket, writing a shutdown notice first where possible.
+   *
+   * review-sol-2026-09-13.md finding 21: `socket.write(notice)` immediately followed by
+   * `socket.destroy()` used to be the whole thing — `destroy()` tears the connection down right away and
+   * does NOT wait for a just-queued write to actually flush, so the notice's delivery was nondeterministic
+   * (a client could see the connection die with nothing ever received). `socket.end(payload)` queues the
+   * payload, flushes it, THEN half-closes — the correct way to say "here is my last word, then goodbye."
+   * A bounded `destroy()` fallback timer still fires if `end()`'s own close does not complete promptly
+   * (a wedged socket, a client that never reads), so teardown remains bounded either way — the same
+   * "deterministic, never hangs on the client's cooperation" rule `shutdown()` below already applies to
+   * the whole server.
+   */
   function forceCloseAll(reason = "server shutting down") {
+    const encoded = encodeFrame({ id: null, ok: false, event: { type: "server.shutdown", reason } });
     for (const socket of sockets) {
-      safeWrite(socket, { id: null, ok: false, event: { type: "server.shutdown", reason } });
-      socket.destroy();
+      if (socket.destroyed || socket.writableEnded) continue;
+      const forceTimer = setTimeout(() => { try { socket.destroy(); } catch { /* already gone */ } }, 200);
+      forceTimer.unref?.();
+      socket.once("close", () => clearTimeout(forceTimer));
+      try {
+        socket.end(encoded);
+      } catch (err) {
+        logger.warn?.(`[ipc] end() with shutdown notice failed, forcing destroy: ${err.message}`);
+        clearTimeout(forceTimer);
+        try { socket.destroy(); } catch { /* already gone */ }
+      }
     }
     sockets.clear();
   }

@@ -34,7 +34,18 @@ async function main() {
   const observeId = "observe-longlived";
   const frames = [];
   client.onStream(observeId, (frame) => frames.push(frame));
-  client.send("observe", { id: observeId, runId }); // never resolves/completes on its own — that's the point
+  // review-sol-2026-09-13.md finding 21: before the fix, THIS promise — a request whose response never
+  // arrives because the connection was force-closed first — hung forever. `pending` had nothing that
+  // ever settled it on close/error. Captured here so the assertion after shutdown() below can prove it
+  // now resolves instead.
+  const observeSendPromise = client.send("observe", { id: observeId, runId }); // never resolves via a normal response — that's the point
+
+  // `forceCloseAll` (inside `shutdown()`) writes an UNSOLICITED `id: null` notice to every tracked
+  // socket before destroying it — HANDOFF.md's older backlog: "unsolicited frames use id: null,
+  // inconsistent with the 'every frame echoes its request id' claim." Nothing dropped this frame
+  // silently before `onNotice` existed; this proves it's actually deliverable now.
+  const notices = [];
+  client.onNotice((frame) => notices.push(frame));
 
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.equal(listSockets().length, 1, "server should have exactly one accepted socket at this point");
@@ -43,7 +54,7 @@ async function main() {
   // 1. THE real assertion: our shutdown() — which force-closes every tracked
   //    socket BEFORE calling server.close() — must resolve promptly.
   const start = Date.now();
-  const { timedOut } = await shutdown({ timeoutMs: 2000 });
+  const { timedOut } = await shutdown({ timeoutMs: 2000, reason: "test-teardown" });
   const elapsedMs = Date.now() - start;
 
   assert.equal(timedOut, false, "shutdown() should complete via the normal path (force-close + server.close), not via the hard-timeout fallback");
@@ -52,6 +63,28 @@ async function main() {
 
   assert.equal(listSockets().length, 0, "no sockets should remain tracked after shutdown");
   console.log("PASS: zero sockets remain tracked after shutdown");
+
+  // Give the already-written notice bytes a moment to actually arrive client-side — `forceCloseAll`
+  // writes then immediately destroys server-side, but the bytes are already queued in the kernel by
+  // then; this is NOT the adversarial-flood RST-discard race bounded-buffer.test.js documents for the
+  // overflow path, just an ordinary small clean write.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(notices.length, 1, `the shutdown notice must reach onNotice, not be silently dropped; got ${JSON.stringify(notices)}`);
+  assert.equal(notices[0].id, null, "an unsolicited notice carries no request id");
+  assert.equal(notices[0].event?.type, "server.shutdown");
+  assert.equal(notices[0].event?.reason, "test-teardown");
+  console.log("PASS: the unsolicited shutdown notice reached onNotice with its structured event, not silently dropped");
+
+  // finding 21's other half: the still-in-flight `observe` request above must settle now that the
+  // connection is gone, not hang forever. Race it against a short timeout so a regression FAILS this
+  // test (times out) rather than hanging the whole suite indefinitely.
+  const observeSettled = await Promise.race([
+    observeSendPromise.then((r) => ({ settled: true, result: r })),
+    new Promise((resolve) => setTimeout(() => resolve({ settled: false }), 1000)),
+  ]);
+  assert.equal(observeSettled.settled, true, "a request still in flight when the connection closes must settle its promise, not hang forever");
+  assert.equal(observeSettled.result.ok, false, "a connection-closed settlement must be reported as a failure, not a fabricated success");
+  console.log("PASS: a request still in flight when the server force-closes the connection settles its promise instead of hanging forever");
 
   client.close();
   fs.rmSync(SOCK_PATH, { force: true });

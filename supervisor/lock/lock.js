@@ -201,29 +201,61 @@ export async function acquireLock(lockPath = LOCK_PATH, opts = {}) {
       2,
     );
 
-    // Write the full payload under a private temp name first. Nobody else can see
-    // this name (it's namespaced by our own pid/attempt/random suffix), so this
-    // write is never itself part of a race.
-    await fs.writeFile(tmpPath, payload, { flag: "wx" });
-
     let linked = false;
+    // review-sol-2026-09-13.md finding 34: this used to `throw err` directly from the `catch` block and
+    // let the `finally` block's own `await safeUnlink(tmpPath)` run afterward — a JS `finally` that
+    // throws REPLACES whatever exception was already propagating from `try`/`catch`, so a real primary
+    // failure (disk full, an I/O error on `writeFile`) was silently swapped for whatever the cleanup
+    // attempt threw, and the caller/operator saw the wrong root cause. `primaryError` is captured here
+    // instead of rethrown immediately, and the actual `throw` moves to AFTER the `finally` block entirely
+    // — so a cleanup failure below has nothing in flight to replace; it can only attach itself as
+    // additional context via `cleanupError`, never mask the original.
+    let primaryError = null;
     try {
+      // Write the full payload under a private temp name first. Nobody else can see
+      // this name (it's namespaced by our own pid/attempt/random suffix), so this
+      // write is never itself part of a race.
+      //
+      // INSIDE the try/finally now, not before it (older should-fix backlog: "temp-file
+      // leak if fs.writeFile fails mid-write"). `wx` creates the file, then writes the
+      // payload, then closes it as three separate underlying steps — a failure AFTER
+      // creation but before the write completes (disk full, an I/O error) used to leave
+      // a half-written file at `tmpPath` that nothing here ever cleaned up, because the
+      // old code only reached its cleanup path once this call had already returned.
+      await fs.writeFile(tmpPath, payload, { flag: "wx" });
+
       // Atomic publish: link(2) fails EEXIST if lockPath already exists. By the
       // time lockPath exists under this name, it is already fully populated —
       // there is no observable empty-file window.
       await fs.link(tmpPath, lockPath);
       linked = true;
     } catch (err) {
-      if (err.code !== "EEXIST") {
-        await safeUnlink(tmpPath);
-        throw err;
-      }
+      if (err.code !== "EEXIST") primaryError = err;
     } finally {
-      // Whether the link succeeded or failed, the temp name itself is never
-      // needed again: on success lockPath is a second hard link to the same
-      // inode; on failure it was never published. Never leak it.
-      await safeUnlink(tmpPath);
+      if (linked) {
+        // The lock is ALREADY held at this point — `lockPath` is a second hard link to
+        // `tmpPath`'s inode. A failure removing the now-redundant temp name must NEVER
+        // fail the acquisition itself, or a legitimately-held lock becomes an ORPHAN
+        // nobody can ever release (older should-fix backlog: "orphaned lock if
+        // fs.link() succeeds but temp cleanup then fails"). Best-effort only — a
+        // leftover redundant hard link is harmless clutter, not a correctness problem.
+        try {
+          await fs.unlink(tmpPath);
+        } catch { /* redundant hard link; the lock itself is fine either way */ }
+      } else {
+        // Not published (write failed partway, or link lost EEXIST): whatever is at
+        // `tmpPath` is exclusively ours, and it is never needed again. A real cleanup
+        // failure here is recorded on `primaryError` (if there is one) rather than thrown
+        // directly — see the note above finding 34.
+        try {
+          await safeUnlink(tmpPath);
+        } catch (cleanupErr) {
+          if (primaryError) primaryError.cleanupError = cleanupErr;
+          else primaryError = cleanupErr;
+        }
+      }
     }
+    if (primaryError) throw primaryError;
 
     if (!linked) {
       const outcome = await resolveExistingLock(

@@ -13,7 +13,7 @@
 // own cursor.
 
 import readline from "node:readline";
-import { attachPane, parsePaneCommand, PANE_HELP } from "./pane.js";
+import { attachPane, parsePaneCommand, PANE_HELP, readOwnerToken } from "./pane.js";
 import { connect } from "../ipc/client.js";
 import { defaultSockPath, defaultStateDir } from "../ipc/paths.js";
 
@@ -35,8 +35,10 @@ function parseArgv(argv) {
   return opts;
 }
 
-async function listRuns(sockPath) {
-  const client = await connect(sockPath);
+// Fixed 2026-09-11 alongside `attachPane`'s own fix (`codexdoc/REVIEW-NOTES.md` finding 10) — `--list`
+// went through the same tokenless client and would be refused identically.
+async function listRuns(sockPath, stateDir) {
+  const client = await connect(sockPath, { token: readOwnerToken(stateDir) });
   try {
     const [runs, orphans] = await Promise.all([client.send("list", {}), client.send("orphans", {})]);
     const rows = runs.runs ?? [];
@@ -60,10 +62,11 @@ async function listRuns(sockPath) {
 
 async function main() {
   const opts = parseArgv(process.argv.slice(2));
-  const sockPath = opts.sockPath ?? defaultSockPath(defaultStateDir());
+  const stateDir = defaultStateDir();
+  const sockPath = opts.sockPath ?? defaultSockPath(stateDir);
 
   if (opts.list) {
-    await listRuns(sockPath);
+    await listRuns(sockPath, stateDir);
     return;
   }
   if (!opts.runId) {

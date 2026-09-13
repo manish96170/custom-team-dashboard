@@ -71,6 +71,19 @@ class Run extends EventEmitter {
     // rebound (resume()). Lets a stale stop() SIGKILL timer recognize that
     // the child it was scheduled against is no longer the current one.
     this._generation = 0;
+    // Older should-fix backlog: "a Claude Code process exiting with no `result` object produces
+    // no turn.end at all." `turn.end` is ONLY emitted from a parsed `type: 'result'` stdout line
+    // (see below) — a process that crashes, is killed, or otherwise dies mid-turn without ever
+    // printing one leaves NO turn.end in `_eventLog`. `observe()` itself still terminates (its
+    // exit check is `run.status`-based, not turn.end-based), but `runtime/event-pump.js`'s
+    // `updateDerived` only updates `derived.terminalStatus` ON a turn.end event, so a silently-dead
+    // run's derived status stays whatever it was before — never marked terminal at that layer.
+    // Set the first time a real turn.end is emitted for the current turn; reset at the start of
+    // each new one (`_sendUserMessage`, called by both `sendInput` and `clearContext`'s `/clear`).
+    this._turnEnded = false;
+    // Set by observe()'s returned wrapper when its `.return()` is called (the pump's iterator
+    // cancellation contract) — see observe()'s own doc comment for why this exists at all.
+    this._cancelled = false;
   }
 
   _emitEvent(evt) {
@@ -387,10 +400,36 @@ function _bindChild(run, child) {
     // can happen if a stale process from a superseded generation finally
     // exits after resume() has already rebound run.child (finding S7).
     if (run._generation !== generation) return;
+    // review-sol-2026-09-13.md finding 19: captured BEFORE `run.status` is overwritten below. The
+    // fallback-status logic further down used to read `run.status` AFTER that overwrite, so (a) a
+    // deliberate `stopped` state was already clobbered to 'completed'/'errored' by the line below,
+    // making its own "stopped" branch dead code, and (b) exit code 0 produced `fallbackStatus:
+    // 'completed'` — directly contradicting this function's own comment, which says a code-0 exit
+    // with no `result` line "still does NOT mean the turn completed... this is always reported as
+    // an error, regardless of exit code."
+    const priorStatus = run.status;
     run.exitCode = code;
     run.exitSignal = signal;
     run.status = run.status === 'interrupted' ? 'interrupted' : (code === 0 ? 'completed' : 'errored');
     run._emitEvent({ type: 'process.exit', runId, code, signal });
+    // The process died without ever printing a `result` line — no turn.end was emitted for
+    // whatever turn was in flight. `observe()` still terminates fine (it's driven by `run.status`,
+    // set just above), but `runtime/event-pump.js`'s `updateDerived` only marks a run terminal on
+    // a REAL turn.end event, so without this, a silently-dead run's derived status stays whatever
+    // it was before — never actually recorded as terminal at that layer. A real exit code of 0
+    // still does NOT mean the turn completed per the JSON protocol's own contract (a `result` line
+    // never arrived), so this is always reported as an error, regardless of exit code.
+    if (!run._turnEnded) {
+      run._turnEnded = true;
+      // A deliberate stop()/interrupt() that killed the process before a result could print is an
+      // abort, not a raw error — checked against the PRIOR status (before this handler's own
+      // overwrite above), never against exit code, which is what an ordinary crash also produces.
+      const fallbackStatus = (priorStatus === 'stopped' || priorStatus === 'interrupted') ? 'aborted' : 'error';
+      run._emitEvent({
+        type: 'turn.end', runId, status: fallbackStatus, isError: fallbackStatus === 'error',
+        error: `claude process exited (code ${code}, signal ${signal ?? 'none'}) without ever emitting a result`,
+      });
+    }
   });
   child.on('error', (err) => {
     if (run._generation !== generation) return;
@@ -424,6 +463,8 @@ function _sendUserMessage(run, text) {
   if (!run.child?.stdin || run.child.stdin.destroyed || run.exitCode !== null) {
     throw new Error(`sendInput: run ${run.runId} has no live stdin (exitCode=${run.exitCode})`);
   }
+  // A NEW turn starts here — the previous turn's "already ended" guard must not carry over.
+  run._turnEnded = false;
   run.child.stdin.write(JSON.stringify(msg) + '\n');
   run.status = 'running';
 }
@@ -447,7 +488,7 @@ function _sendUserMessage(run, text) {
  * approvalHookExample.js. That hook is the only proven programmatic
  * approval mechanism.
  */
-export async function* observe(runId) {
+export function observe(runId) {
   const run = _get(runId);
   // NOTE: this adapter targets a single logical consumer per run (the
   // pattern the interface's own spec/usage implies: one orchestrator
@@ -458,28 +499,56 @@ export async function* observe(runId) {
   // whole history. A multi-consumer fan-out design is future work (see
   // consolidated review B3/S3 — out of scope for this pass).
   if (run._readCursor === undefined) run._readCursor = 0;
-  let wake = () => {};
-  const onEvent = () => wake();
-  run.on('event', onEvent);
 
-  try {
-    while (true) {
-      while (run._readCursor < run._eventLog.length) {
-        yield run._eventLog[run._readCursor++];
+  async function* realObserve() {
+    let wake = () => {};
+    const onEvent = () => wake();
+    run.on('event', onEvent);
+
+    try {
+      while (true) {
+        while (run._readCursor < run._eventLog.length) {
+          yield run._eventLog[run._readCursor++];
+        }
+        if (run.status === 'completed' || run.status === 'errored' || run.status === 'stopped') {
+          if (run._readCursor >= run._eventLog.length) return;
+        }
+        if (run._cancelled) return;
+        let timer;
+        await new Promise((res) => {
+          wake = res;
+          timer = setTimeout(res, 200); // safety-net poll in case an event slips past the listener
+        });
+        clearTimeout(timer);
       }
-      if (run.status === 'completed' || run.status === 'errored' || run.status === 'stopped') {
-        if (run._readCursor >= run._eventLog.length) return;
-      }
-      let timer;
-      await new Promise((res) => {
-        wake = res;
-        timer = setTimeout(res, 200); // safety-net poll in case an event slips past the listener
-      });
-      clearTimeout(timer);
+    } finally {
+      run.off('event', onEvent);
     }
-  } finally {
-    run.off('event', onEvent);
   }
+
+  // Older should-fix backlog: "full adapter-iterator cancellation needs an AbortSignal ...
+  // iterator.return() is invoked now, but return() on an async generator suspended inside an
+  // await is queued until it resumes, so a generator blocked on a socket read cannot be
+  // cancelled at all." MEASURED against a minimal repro of this EXACT loop shape, not assumed:
+  // a bare `while (true) { await X }` generator with no `yield` between successive idle-poll
+  // awaits never delivers a queued `.return()` at all — it just keeps re-entering the next await
+  // forever, so `runtime/event-pump.js`'s `cancelIterator()` (which only ever calls `.return()`)
+  // could hang indefinitely exactly while this loop is idle-polling. Wrapped so `.return()` (the
+  // pump's ONLY cancellation call) is intercepted: mark cancelled AND wake the wait immediately
+  // (`run.emit('event', ...)`'s own mechanism, reused here directly), so the generator's OWN code
+  // runs a genuine, synchronous `return;` on its very next tick — completing normally, which needs
+  // no generator-protocol delivery of a queued external completion at all.
+  const inner = realObserve();
+  return {
+    next: (...args) => inner.next(...args),
+    return(value) {
+      run._cancelled = true;
+      run.emit('event', { type: '_wake' });
+      return inner.return(value);
+    },
+    throw: (err) => inner.throw(err),
+    [Symbol.asyncIterator]() { return this; },
+  };
 }
 
 function _onStdout(run, chunk) {
@@ -623,6 +692,7 @@ function _handleLine(run, obj) {
   }
 
   if (obj.type === 'result') {
+    run._turnEnded = true;
     run.terminalReason = obj.terminal_reason;
     // Exit classification (proven: FINDINGS.md #8) — exit code alone is
     // NOT sufficient (interrupt also exits 0). Must inspect this record.
@@ -897,6 +967,9 @@ export function resume(runId) {
   args.push('--resume', run.claudeSessionId);
 
   run._buf = '';
+  // A genuinely NEW process for the same run — the observer that gave up on the OLD one (if any)
+  // does not speak for whoever calls observe() on this fresh generation.
+  run._cancelled = false;
   // A resumed generation gets its environment declared again, and recorded again: the
   // project settings on disk may have changed between generations (a `git pull`, an edited
   // hook), so one `worker.env` per run would be a record of the environment generation 1

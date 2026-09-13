@@ -23,6 +23,7 @@ import {
   createTask,
   listUndeliveredAnswers,
   closeOpenAsksForRun,
+  recordTransition,
 } from "../../db/index.js";
 import { createSupervisor } from "../supervisor.js";
 import { killProcessGroup } from "../spawn.js";
@@ -620,6 +621,35 @@ await runTest("approval round trip", async () => {
       );
       assert.equal(supervisor.asks({ runId }).length, 0, "so the run is not shown as blocked on a settled call");
       console.log("  15. a replayed approval.request for a request nothing is waiting on created no phantom ask");
+    }
+
+    // ── 16. the ask/task lifecycle wiring (`codexdoc/REVIEW-NOTES.md` finding 16) ───────
+    // `domain/task-states.js`'s `autoBlockTarget` existed and was tested in isolation, but nothing in
+    // the runtime ever called it — a task could sit in `implementing` with a real open ask, or in
+    // `blocked` with nothing left open, forever.
+    {
+      let from = "created";
+      for (const to of ["starting", "planning", "implementing"]) {
+        recordTransition(db, { id: `tr-lifecycle-${to}`, taskId: "t1", fromState: from, toState: to, actor: "tester" });
+        from = to;
+      }
+      assert.equal(db.prepare("SELECT state FROM tasks WHERE id = 't1'").get().state, "implementing");
+
+      const runId = await startRun("case 16");
+      const ask = await parkRequest(supervisor, harness, runId, {
+        requestId: "req-lifecycle",
+        toolName: "Bash",
+        description: "a real ask that should auto-block its task",
+        input: { command: "echo lifecycle" },
+      });
+      assert.equal(db.prepare("SELECT state FROM tasks WHERE id = 't1'").get().state, "blocked",
+        "an open ask on an implementing task's run must auto-block the task");
+
+      const answered = await supervisor.answerAsk(ask.askId, { allow: true, answeredBy: "operator" });
+      assert.equal(answered.delivered, true);
+      assert.equal(db.prepare("SELECT state FROM tasks WHERE id = 't1'").get().state, "implementing",
+        "answering the LAST open ask must auto-unblock the task back to implementing");
+      console.log("  16. an open ask auto-blocks its implementing task, and answering the last one auto-unblocks it");
     }
   } finally {
     if (supervisor) await supervisor.shutdown({ timeoutMs: 4000 }).catch(() => {});

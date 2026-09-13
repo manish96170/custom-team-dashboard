@@ -37,15 +37,38 @@ export const CONFIG_FILENAME = "harness-defaults.json";
  * way the design says before anyone configures anything. If they change there, change them here.
  */
 export const BUILT_IN_DEFAULTS = Object.freeze({
-  coder: Object.freeze({ harnessId: "claude-code", model: "sonnet", effort: "medium" }),
-  reviewer1: Object.freeze({ harnessId: "claude-code", model: "sonnet", effort: "medium" }),
-  reviewer2: Object.freeze({ harnessId: "opencode", model: "gpt-5.6", effort: "medium" }),
-  parentReviewer: Object.freeze({ harnessId: "claude-code", model: "opus", effort: "high" }),
-  cto: Object.freeze({ harnessId: "claude-code", model: "haiku", effort: "low" }),
+  coder: Object.freeze({ harnessId: "claude-code", model: "sonnet", effort: "medium", clearPolicy: "on-state-transition" }),
+  reviewer1: Object.freeze({ harnessId: "claude-code", model: "sonnet", effort: "medium", clearPolicy: "per-review-round" }),
+  reviewer2: Object.freeze({ harnessId: "opencode", model: "gpt-5.6", effort: "medium", clearPolicy: "per-review-round" }),
+  parentReviewer: Object.freeze({ harnessId: "claude-code", model: "opus", effort: "high", clearPolicy: "per-review-round" }),
+  cto: Object.freeze({ harnessId: "claude-code", model: "haiku", effort: "low", clearPolicy: "on-demand" }),
+  // PLAN.md §16.2, the utility-task lane, added 2026-09-11: narrow, do-and-forget adhoc roles. Cheap
+  // model on purpose — Rule 6/7's "cheap and mostly deterministic" pushed further than the CTO, because
+  // the job itself is mechanical (a git push, a scoped Jira/AWS/Slack call), not because the role is
+  // less important. Escalate per-run via the assignment override, same as any other role, if a specific
+  // job genuinely needs more. `clearPolicy: "always"` matches PLAN.md §8 Rule 5's own worked example —
+  // "one operation per invocation, state in its journal," so there is no second turn to clear between.
+  "git-push-runner": Object.freeze({ harnessId: "claude-code", model: "haiku", effort: "low", clearPolicy: "always" }),
+  "jira-runner": Object.freeze({ harnessId: "claude-code", model: "haiku", effort: "low", clearPolicy: "always" }),
+  "awsquery-runner": Object.freeze({ harnessId: "claude-code", model: "haiku", effort: "low", clearPolicy: "always" }),
+  "slack-runner": Object.freeze({ harnessId: "claude-code", model: "haiku", effort: "low", clearPolicy: "always" }),
 });
 
 /** The keys a role assignment may carry. Anything else in the file is a typo worth reporting. */
-const ASSIGNMENT_KEYS = Object.freeze(["harnessId", "model", "effort"]);
+const ASSIGNMENT_KEYS = Object.freeze(["harnessId", "model", "effort", "clearPolicy"]);
+
+/**
+ * PLAN.md §8 Rule 5's own vocabulary, verbatim — the four shapes "clearing becomes routine" comes in.
+ *
+ * SCHEMA ONLY, added 2026-09-13 as Phase 8's first step (schema before behavior, same dependency
+ * order item 9's leases/MCP-pooling work already used). Nothing reads `clearPolicy` yet to actually
+ * call `clearContext()` at the right moment — no `domain/clear-policy.js` decision module exists.
+ * This is just the closed vocabulary a config file (or an assignment override) is allowed to name,
+ * validated below so a typo fails loudly instead of silently doing nothing (this file's own stated
+ * rule: "A MALFORMED file THROWS"). Building the decision module that actually fires on this policy
+ * is Phase 8's next step, not this one.
+ */
+export const CLEAR_POLICIES = Object.freeze(["on-state-transition", "per-review-round", "on-demand", "always"]);
 
 /**
  * Load and validate the file. Returns `{ global, perTeam, source, path }`.
@@ -142,6 +165,15 @@ function validateRoleMap(roles, where) {
     }
     if (spec.harnessId !== undefined && typeof spec.harnessId !== "string") {
       throw new Error(`${CONFIG_FILENAME}: "${where}.${role}.harnessId" must be a string`);
+    }
+    if (spec.clearPolicy !== undefined && !CLEAR_POLICIES.includes(spec.clearPolicy)) {
+      // `clearPolicy` was accepted as a known KEY above (`ASSIGNMENT_KEYS`) but its VALUE was never
+      // checked against the vocabulary it's supposed to be drawn from — a typo (`"clearPolicy":
+      // "on-demandd"`) passed silently, which is exactly the "malformed file throws" rule this file
+      // states as a design principle for every OTHER field.
+      throw new Error(
+        `${CONFIG_FILENAME}: "${where}.${role}.clearPolicy" must be one of ${CLEAR_POLICIES.join(", ")}, got ${JSON.stringify(spec.clearPolicy)}`,
+      );
     }
     out[role] = { ...spec };
   }

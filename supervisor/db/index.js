@@ -48,8 +48,9 @@ export function enforceFilePermissions(dbPath) {
 
 /** Synchronous sleep. better-sqlite3 is synchronous, so there is no event loop turn to
  * yield to here -- Atomics.wait on a throwaway buffer is the only way to actually wait
- * without busy-spinning the CPU. */
-function sleepSync(ms) {
+ * without busy-spinning the CPU. Exported so `createTaskWorktree`'s cross-process claim
+ * retry loop (`runtime/supervisor.js`) can reuse it rather than a second implementation. */
+export function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
@@ -107,21 +108,30 @@ export function openDb(opts = {}) {
     throw new Error(`busyTimeoutMs must be a non-negative integer, got ${JSON.stringify(opts.busyTimeoutMs)}`);
   }
   const db = new Database(dbPath);
-  db.pragma(`busy_timeout = ${busyTimeoutMs}`);
-  setWalMode(db, busyTimeoutMs);
-  db.pragma("foreign_keys = ON");
+  // Everything below can throw (a corrupt file, a bad migration, a permissions error) — and until this
+  // was closed on that path, `db` had already opened a real file handle that nothing then closed, an
+  // fd leak on every failed open. Close it before rethrowing; the ORIGINAL error is what the caller
+  // needs to see, so a failure closing an already-broken handle is swallowed, not layered on top.
+  try {
+    db.pragma(`busy_timeout = ${busyTimeoutMs}`);
+    setWalMode(db, busyTimeoutMs);
+    db.pragma("foreign_keys = ON");
 
-  enforceFilePermissions(dbPath);
+    enforceFilePermissions(dbPath);
 
-  const migrationResult = applyMigrations(db);
+    const migrationResult = applyMigrations(db);
 
-  // WAL/SHM sidecars may have just been created by the migration's writes.
-  enforceFilePermissions(dbPath);
+    // WAL/SHM sidecars may have just been created by the migration's writes.
+    enforceFilePermissions(dbPath);
 
-  db.__dbPath = dbPath;
-  db.__stateDir = stateDir;
-  db.__migrationResult = migrationResult;
-  return db;
+    db.__dbPath = dbPath;
+    db.__stateDir = stateDir;
+    db.__migrationResult = migrationResult;
+    return db;
+  } catch (err) {
+    try { db.close(); } catch { /* best effort -- the original error is what matters */ }
+    throw err;
+  }
 }
 
 export function closeDb(db) {
@@ -260,11 +270,27 @@ export function createRun(db, r) {
  */
 export function endRun(db, runId, { endedAt, exitReason, reapedAt } = {}) {
   const ts = endedAt ?? nowIso();
-  const info = db.prepare(
-    `UPDATE runs SET ended_at = ?, exit_reason = ?, reaped_at = COALESCE(?, reaped_at)
-       WHERE run_id = ? AND ended_at IS NULL`,
-  ).run(ts, exitReason ?? null, reapedAt ?? null, runId);
-  return info.changes;
+  // Closing the run row and releasing its leases are now ONE transaction, not two separate statements —
+  // a process death or a thrown error between them used to leave an ended run with its leases still
+  // held, recoverable only by the TTL sweep, and a retried `endRun` on the already-closed row would skip
+  // the release forever (the guard below only fires when THIS call is the one that changes the row).
+  // Codex review (`codexdoc/review-phase7-uncommitted.md` finding 6, `codexdoc/REVIEW-NOTES.md` finding
+  // 13's related note), fixed 2026-09-11.
+  const tx = db.transaction(() => {
+    const info = db.prepare(
+      `UPDATE runs SET ended_at = ?, exit_reason = ?, reaped_at = COALESCE(?, reaped_at)
+         WHERE run_id = ? AND ended_at IS NULL`,
+    ).run(ts, exitReason ?? null, reapedAt ?? null, runId);
+    // A lease is arbitration between COOPERATING sessions (PLAN.md §20.4) — a run that ended, however it
+    // ended, is no longer cooperating, so anything it held must not survive it. Only the writer that
+    // actually closed the row releases leases, matching `endRun`'s own first-writer-wins rule above: a
+    // second, rejected call must not release leases a still-open run is relying on. If this throws, the
+    // whole transaction (including the UPDATE above) rolls back — the run stays open rather than ending
+    // with its leases silently orphaned.
+    if (info.changes === 1) releaseLeasesForRun(db, runId, { now: ts, reason: exitReason ?? "run-ended" });
+    return info.changes;
+  });
+  return tx.immediate();
 }
 
 /**
@@ -505,6 +531,113 @@ export function taskIdForRun(db, runId) {
 }
 
 /**
+ * Which worker a run belongs to, or null if the run doesn't exist. Same join shape as `taskIdForRun`,
+ * added 2026-09-11 so `acquireLease`/`requestWorktree` can bind a caller-supplied `runId` to the
+ * AUTHENTICATED principal's own worker identity — closing the impersonation gap
+ * `codexdoc/review-phase7-uncommitted.md` finding 4 describes (a worker-A token acting on worker-B's
+ * run). Same "identity is a registry fact, not a request field" reasoning already applied to
+ * `recordVerdict` (`runtime/supervisor.js`).
+ */
+export function workerIdForRun(db, runId) {
+  const row = db.prepare(`SELECT worker_id FROM runs WHERE run_id = ?`).get(runId);
+  return row?.worker_id ?? null;
+}
+
+/** The marker `createTaskWorktree` claims a task's worktree slot with before running any git command —
+ *  a real path is never valid JSON-free text starting with this prefix, so it can't be confused with one. */
+export const WORKTREE_CLAIM_PENDING = " pending-worktree-claim ";
+
+/**
+ * Claim a task's worktree slot with a compare-and-swap, atomically inside `BEGIN IMMEDIATE` — the
+ * cross-process race `codexdoc/review-phase7-uncommitted.md` finding 2 describes: two processes both
+ * reading `worktree_id = NULL` for the same task and both proceeding to run `git worktree add`. Same
+ * "reserve with a status marker, only the winner does the real work" pattern already proven for
+ * `claimPoolSlot` (`mcp-pool.js`'s manager).
+ *
+ * `previousValue` is whatever the caller last read `tasks.worktree_id` as (NULL, a stale nonexistent
+ * path, or `WORKTREE_CLAIM_PENDING` from someone else's in-flight claim it's now retrying past) — the
+ * claim succeeds only if the column STILL holds that exact value, so a caller whose view is already
+ * stale never overwrites a claim (or a real result) it didn't know about.
+ *
+ * `repoPath`/`branch` are recorded on the row AT CLAIM TIME, not just at finalize (migration 0014,
+ * `codexdoc/review-luna-2026-09-11.md` finding 5) — so a second caller naming a different repo/branch
+ * for the same task can be refused while the FIRST caller's claim is still pending, not only once it
+ * has already finalized.
+ */
+export function claimTaskWorktreeSlot(db, taskId, { previousValue, repoPath, branch, now } = {}) {
+  const ts = now ?? nowIso();
+  const tx = db.transaction(() => {
+    const row = db.prepare(`SELECT worktree_id FROM tasks WHERE id = ?`).get(taskId);
+    if (!row) return { claimed: false, reason: "no-such-task" };
+    if (row.worktree_id !== (previousValue ?? null)) {
+      return { claimed: false, currentValue: row.worktree_id };
+    }
+    // review-sol-2026-09-13.md finding 9: a fresh, unguessable token identifies THIS claim specifically
+    // — required by finalize/release below, so a stale claimant reclaimed out from under (see
+    // `reclaimStaleTaskWorktreeClaim`) can never resolve a claim that is no longer its own, even though
+    // the pending marker text itself is unchanged.
+    const claimToken = crypto.randomUUID();
+    db.prepare(
+      `UPDATE tasks SET worktree_id = ?, branch = ?, worktree_repo_path = ?, worktree_claim_token = ?, updated_at = ? WHERE id = ?`,
+    ).run(WORKTREE_CLAIM_PENDING, branch ?? null, repoPath ?? null, claimToken, ts, taskId);
+    return { claimed: true, claimToken };
+  });
+  return tx.immediate();
+}
+
+/** Finalize a claimed worktree slot with the real path/branch — gated on the pending marker AND the
+ *  exact claim token still matching, so a caller can never clobber a result it didn't itself just claim
+ *  (including one reclaimed out from under it as stale — finding 9, above). */
+export function finalizeTaskWorktreeSlot(db, taskId, { worktreeId, branch, repoPath, claimToken, now } = {}) {
+  const ts = now ?? nowIso();
+  const info = db.prepare(
+    `UPDATE tasks SET worktree_id = ?, branch = ?, worktree_repo_path = ?, worktree_claim_token = NULL, updated_at = ? WHERE id = ? AND worktree_id = ? AND worktree_claim_token = ?`,
+  ).run(worktreeId, branch, repoPath ?? null, ts, taskId, WORKTREE_CLAIM_PENDING, claimToken ?? null);
+  return { finalized: info.changes === 1 };
+}
+
+/** Release a claim without finalizing it — the git side failed, so the slot must go back to open
+ *  (`previousValue`) rather than being stuck on the pending marker forever. Same token gate as
+ *  `finalizeTaskWorktreeSlot` (finding 9). */
+export function releaseTaskWorktreeClaim(db, taskId, { previousValue, previousBranch, previousRepoPath, claimToken, now } = {}) {
+  const ts = now ?? nowIso();
+  const info = db.prepare(
+    `UPDATE tasks SET worktree_id = ?, branch = ?, worktree_repo_path = ?, worktree_claim_token = NULL, updated_at = ? WHERE id = ? AND worktree_id = ? AND worktree_claim_token = ?`,
+  ).run(previousValue ?? null, previousBranch ?? null, previousRepoPath ?? null, ts, taskId, WORKTREE_CLAIM_PENDING, claimToken ?? null);
+  return { released: info.changes === 1 };
+}
+
+/**
+ * Reclaim a PENDING worktree claim that has sat unfinalized for longer than `staleBeforeIso` — the
+ * crashed-creator deadlock `codexdoc/review-luna-2026-09-11.md` finding 6 describes: the winning CAS
+ * caller died after `claimTaskWorktreeSlot` and before `finalizeTaskWorktreeSlot`/
+ * `releaseTaskWorktreeClaim`, so every later caller polled `worktree-claim-pending` forever with no
+ * recovery path. Atomic inside `BEGIN IMMEDIATE`, same pattern as the claim itself: only refreshes
+ * `updated_at` (the claim marker itself is untouched) so a second, concurrent reclaimer's own read
+ * lands on a freshly-stamped row and correctly refuses as "not stale" rather than double-reclaiming.
+ * The caller that wins this still has to decide, by inspecting the filesystem, whether the dead
+ * claimant already finished the real git work before it died — this function only re-opens the door.
+ */
+export function reclaimStaleTaskWorktreeClaim(db, taskId, { staleBeforeIso, now } = {}) {
+  const ts = now ?? nowIso();
+  const tx = db.transaction(() => {
+    const row = db.prepare(`SELECT worktree_id, updated_at FROM tasks WHERE id = ?`).get(taskId);
+    if (!row) return { reclaimed: false, reason: "no-such-task" };
+    if (row.worktree_id !== WORKTREE_CLAIM_PENDING) return { reclaimed: false, reason: "not-pending" };
+    if (row.updated_at >= staleBeforeIso) return { reclaimed: false, reason: "not-stale" };
+    // review-sol-2026-09-13.md finding 9: mint a NEW claim token here, replacing whatever the original
+    // (presumed-dead) claimant held. That original claimant, if it was only slow rather than actually
+    // dead and wakes up later to call `finalizeTaskWorktreeSlot`/`releaseTaskWorktreeClaim` with ITS OLD
+    // token, now fails the exact-token match instead of silently resolving a claim that is no longer
+    // its own — the reclaimer below is the only party that can finalize or release from this point on.
+    const claimToken = crypto.randomUUID();
+    db.prepare(`UPDATE tasks SET worktree_claim_token = ?, updated_at = ? WHERE id = ?`).run(claimToken, ts, taskId);
+    return { reclaimed: true, claimToken };
+  });
+  return tx.immediate();
+}
+
+/**
  * Every run the database still believes is in flight. This is reconciliation's input set
  * on boot: `ended_at IS NULL` means no terminal path (adapter completion, stop, or a
  * previous reconciliation) ever closed it.
@@ -611,13 +744,31 @@ export function deletePreflightRun(db, runId) {
     const events = db.prepare(`DELETE FROM event_log WHERE run_id = ?`).run(runId).changes;
     const asks = db.prepare(`DELETE FROM asks WHERE run_id = ?`).run(runId).changes;
     const sightings = db.prepare(`DELETE FROM orphan_sightings WHERE run_id = ?`).run(runId).changes;
+    // review-sol-2026-09-13.md finding 20: migrations 0011/0013 added FOREIGN KEY references to
+    // `runs(run_id)` from `resource_leases.holder_run_id` and `mcp_pool_attachments.run_id` — neither
+    // existed when this function was written, and neither had an `ON DELETE` action, so a preflight run
+    // that had ever acquired a lease or attached to a pooled MCP server (released/detached or not —
+    // the historical row's FK reference remains either way) made the `DELETE FROM runs` below fail with
+    // a real `FOREIGN KEY constraint failed` (reproduced). This is a full purge of a probe run, the same
+    // as `event_log`/`asks`/`orphan_sightings` above — its lease/attachment history has no meaning to
+    // keep once the run itself is gone, so it is deleted outright too, not nulled.
     // NOT `transition_journal`: it is keyed by `task_id`, not `run_id` — it records TASK state
     // changes, and a preflight has no task. An earlier draft deleted from it by `run_id` and failed
     // with "no such column", which was the schema refusing a delete that would have been wrong even
     // if it had parsed: task history does not belong to a run.
+    // review-sol-2026-09-13.md finding 20: migrations 0011/0013 added FOREIGN KEY references to
+    // `runs(run_id)` from `resource_leases.holder_run_id` and `mcp_pool_attachments.run_id` — neither
+    // existed when this function was written, and neither had an `ON DELETE` action, so a preflight run
+    // that had ever acquired a lease or attached to a pooled MCP server (released/detached or not —
+    // the historical row's FK reference remains either way) made the `DELETE FROM runs` below fail with
+    // a real `FOREIGN KEY constraint failed` (reproduced). This is a full purge of a probe run, the same
+    // as `event_log`/`asks`/`orphan_sightings` above — its lease/attachment history has no meaning to
+    // keep once the run itself is gone, so it is deleted outright too, not nulled.
+    const leases = db.prepare(`DELETE FROM resource_leases WHERE holder_run_id = ?`).run(runId).changes;
+    const mcpAttachments = db.prepare(`DELETE FROM mcp_pool_attachments WHERE run_id = ?`).run(runId).changes;
     const runs = db.prepare(`DELETE FROM runs WHERE run_id = ? AND is_preflight = 1`).run(runId).changes;
     if (runs !== 1) throw new Error(`expected to delete exactly 1 run row for ${runId}, deleted ${runs}`);
-    return { deleted: true, events, asks, sightings };
+    return { deleted: true, events, asks, sightings, leases, mcpAttachments };
   });
   return tx();
 }
@@ -804,10 +955,20 @@ export function reconcileRun(db, runId, { exitReason, at } = {}) {
     );
   }
   const ts = at ?? nowIso();
-  const info = db.prepare(
-    `UPDATE runs SET ended_at = ?, exit_reason = ?, reconciled_at = ? WHERE run_id = ? AND ended_at IS NULL`,
-  ).run(ts, exitReason, ts, runId);
-  return info.changes;
+  // Same lease-release treatment as `endRun` (added 2026-09-11, both codex reviews' finding 9/13): this
+  // path closes a run's `asks` (see `closeOpenAsksForRun` below) but was not releasing its leases, so a
+  // run reconciled to `lost` while holding an unexpired lease left it held until the TTL sweep — a
+  // bounded availability gap, not an exclusivity break, but the same "a run that ended is no longer
+  // cooperating" reasoning applies. `reconciled_at` semantics are unchanged; only the lease cleanup is
+  // new, and only for the writer that actually closes the row, matching `endRun`'s own guard.
+  const tx = db.transaction(() => {
+    const info = db.prepare(
+      `UPDATE runs SET ended_at = ?, exit_reason = ?, reconciled_at = ? WHERE run_id = ? AND ended_at IS NULL`,
+    ).run(ts, exitReason, ts, runId);
+    if (info.changes === 1) releaseLeasesForRun(db, runId, { now: ts, reason: exitReason });
+    return info.changes;
+  });
+  return tx.immediate();
 }
 
 /**
@@ -1624,4 +1785,435 @@ export function consumeSensitiveApproval(db, id) {
   const info = db.prepare(`UPDATE sensitive_approvals SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL`)
     .run(nowIso(), id);
   return { consumed: info.changes === 1 };
+}
+
+// ── resource leases (PLAN.md section 20, migration 0011/0012) ─────────────────────────────
+
+/**
+ * Default lease TTL. Deliberately short relative to `ASK_AUTO_CLOSE_GRACE_MS` (5 min): a lease
+ * protects a machine-wide resource other cooperating sessions are BLOCKED on, so a SIGKILLed
+ * holder should free it for the next waiter quickly, not sit stale for the same grace period a
+ * human's unanswered ask gets. A live holder renews via `renewLeaseRow` well before this elapses.
+ */
+export const DEFAULT_LEASE_TTL_MS = 2 * 60 * 1000;
+
+/**
+ * Documented maximum lease TTL — 30 minutes. A lease exists to arbitrate a machine-wide resource
+ * OTHER cooperating sessions are blocked on (§20.1); an unbounded or hours-long TTL defeats the
+ * "SIGKILLed holder frees it quickly" property `DEFAULT_LEASE_TTL_MS`'s own docstring describes, by
+ * letting a caller opt out of it entirely. 15x the default: generous for a genuinely long-running
+ * heavy job, still bounded.
+ */
+export const MAX_LEASE_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * A finite positive integer within the documented bound, or a thrown, named reason. Shared by
+ * `tryAcquireLease` and `renewLeaseRow` so the two primitives cannot silently drift on what counts as
+ * valid — found as a gap in both independently (`codexdoc/review-luna-2026-09-11.md` finding 5,
+ * `codexdoc/review-phase7-uncommitted.md` finding 7), fixed 2026-09-11. A negative or zero `ttlMs`
+ * used to return `granted: true` for a lease that was already expired the instant it was inserted —
+ * `ok: true` with no actual protection.
+ */
+function validateTtlMs(ttlMs, fnName) {
+  if (ttlMs === undefined) return; // caller gets DEFAULT_LEASE_TTL_MS
+  if (!Number.isInteger(ttlMs) || ttlMs <= 0) {
+    throw new Error(`${fnName}: ttlMs must be a positive integer, got ${JSON.stringify(ttlMs)}`);
+  }
+  if (ttlMs > MAX_LEASE_TTL_MS) {
+    throw new Error(`${fnName}: ttlMs ${ttlMs} exceeds the maximum of ${MAX_LEASE_TTL_MS}ms (30 minutes)`);
+  }
+}
+
+/**
+ * Claim a lease on a machine-wide resource, or refuse and say who holds it.
+ *
+ * `BEGIN IMMEDIATE`, the same reasoning `db/migrate.js` already uses for its own schema-version
+ * race: the write lock must be taken BEFORE counting current holders, or two processes (or two
+ * connections) can both count "capacity not reached" and both insert. A plain `db.transaction()`
+ * (`BEGIN DEFERRED`) only escalates to a write lock at the first write, which is too late for a
+ * check-then-insert — the count already happened as a read. `.immediate()` takes it up front.
+ *
+ * `ttl_expires_at >= now` in the holder count is what keeps a stale (TTL-expired but unswept) row
+ * from blocking a new acquire even before the sweep has run — the sweep is a cleanup convenience,
+ * not what acquisition depends on for correctness.
+ *
+ * The expiry TIMESTAMP is computed INSIDE the transaction (below), not before it — fixed 2026-09-11
+ * (review finding 5's second half). Computing it before `.immediate()` meant time spent WAITING for
+ * the write lock silently ate into a short TTL before the row was even inserted; a caller asking for
+ * a 5-second lease could receive one already partway expired if the lock was briefly contended. `now`
+ * (an explicit override, used by tests for determinism) still bypasses this — it's only the real-clock
+ * default that moves.
+ */
+export function tryAcquireLease(db, {
+  resourceName, kind, capacity = null, holderPrincipalId, holderRunId = null, reason = null, ttlMs, now,
+} = {}) {
+  if (!resourceName) throw new Error("tryAcquireLease: resourceName is required");
+  if (kind !== "exclusive" && kind !== "counted") {
+    throw new Error(`tryAcquireLease: kind must be "exclusive" or "counted", got ${JSON.stringify(kind)}`);
+  }
+  if (!holderPrincipalId) throw new Error("tryAcquireLease: holderPrincipalId is required");
+  if (kind === "counted" && !(Number.isInteger(capacity) && capacity > 0)) {
+    throw new Error("tryAcquireLease: capacity must be a positive integer for a counted resource");
+  }
+  validateTtlMs(ttlMs, "tryAcquireLease");
+  const limit = kind === "exclusive" ? 1 : capacity;
+
+  const tx = db.transaction(() => {
+    const ts = now ?? nowIso();
+    const ttlExpiresAt = new Date(new Date(ts).getTime() + (ttlMs ?? DEFAULT_LEASE_TTL_MS)).toISOString();
+    // A lease bound to a run that has ALREADY ended is a claim nobody can be holding for a live purpose —
+    // `endRun`/`reconcileRun` release a run's leases on close, but only the leases that existed AT that
+    // moment; a later acquire naming an already-closed run would create a claim `endRun` will never come
+    // back to release; only the TTL sweep would ever clear it. Checked inside this same transaction so it
+    // is consistent with the capacity count above, not a separate racy pre-read. Codex review
+    // (`codexdoc/review-phase7-uncommitted.md` finding 5), fixed 2026-09-11.
+    if (holderRunId) {
+      const run = db.prepare(`SELECT ended_at FROM runs WHERE run_id = ?`).get(holderRunId);
+      if (run && run.ended_at !== null) {
+        return { granted: false, refused: `holderRunId ${holderRunId} has already ended; a lease cannot be acquired for it` };
+      }
+    }
+    const active = db.prepare(
+      `SELECT id, kind, capacity, holder_principal_id, holder_run_id, reason, acquired_at
+         FROM resource_leases
+        WHERE resource_name = ? AND released_at IS NULL AND ttl_expires_at >= ?
+        ORDER BY acquired_at`,
+    ).all(resourceName, ts);
+    // review-sol-2026-09-13.md finding 11: `limit` above is derived from THIS call's own kind/capacity —
+    // with no check that active rows for the SAME resource were admitted under the same policy, a caller
+    // could acquire a "counted, capacity 3" lease for a resource that already has an ACTIVE exclusive
+    // holder (limit would be 3, active.length 1, so 1 < 3 admits it), defeating the exclusive holder's
+    // whole guarantee (reproduced: counted leases admitted alongside an active exclusive one). Refuse
+    // outright when any active row disagrees with this call's kind/capacity, before the count check.
+    const policyConflict = active.find((r) => r.kind !== kind || (r.capacity ?? null) !== (capacity ?? null));
+    if (policyConflict) {
+      return {
+        granted: false,
+        refused: `resource "${resourceName}" already has an active lease admitted as kind=${policyConflict.kind}`
+          + `${policyConflict.capacity != null ? `/capacity=${policyConflict.capacity}` : ""} — this request `
+          + `(kind=${kind}${capacity != null ? `/capacity=${capacity}` : ""}) disagrees; a resource's policy `
+          + "must be consistent across every active holder",
+        blockedBy: active.map((r) => ({
+          leaseId: r.id, principalId: r.holder_principal_id, runId: r.holder_run_id,
+          reason: r.reason, acquiredAt: r.acquired_at,
+        })),
+      };
+    }
+    if (active.length >= limit) {
+      return {
+        granted: false,
+        blockedBy: active.map((r) => ({
+          leaseId: r.id, principalId: r.holder_principal_id, runId: r.holder_run_id,
+          reason: r.reason, acquiredAt: r.acquired_at,
+        })),
+      };
+    }
+    const id = `lease-${crypto.randomUUID().slice(0, 12)}`;
+    db.prepare(
+      `INSERT INTO resource_leases
+         (id, resource_name, kind, capacity, holder_principal_id, holder_run_id, reason,
+          acquired_at, heartbeat_at, ttl_expires_at, released_at, release_reason)
+       VALUES (@id, @resource_name, @kind, @capacity, @holder_principal_id, @holder_run_id, @reason,
+               @acquired_at, @heartbeat_at, @ttl_expires_at, NULL, NULL)`,
+    ).run({
+      id, resource_name: resourceName, kind, capacity: kind === "counted" ? capacity : null,
+      holder_principal_id: holderPrincipalId, holder_run_id: holderRunId, reason,
+      acquired_at: ts, heartbeat_at: ts, ttl_expires_at: ttlExpiresAt,
+    });
+    return {
+      granted: true,
+      lease: {
+        id, resourceName, kind, capacity: kind === "counted" ? capacity : null,
+        holderPrincipalId, holderRunId, reason, acquiredAt: ts, heartbeatAt: ts, ttlExpiresAt,
+      },
+    };
+  });
+  return tx.immediate();
+}
+
+const leaseRow = (r) => (r
+  ? {
+    id: r.id, resourceName: r.resource_name, kind: r.kind, capacity: r.capacity,
+    holderPrincipalId: r.holder_principal_id, holderRunId: r.holder_run_id, reason: r.reason,
+    acquiredAt: r.acquired_at, heartbeatAt: r.heartbeat_at, ttlExpiresAt: r.ttl_expires_at,
+    releasedAt: r.released_at, releaseReason: r.release_reason,
+  }
+  : null);
+
+export function getLease(db, id) {
+  return leaseRow(db.prepare(`SELECT * FROM resource_leases WHERE id = ?`).get(id));
+}
+
+/** Release a live lease. Conditional UPDATE, same shape as `consumeSensitiveApproval` — the WHERE
+ *  clause is the whole mechanism, so a lease cannot be released twice by two concurrent callers. */
+export function releaseLeaseRow(db, id, { now, reason = "released" } = {}) {
+  const info = db.prepare(
+    `UPDATE resource_leases SET released_at = ?, release_reason = ? WHERE id = ? AND released_at IS NULL`,
+  ).run(now ?? nowIso(), reason, id);
+  return { released: info.changes === 1 };
+}
+
+/**
+ * Renew a live lease's heartbeat/TTL. Refuses (no-op) if already released, unknown, OR ALREADY EXPIRED.
+ *
+ * The expiry check is not redundant with `released_at IS NULL`: a lease whose TTL has passed but has not
+ * yet been swept is still `released_at IS NULL` (that is exactly the "unswept" state `tryAcquireLease`'s
+ * own capacity count already treats as free for a NEW holder to claim). Renewing by ID with only the
+ * `released_at` guard could therefore resurrect a lease the resource has already re-granted to someone
+ * else, producing two live exclusive holders — reproduced independently by both codex reviews
+ * (`codexdoc/review-phase7-uncommitted.md` finding 1, `codexdoc/REVIEW-NOTES.md` finding 1), fixed
+ * 2026-09-11. An expired lease is never revived by ID; the caller has lost the resource and must go
+ * through `tryAcquireLease`'s normal admission control like anyone else.
+ */
+/**
+ * review-sol-2026-09-13.md finding 10: `ts` used to be computed BEFORE the UPDATE ran. If this
+ * statement had to wait behind another writer's transaction (SQLite's busy handler), real wall-clock
+ * time could advance past the lease's `ttl_expires_at` DURING that wait — but the WHERE clause still
+ * compared against the stale, pre-wait `ts`, so an already-expired lease could be renewed anyway
+ * (reproduced: a 300ms lease renewed successfully more than 500ms after it expired, once the write was
+ * made to wait). Fixed by computing `ts`/`ttlExpiresAt` INSIDE a `BEGIN IMMEDIATE` transaction, so the
+ * write lock is held before "now" is read — the same fix `db/migrate.js`'s own schema-version race and
+ * `claimPoolSlot`/`tryAcquireLease` already use for exactly this class of check-then-write gap.
+ */
+export function renewLeaseRow(db, id, { ttlMs, now } = {}) {
+  validateTtlMs(ttlMs, "renewLeaseRow");
+  const tx = db.transaction(() => {
+    const ts = now ?? nowIso();
+    const ttlExpiresAt = new Date(new Date(ts).getTime() + (ttlMs ?? DEFAULT_LEASE_TTL_MS)).toISOString();
+    const info = db.prepare(
+      `UPDATE resource_leases SET heartbeat_at = ?, ttl_expires_at = ?
+        WHERE id = ? AND released_at IS NULL AND ttl_expires_at >= ?`,
+    ).run(ts, ttlExpiresAt, id, ts);
+    return { renewed: info.changes === 1, heartbeatAt: ts, ttlExpiresAt };
+  });
+  return tx.immediate();
+}
+
+/**
+ * Release every live lease a run still holds. Wired into both `endRun` and `reconcileRun` above, each
+ * in the SAME transaction as the terminal write (not a separate call after) — a run that ended, however
+ * it ended, is no longer cooperating (PLAN.md §20.4), and only the writer that actually closed the row
+ * releases leases, matching each caller's own first-writer-wins guard.
+ */
+export function releaseLeasesForRun(db, runId, { now, reason = "run-ended" } = {}) {
+  const info = db.prepare(
+    `UPDATE resource_leases SET released_at = ?, release_reason = ? WHERE holder_run_id = ? AND released_at IS NULL`,
+  ).run(now ?? nowIso(), reason, runId);
+  return { released: info.changes };
+}
+
+/**
+ * Close every lease whose TTL has expired without a renewal. Idempotent, safe from anywhere — same
+ * pattern as `sweepExpiredAsks`: a SIGKILLed holder must not deadlock every future waiter, and the
+ * deadline is persisted precisely so a crash mid-lease does not strand it. `release_reason =
+ * 'expired-swept'` (migration 0012) distinguishes this from a holder's own `releaseLeaseRow` call —
+ * the same distinction `asks.answered_by = 'supervisor:auto-close'` already makes for asks.
+ */
+export function sweepExpiredLeases(db, { now } = {}) {
+  const ts = now ?? nowIso();
+  const info = db.prepare(
+    `UPDATE resource_leases
+        SET released_at = ?, release_reason = 'expired-swept'
+      WHERE released_at IS NULL AND ttl_expires_at < ?`,
+  ).run(ts, ts);
+  return info.changes;
+}
+
+/** Every currently-held lease for a resource, oldest first — the same query `tryAcquireLease` runs. */
+export function listActiveLeases(db, resourceName, { now } = {}) {
+  const ts = now ?? nowIso();
+  return db.prepare(
+    `SELECT * FROM resource_leases WHERE resource_name = ? AND released_at IS NULL AND ttl_expires_at >= ? ORDER BY acquired_at`,
+  ).all(resourceName, ts).map(leaseRow);
+}
+
+// ---------------------------------------------------------------------------
+// MCP server pooling (PLAN.md §21.1, migrations 0011/0013). The primitives here are pure DB
+// operations; process spawning/health/teardown live in `runtime/mcp-pool.js`, the same split
+// `runtime/spawn.js` already keeps from `db/index.js`'s run rows.
+// ---------------------------------------------------------------------------
+
+const poolRow = (r) => (r
+  ? {
+    id: r.id, name: r.name, configHash: r.config_hash, pid: r.pid, pgid: r.pgid, lstart: r.lstart,
+    socketPath: r.socket_path, status: r.status, startedAt: r.started_at, lastAttachedAt: r.last_attached_at,
+  }
+  : null);
+
+/** How many live (undetached) attachments a pool row has right now — the authoritative refcount,
+ *  derived from attachment rows rather than trusted from a bare integer (see migration 0013's header
+ *  for why: a crash between "decided" and "incremented" leaves a bare integer nobody can reconstruct). */
+function liveAttachmentCount(db, poolId) {
+  return db.prepare(`SELECT COUNT(*) AS n FROM mcp_pool_attachments WHERE pool_id = ? AND detached_at IS NULL`).get(poolId).n;
+}
+
+/**
+ * Claim the (name, configHash) slot for spawning, or report that someone already has — atomically.
+ *
+ * The unique index on (name, config_hash) makes a genuinely-concurrent double-insert impossible at the
+ * DB level; this makes the BUSINESS decision ("is there already a spawner for this identity") match it,
+ * inside one `BEGIN IMMEDIATE` transaction so the check and the insert cannot interleave with another
+ * caller's. Returns `{ claimed: true, pool }` for the caller that must now actually spawn the process,
+ * or `{ claimed: false, pool }` naming the existing row (which may be `starting`, `ready`, `draining`,
+ * `stopped` or `failed` — the caller decides what to do with each, see `runtime/mcp-pool.js`'s `attach()`).
+ */
+export function claimPoolSlot(db, { name, configHash, now } = {}) {
+  if (!name) throw new Error("claimPoolSlot: name is required");
+  if (!configHash) throw new Error("claimPoolSlot: configHash is required");
+  const ts = now ?? nowIso();
+  const tx = db.transaction(() => {
+    const existing = poolRow(db.prepare(`SELECT * FROM mcp_pool WHERE name = ? AND config_hash = ?`).get(name, configHash));
+    if (!existing) {
+      const id = `mcp-${crypto.randomUUID().slice(0, 12)}`;
+      db.prepare(
+        `INSERT INTO mcp_pool (id, name, config_hash, pid, socket_path, refcount, started_at, last_attached_at, status, pgid)
+         VALUES (?, ?, ?, NULL, NULL, 0, ?, NULL, 'starting', NULL)`,
+      ).run(id, name, configHash, ts);
+      return { claimed: true, pool: poolRow(db.prepare(`SELECT * FROM mcp_pool WHERE id = ?`).get(id)) };
+    }
+    if (existing.status === "stopped" || existing.status === "failed") {
+      // RESURRECT the same row rather than inserting a new one — the unique index is on
+      // (name, config_hash), which is identity, not lifetime, so a config that already spawned once
+      // must reuse its row to spawn again. The conditional UPDATE is the claim: only the caller whose
+      // UPDATE actually changes the row won the resurrection race; a `changes === 0` here means someone
+      // else's resurrection committed first, and this caller falls through to `claimed: false` below
+      // exactly like the already-active case, so `attach()`'s retry loop treats both the same way.
+      const claimed = db.prepare(
+        `UPDATE mcp_pool SET status = 'starting', pid = NULL, pgid = NULL, lstart = NULL, socket_path = NULL WHERE id = ? AND status IN ('stopped', 'failed')`,
+      ).run(existing.id);
+      if (claimed.changes === 1) return { claimed: true, pool: poolRow(db.prepare(`SELECT * FROM mcp_pool WHERE id = ?`).get(existing.id)) };
+    }
+    return { claimed: false, pool: poolRow(db.prepare(`SELECT * FROM mcp_pool WHERE id = ?`).get(existing.id)) };
+  });
+  return tx.immediate();
+}
+
+/** The spawner reports back once the process is actually up (or has failed to start). `lstart` is the
+ *  pid-reuse guard boot reconciliation needs — same reasoning as `runs.proc_lstart` (migration 0002). */
+export function markPoolReady(db, id, { pid, pgid, lstart, socketPath } = {}) {
+  const info = db.prepare(
+    `UPDATE mcp_pool SET status = 'ready', pid = ?, pgid = ?, lstart = ?, socket_path = ? WHERE id = ? AND status = 'starting'`,
+  ).run(pid, pgid ?? null, lstart ?? null, socketPath ?? null, id);
+  return { updated: info.changes === 1 };
+}
+
+/**
+ * Mark a pool row `failed`, and atomically close every live attachment against THAT generation of the
+ * row in the SAME transaction — never a separate call after. Before this fix, the exit handler / boot
+ * reconciliation marked the pool `failed` but left its attachment rows with `detached_at IS NULL`, so a
+ * later `attach()` could resurrect the SAME pool row (`claimPoolSlot`'s resurrection path), add a NEW
+ * attachment, and have the replacement process's own `detach()` see the OLD stale attachment still
+ * "live" — `liveAttachmentCount` never reaches 0, so `shouldTeardown` never fires, leaking the
+ * replacement process forever. Found in review (`codexdoc/review-luna-2026-09-11.md` finding 3),
+ * confirmed by reproduction before this fix, fixed 2026-09-11. One transaction, matching this
+ * codebase's own "terminal write and cleanup together, not two commits a crash can split" rule already
+ * applied to `endRun`/leases.
+ */
+export function markPoolFailed(db, id) {
+  const tx = db.transaction(() => {
+    const info = db.prepare(`UPDATE mcp_pool SET status = 'failed' WHERE id = ? AND status IN ('starting', 'ready')`).run(id);
+    const closed = db.prepare(
+      `UPDATE mcp_pool_attachments SET detached_at = ? WHERE pool_id = ? AND detached_at IS NULL`,
+    ).run(nowIso(), id);
+    return { updated: info.changes === 1, attachmentsClosed: closed.changes };
+  });
+  return tx.immediate();
+}
+
+/**
+ * Join an existing pool row, OR discover it is not joinable — atomically with the attachment insert,
+ * inside one `BEGIN IMMEDIATE` transaction. This is the attach side of the race `codexdoc/REVIEW-NOTES.md`
+ * calls out: a caller must never attach to a row that a concurrent `detachAndMaybeDrain` has already
+ * decided to tear down. Because both this function and `detachAndMaybeDrain` take SQLite's write lock
+ * immediately and run to completion before releasing it, whichever one commits first is the one the other
+ * sees — there is no window where a reader sees "joinable" based on data a concurrent writer is about to
+ * invalidate.
+ *
+ * ONLY `ready` is joinable — NOT `starting`. `review-sol-2026-09-13.md` finding 14: a `starting` row has
+ * no verified pid/pgid/transport yet, so joining it told a caller the pool was usable before spawn had
+ * even finished, and a later spawn failure silently invalidated an attachment already reported successful.
+ * `mcp-pool.js`'s `attach()` is the only caller that needs to observe a `starting` row directly (its own
+ * spawn-then-retry-join loop), and it does that by polling this same function until it sees `ready` or the
+ * row goes `failed` — never by being handed a `starting` attachment.
+ */
+export function attachToPool(db, { name, configHash, principalId = null, runId = null, now } = {}) {
+  const ts = now ?? nowIso();
+  const tx = db.transaction(() => {
+    const pool = poolRow(db.prepare(`SELECT * FROM mcp_pool WHERE name = ? AND config_hash = ?`).get(name, configHash));
+    if (!pool || pool.status !== "ready") {
+      return { attached: false, pool, reason: pool ? `pool is ${pool.status}, not joinable` : "no such pool" };
+    }
+    const attachmentId = `mcpa-${crypto.randomUUID().slice(0, 12)}`;
+    db.prepare(
+      `INSERT INTO mcp_pool_attachments (id, pool_id, principal_id, run_id, attached_at, detached_at)
+       VALUES (?, ?, ?, ?, ?, NULL)`,
+    ).run(attachmentId, pool.id, principalId, runId, ts);
+    db.prepare(`UPDATE mcp_pool SET last_attached_at = ? WHERE id = ?`).run(ts, pool.id);
+    return { attached: true, pool, attachmentId };
+  });
+  return tx.immediate();
+}
+
+/**
+ * Detach, and if this was the last live attachment, atomically flip the pool to `draining` in the SAME
+ * transaction as the count check — the detach side of the race described on `attachToPool`. A
+ * concurrent `attachToPool` either committed its attachment row before this transaction started (so
+ * `liveAttachmentCount` sees it and this call does NOT drain — correct), or it runs after this
+ * transaction commits `draining` (so its own `status !== 'starting' && status !== 'ready'` check refuses
+ * to join and it claims a fresh pool slot instead — correct). Returns `shouldTeardown: true` exactly
+ * once per pool row, for the caller that must now actually kill the process.
+ */
+export function detachAndMaybeDrain(db, attachmentId, { now } = {}) {
+  const ts = now ?? nowIso();
+  const tx = db.transaction(() => {
+    const att = db.prepare(`SELECT * FROM mcp_pool_attachments WHERE id = ?`).get(attachmentId);
+    if (!att || att.detached_at !== null) return { detached: false, shouldTeardown: false };
+    db.prepare(`UPDATE mcp_pool_attachments SET detached_at = ? WHERE id = ?`).run(ts, attachmentId);
+    const remaining = liveAttachmentCount(db, att.pool_id);
+    if (remaining === 0) {
+      const drained = db.prepare(`UPDATE mcp_pool SET status = 'draining' WHERE id = ? AND status IN ('starting', 'ready')`).run(att.pool_id);
+      return { detached: true, shouldTeardown: drained.changes === 1, poolId: att.pool_id };
+    }
+    return { detached: true, shouldTeardown: false, poolId: att.pool_id };
+  });
+  return tx.immediate();
+}
+
+/** The caller that tore down the process reports the pool row fully stopped. */
+export function markPoolStopped(db, id) {
+  const info = db.prepare(`UPDATE mcp_pool SET status = 'stopped', pid = NULL, pgid = NULL WHERE id = ?`).run(id);
+  return { updated: info.changes === 1 };
+}
+
+export function getPoolByName(db, name, configHash) {
+  return poolRow(db.prepare(`SELECT * FROM mcp_pool WHERE name = ? AND config_hash = ?`).get(name, configHash));
+}
+
+export function getPool(db, id) {
+  return poolRow(db.prepare(`SELECT * FROM mcp_pool WHERE id = ?`).get(id));
+}
+
+/** Every pool row claiming to be live (`starting`/`ready`) — what boot-time reconciliation checks
+ *  against real OS process liveness. */
+export function listLivePoolRows(db) {
+  return db.prepare(`SELECT * FROM mcp_pool WHERE status IN ('starting', 'ready')`).all().map(poolRow);
+}
+
+/**
+ * Backfill `run_id` on an attachment made before its run existed.
+ *
+ * `attach()` (runtime/mcp-pool.js) has to happen BEFORE `adapter.start()` returns a real `runId` — the
+ * pooled MCP config needs to be in `spec` before the process is spawned — so the attachment is created
+ * with `run_id: NULL` and this backfills it immediately after `start()` returns. The window between is
+ * synchronous and sub-millisecond; a crash inside it would leave one attachment un-run-scoped until the
+ * next full pool-config restart cycle reclaims it — a known, accepted small gap, not silently ignored.
+ */
+export function setAttachmentRunId(db, attachmentId, runId) {
+  const info = db.prepare(`UPDATE mcp_pool_attachments SET run_id = ? WHERE id = ? AND detached_at IS NULL`).run(runId, attachmentId);
+  return { updated: info.changes === 1 };
+}
+
+/** Every still-live attachment a run holds — what `endRun`/`reconcileRun` detach on terminal write. */
+export function listOpenAttachmentsForRun(db, runId) {
+  return db.prepare(`SELECT id FROM mcp_pool_attachments WHERE run_id = ? AND detached_at IS NULL`).all(runId).map((r) => r.id);
 }

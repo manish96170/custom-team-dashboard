@@ -132,7 +132,17 @@ export function createTuiApp({
    * Everything here is a READ. The TUI is a client like the pane and the hooks (PLAN.md section 4);
    * it never touches SQLite, and every mutation goes back as a command.
    */
+  // review-sol-2026-09-13.md finding 16: `setInterval(refresh, refreshMs)` starts a new async refresh on
+  // every tick with no serialization against the previous one. If a round trip ever took longer than
+  // `refreshMs` (a slow network tick, a GC pause), two requests were in flight sharing the same captured
+  // cursors, and whichever RESPONSE happened to arrive and apply LAST won — regardless of which request
+  // was actually newer — so an older snapshot could overwrite a newer one (a regressed team/task view,
+  // reordered or duplicated transcript lines). Made single-flight: a refresh already in progress makes
+  // the next tick a no-op rather than starting an overlapping second request.
+  let refreshInFlight = false;
   async function refresh() {
+    if (refreshInFlight) return;
+    refreshInFlight = true;
     try {
       // ONE round trip, not two. Two reads per tick is two chances to render half of one instant and
       // half of the next — teams from before a change and runs from after it.
@@ -183,6 +193,8 @@ export function createTuiApp({
       }
     } catch (err) {
       state = { ...state, status: `supervisor unreachable: ${err.message}` };
+    } finally {
+      refreshInFlight = false;
     }
     paint();
   }
@@ -230,9 +242,17 @@ export function createTuiApp({
    * Turn runs into panes.
    *
    * The three non-running pane states come from the ROW, not from guesswork: a closed row is
-   * `crashed` with its own `exit_reason`, an adopted or un-streamed run is `stale`, and a run with no
+   * `ended` with its own `exit_reason`, an adopted or un-streamed run is `stale`, and a run with no
    * events yet is `empty`. Every one of those is a thing the pane must SAY rather than render blank
    * (see layout.js).
+   *
+   * Corrected 2026-09-11 (`codexdoc/REVIEW-NOTES.md` finding 15's second half, missed in this file's
+   * first fix pass): this status used to be the literal string `"crashed"` for EVERY ended run,
+   * regardless of `exitReason` — so a run that finished normally, or was deliberately stopped, was
+   * unconditionally labelled as having crashed. The row already carries the real reason
+   * (`exitReason`), and `layout.js` already renders it in the message — the bug was the STATUS NAME
+   * itself asserting a failure that the reason might contradict. `ended` is neutral; the message still
+   * names the specific reason either way.
    */
   function buildPanes(prev, snapshot) {
     const rows = snapshot.runs ?? [];
@@ -240,7 +260,20 @@ export function createTuiApp({
     const workers = snapshot.workers ?? [];
     const pinned = prev.pinnedWorkerId;
 
-    const forWorker = (workerId) => rows.find((r) => r.workerId === workerId) ?? null;
+    // Fixed 2026-09-11 (`codexdoc/REVIEW-NOTES.md` finding 15): this used to be a bare `rows.find(...)`,
+    // which picks whichever run for this worker happens to come FIRST in `rows`' own order — and
+    // `listRunsForDisplay` returns runs in roughly historical/ascending order, so a worker's OLD ended
+    // run was shown even after it had a live replacement. The actual rule: prefer the LIVE run
+    // (`endedAt` null) if one exists; otherwise the NEWEST ended one, by `lastEventAt` (which the
+    // `runs` projection above already falls back to `started_at` for, so this never compares against
+    // `undefined`) — not simply array position either way.
+    const forWorker = (workerId) => {
+      const candidates = rows.filter((r) => r.workerId === workerId);
+      if (!candidates.length) return null;
+      const live = candidates.find((r) => !r.endedAt);
+      if (live) return live;
+      return [...candidates].sort((a, b) => String(b.lastEventAt ?? "").localeCompare(String(a.lastEventAt ?? "")))[0];
+    };
     const paneFor = (worker, role, slot) => {
       const run = forWorker(worker.workerId);
       // From the ACCUMULATED buffer, not from this snapshot's slice: the slice is only what is new
@@ -249,7 +282,7 @@ export function createTuiApp({
       const lines = linesFor(run?.runId).slice(-40);
       let status = "running";
       if (!run) status = "empty";
-      else if (run.endedAt) status = "crashed";
+      else if (run.endedAt) status = "ended";
       else if (run.controllable === false || run.lifecycle === "adopted") status = "stale";
       else if (!lines.length) status = "empty";
       return {
@@ -328,24 +361,51 @@ export function createTuiApp({
         }
       }
     }
+
+    // Accept/Decline from the Request Detail view (PLAN.md §14.4 correction 3 / FLOWS §6c), added
+    // 2026-09-11 — same `pendingX` handoff shape as `pendingChat` above. Honestly a no-op past the
+    // status line: there is no wire command yet for "accept this request into a real task" — §14.4's
+    // own note says so explicitly ("none of this is built" server-side; `hitTest`'s comment on the
+    // panel's own click target says the same). This closes the UI round-trip without pretending the
+    // backend half exists.
+    // review-sol-2026-09-13.md finding 24: the status message used to LEAD with "accepted"/"declined"
+    // — past-tense success wording, with the "not yet wired" caveat only tacked on afterward. An
+    // operator scanning the status line (not reading the whole sentence) reads a real decision as
+    // recorded; it is not — the request stays pending, unchanged, on the very next refresh. Reworded
+    // to never claim the decision happened at all.
+    if (state.pendingRequestDecision) {
+      const { requestId, decision } = state.pendingRequestDecision;
+      state = {
+        ...state, pendingRequestDecision: null,
+        status: `${decision} on ${requestId} not recorded — no backend command exists yet to act on a request (PLAN.md §14.4, backlog)`,
+      };
+    }
     if (state !== before) paint();
   }
+
+  // review-sol-2026-09-13.md finding 30: these used to be anonymous inline listeners passed straight to
+  // `input.on("data", ...)`/`out.on("resize", ...)`, with no reference kept — `stop()` had no way to
+  // remove them. Restarting or embedding this TUI (each `start()` adding another pair with no way to
+  // undo the previous ones) accumulated listeners without bound, and a stopped app could keep repainting
+  // on a resize event nobody meant to still be listening for. Named here so `stop()` can `off()` them.
+  function onInputData(chunk) {
+    // Mouse FIRST: an SGR report starts with `ESC[`, so `decodeKey` would otherwise read `ESC[<...`
+    // as an unrecognised arrow key and drop it — silently, which is the worst of the three outcomes.
+    const click = decodeMouse(chunk);
+    if (click) { handleClick(click); return; }
+    const key = decodeKey(chunk);
+    if (key === null) return;
+    handleKey(key).then(() => { if (state.quit) stop(); });
+  }
+  function onResize() { lastFrame = []; paint(); }
 
   async function start() {
     if (input.isTTY) { input.setRawMode?.(true); }
     input.resume?.();
     out.write(ALT_SCREEN_ON + HIDE_CURSOR + MOUSE_ON + CLEAR);
 
-    input.on("data", (chunk) => {
-      // Mouse FIRST: an SGR report starts with `ESC[`, so `decodeKey` would otherwise read `ESC[<...`
-      // as an unrecognised arrow key and drop it — silently, which is the worst of the three outcomes.
-      const click = decodeMouse(chunk);
-      if (click) { handleClick(click); return; }
-      const key = decodeKey(chunk);
-      if (key === null) return;
-      handleKey(key).then(() => { if (state.quit) stop(); });
-    });
-    out.on?.("resize", () => { lastFrame = []; paint(); });
+    input.on("data", onInputData);
+    out.on?.("resize", onResize);
 
     await refresh();
     timer = setInterval(refresh, refreshMs);
@@ -358,12 +418,17 @@ export function createTuiApp({
     if (stopped) return;
     stopped = true;
     if (timer) clearInterval(timer);
+    input.off?.("data", onInputData);
+    out.off?.("resize", onResize);
     // Restore the terminal on EVERY exit path. A TUI that leaves raw mode on, the cursor hidden, or
     // MOUSE REPORTING ON makes the user's shell appear broken — mouse reporting is the worst of the
     // three, because the shell then prints escape sequences whenever the user moves the pointer.
     out.write(MOUSE_OFF + SHOW_CURSOR + ALT_SCREEN_OFF);
     if (input.isTTY) input.setRawMode?.(false);
     input.pause?.();
+    // finding 30's other half: the socket client was never closed on stop(), leaking it past this app's
+    // own lifetime.
+    client.close?.();
   }
 
   return {

@@ -34,7 +34,15 @@ const stateDir = path.join(os.homedir(), ".custom-team-dashboard", "tui-capture"
 fs.rmSync(stateDir, { recursive: true, force: true });
 fs.mkdirSync(stateDir, { recursive: true });
 
-const db = openDb({ stateDir });
+// review-sol-2026-09-13.md finding 28: teardown used to be a flat sequence of statements AFTER the
+// frame-capture body, reached only if every step above it (setup, each `frame()`, each `handleKey()`)
+// completed with no exception — a timeout, a render exception, or a failed assertion skipped harness,
+// socket, DB, and state-directory teardown entirely, leaving real processes/sockets alive and (worse)
+// a state directory a LATER run could delete out from under a still-live previous process. Declared
+// here, outside the try, so `finally` below can reach them regardless of how far setup got.
+let db, supervisor, harness, ipc;
+try {
+db = openDb({ stateDir });
 upsertHarness(db, { id: "fake", displayName: "Mock Harness", status: "active" });
 db.prepare("INSERT INTO teams (id, name, hidden_from_top_bar) VALUES ('team-vite','Vite Migration',0)").run();
 db.prepare("INSERT INTO teams (id, name, hidden_from_top_bar) VALUES ('team-lint','Biome Lint',0)").run();
@@ -79,8 +87,8 @@ recordReviewVerdict(db, {
   findings: [{ file: "checkout/app.ts", line: 42, summary: "token logged in plaintext", verdict: "unverified" }],
 });
 
-const harness = createFakeHarness({ label: "capture" });
-const supervisor = createSupervisor({
+harness = createFakeHarness({ label: "capture" });
+supervisor = createSupervisor({
   db, adapters: { fake: harness }, askSweepIntervalMs: 0, logger: { log() {}, warn() {}, error() {} },
 });
 await supervisor.boot();
@@ -89,7 +97,7 @@ for (const workerId of ["w-coder", "w-rev1", "w-rev2", "w-lint"]) {
 }
 // The AUTHORIZED map, like the daemon and `--demo`: frames captured against a surface production does not
 // serve would be evidence of the wrong thing.
-const ipc = createIpcServer({ commands: supervisor.authorizedCommandHandlers() });
+ipc = createIpcServer({ commands: supervisor.authorizedCommandHandlers() });
 const sock = sockPath(stateDir);
 await ipc.listen(sock);
 
@@ -170,6 +178,74 @@ await app.handleKey("/");
 for (const ch of "hello") await app.handleKey(ch);
 frame("`/` then typing: letters are TEXT in the chat bar, not commands");
 
+// `escape` from chat returns focus to the tree (state.js FOCUS.CHAT -> blurChat), WITHOUT sending
+// "hello" anywhere — only `return` (submitChat) does that. Added 2026-09-10 for TUI-GUIDE.md, same
+// "looking is one command" reasoning as the rest of this script.
+await app.handleKey("escape");
+await app.handleKey("return");
+frame("`return` on the selected task: opens its pane(s), focus moves from TREE to PANE");
+
+await app.handleKey("f");
+frame("`f`: fullscreen the focused pane");
+
+await app.handleKey("f");
+frame("`f` again: back out of fullscreen to the split view");
+
+await app.handleKey("tab");
+frame("`tab`: cycle focus to the next pane in the split (still PANE focus)");
+
+// `treeDown`/`treeUp` set focus back to TREE themselves (state.js), so this is also how you'd get
+// back to the tree from a pane in the real TUI, not a capture-only shortcut.
+app.state = { ...app.state, selectedNodeId: "w-coder", focus: "tree" };
+await app.refresh();
+frame("selecting a worker directly (purus) in the tree");
+
+await app.handleKey("m");
+frame("`m`: pins purus as the task's main worker, until unpinned");
+
+await app.handleKey("d");
+frame("`d`: bottom bar target switches from CTO chat to direct chat with purus");
+
+await app.handleKey("d");
+frame("`d` again: bottom bar target returns to CTO");
+
+// ── added 2026-09-11: the TREE toggle, the Requests toggle, and the Request Detail view ────────────
+// (PLAN.md §5 / §14.4 corrections, FLOWS §6c) — all three added the same day, none of them built until
+// now.
+await app.handleKey("t");
+frame("`t`: hides the TREE — the pane area reclaims its width, from anywhere (not just tree focus)");
+
+await app.handleKey("t");
+frame("`t` again: tree restored");
+
+// The Requests panel was hidden by the earlier `h` press. `R` shows it again — unlike `h`, it's a
+// genuine toggle that works regardless of focus and regardless of whether anything is pending.
+await app.handleKey("R");
+frame("`R`: shows the Requests panel again — a real toggle, not just a hide, and works from any focus");
+
+// A request too long to fit inline (`please review !4821...` above already fits at this frame width,
+// so this scene needs one that genuinely doesn't — set directly on state, the same technique this
+// script already uses for `task-rev`/`w-coder` above, rather than adding a third row to the real
+// `requests` table and changing every earlier frame's request count).
+// Replaced, not appended: req-1/req-2's own row positions would otherwise shift the long request to
+// index 2, and a click computed for "the first request row" would land on req-2 instead. NOT followed
+// by `app.refresh()` — refresh re-populates `requests` from the real (unchanged) `requests` table,
+// which would immediately overwrite this override with req-1/req-2 again.
+app.state = {
+  ...app.state,
+  requests: [{
+    id: "req-long", channel: "#payments-oncall", mentioned: "you",
+    text: "please look at this before end of day, it touches the payment webhook retry logic and there is a flaky test in the same file that keeps failing intermittently in CI",
+  }],
+};
+const detailRow = frameGeometry(app.state, SIZE).requests.top + 2;
+const detailTarget = hitTest(app.state, SIZE, 5, detailRow);
+await app.handleClick({ col: 5, row: detailRow });
+frame(`click on the long request (hit: ${JSON.stringify(detailTarget)}) — too long to fit inline, so it expands instead of just selecting`);
+
+await app.handleKey("escape");
+frame("`esc`: closes the Request Detail view — the tree + pane area come back exactly as they were");
+
 // What the panes are actually holding, which the frames only show 40 lines of.
 say("## accumulated transcript state (replay cursors)");
 for (const [runId, t] of app.transcriptState()) {
@@ -178,10 +254,19 @@ for (const [runId, t] of app.transcriptState()) {
 say("");
 
 process.stdout.write(`${lines.join("\n")}\n`);
-
-try { await ipc.shutdown(); } catch { /* teardown */ }
-try { await supervisor.shutdown({ timeoutMs: 3000 }); } catch { /* teardown */ }
-try { await harness.disposeAll?.({ graceMs: 300 }); } catch { /* teardown */ }
-try { closeDb(db); } catch { /* teardown */ }
-fs.rmSync(stateDir, { recursive: true, force: true });
-process.exit(0);
+} catch (err) {
+  // Still a real failure — printed and reflected in the exit code — but reaching here (rather than an
+  // uncaught rejection skipping straight past every teardown step below) is the whole fix.
+  console.error(err);
+  process.exitCode = 1;
+} finally {
+  // Reverse-ish order: tear down the things that depend on what's below them first. Each step is
+  // independently best-effort — one failing must not skip the ones after it, same discipline this
+  // codebase's own `shutdown()` implementations already apply to their own multi-step teardown.
+  if (ipc) { try { await ipc.shutdown(); } catch { /* teardown */ } }
+  if (supervisor) { try { await supervisor.shutdown({ timeoutMs: 3000 }); } catch { /* teardown */ } }
+  if (harness) { try { await harness.disposeAll?.({ graceMs: 300 }); } catch { /* teardown */ } }
+  if (db) { try { closeDb(db); } catch { /* teardown */ } }
+  fs.rmSync(stateDir, { recursive: true, force: true });
+}
+process.exit(process.exitCode ?? 0);

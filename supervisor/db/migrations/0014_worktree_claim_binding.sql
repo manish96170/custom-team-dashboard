@@ -1,0 +1,12 @@
+-- 0014_worktree_claim_binding.sql — bind a task's worktree claim to the repo it was requested against
+-- (`codexdoc/review-luna-2026-09-11.md` finding 5). Phase 7.
+--
+-- Without this, `createTaskWorktree`'s CAS only ever compared a caller's `repoPath`/`branch` against
+-- whatever the FIRST caller happened to pass — a second caller naming a different repo/branch for the
+-- same task got back `{ created: false }` for the first caller's worktree with no refusal at all. This
+-- column is set at CLAIM time (not just at finalize), so the mismatch check applies to the pending-claim
+-- poll path too, not only the already-finalized idempotent-return path.
+--
+-- NULL for every existing row (no backfill needed — an already-finalized worktree with no recorded
+-- repo path just skips the mismatch check, which is strictly safer than inventing a wrong value).
+ALTER TABLE tasks ADD COLUMN worktree_repo_path TEXT;

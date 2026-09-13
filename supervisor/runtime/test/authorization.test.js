@@ -24,6 +24,8 @@
 //  10. a RESTARTED worker gets a fresh token for the same identity, and its old token stops working
 //  11. a transition records the AUTHENTICATED principal, not the `actor` a caller claims
 //  12. an expired approval does not mask a valid one granted earlier
+//  13. tuiSnapshot withholds transcript content from an authenticated principal that lacks observe:run
+//  14. answerAsk refuses a worker answering its own ask, and derives attribution from the principal
 //
 // Standing rule: every case asserts. This script cannot exit 0 with a broken claim.
 
@@ -34,7 +36,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
-  openDb, closeDb, upsertHarness, createWorker, createTask, recordTransition,
+  openDb, closeDb, upsertHarness, createWorker, createTask, createRun, recordEvent, recordTransition,
   listPrincipals, principalForWorker, listJournal, journalHasDone, getPrincipal,
 } from "../../db/index.js";
 import { createSupervisor } from "../supervisor.js";
@@ -188,8 +190,11 @@ await runTest("capability-based authorization", async () => {
       assert.equal(wp.id, principalId);
       assert.equal(wp.kind, "worker");
       // ROLE-DERIVED, not request-derived: a coder holds neither `run:start` nor any utility capability, which
-      // is §16's whole reason for utility agents existing.
-      assert.deepEqual(wp.capabilities, ["read:registry", "ask:answer"]);
+      // is §16's whole reason for utility agents existing. `task:worktree` (§7, added 2026-09-10) IS here —
+      // it is what lets a worker call `requestWorktree` for its own isolated overlay, the same self-referential
+      // shape `ask:answer` already has. `resource:lease` (§20, added 2026-09-10) IS here too — a worker running
+      // a heavy build/test needs to hold `host:heavy-job`.
+      assert.deepEqual(wp.capabilities, ["read:registry", "ask:answer", "task:worktree", "resource:lease"]);
       const rev = supervisor.ensureWorkerPrincipal("w-rev");
       assert.ok(rev.principal.capabilities.includes("review:record"), "a reviewer may record verdicts…");
       assert.equal(rev.principal.capabilities.includes("task:approve"), false, "…and may not approve the task");
@@ -598,6 +603,141 @@ await runTest("capability-based authorization", async () => {
         `an expired newer approval must not mask a valid older one; got ${JSON.stringify(merged)}`);
       assert.equal(db.prepare("SELECT state FROM tasks WHERE id='t-two-approvals'").get().state, "merged");
       console.log("  12. an expired approval does not mask a valid one granted earlier");
+    }
+
+    // ── 13 ───────────────────────────────────────────────────────────────────────────
+    // `codexdoc/REVIEW-NOTES.md` finding 9: `tuiSnapshot` requires only `read:registry`, but its
+    // transcript fields hand over a run's RAW tier-1 output — the exact thing `observe:run` gates for
+    // `observe` itself. A registry-only principal (`utility:jira` holds `read:registry` but not
+    // `observe:run`, same as the plain `worker` preset) must not get transcript content back just
+    // because it can call the command at all.
+    {
+      const sock = sockPath(stateDir);
+      createWorker(db, { workerId: "w-snap-leak", nickname: "snap-leak", role: "coder" });
+      createRun(db, { runId: "r-snap-leak", workerId: "w-snap-leak", harnessId: "fake", prompt: "secret transcript" });
+      recordEvent(db, { runId: "r-snap-leak", tier: 1, type: "assistant.delta", payload: { text: "a secret worth leaking" } });
+      recordEvent(db, { runId: "r-snap-leak", tier: 1, type: "turn.end", payload: { status: "completed" } });
+
+      const registryOnly = supervisor.mintNamedPrincipal({ preset: "utility:jira", displayName: "jira (snapshot leak test)" });
+      const leaked = await request(sock, { id: "snap-leak-1", cmd: "tuiSnapshot", token: registryOnly.token });
+      assert.equal(leaked.ok, true, "read:registry is enough to call the command at all");
+      assert.deepEqual(
+        leaked.transcripts[ "r-snap-leak" ] ?? [], [],
+        `a registry-only principal (no observe:run) must NOT receive transcript content; got ${JSON.stringify(leaked.transcripts["r-snap-leak"])}`,
+      );
+
+      // The SAME command, with a principal that actually holds observe:run, still gets the real content —
+      // this only closes the leak, it does not quietly break the feature for anyone entitled to it.
+      const withObserve = await request(sock, { id: "snap-leak-2", cmd: "tuiSnapshot", token: ownerToken });
+      assert.equal(withObserve.ok, true);
+      assert.ok(
+        (withObserve.transcripts["r-snap-leak"] ?? []).some((line) => JSON.stringify(line).includes("a secret worth leaking")),
+        `a principal WITH observe:run must still see real transcript content; got ${JSON.stringify(withObserve.transcripts["r-snap-leak"])}`,
+      );
+      console.log("  13. tuiSnapshot withholds transcript content from an authenticated principal that lacks observe:run");
+    }
+
+    // ── 14 ───────────────────────────────────────────────────────────────────────────
+    // `codexdoc/REVIEW-NOTES.md` finding 6: `ask:answer` is on the plain `worker`/`reviewer` presets so
+    // a run is never stranded if its own principal disappears — but that must not let a worker DECIDE
+    // its own parked ask, nor let a caller dictate the attribution a real human's decision gets.
+    {
+      const sock = sockPath(stateDir);
+      createWorker(db, { workerId: "w-selfanswer", nickname: "selfanswer", role: "coder" });
+      const { runId: selfRunId } = await supervisor.start({
+        harnessId: "fake", workerId: "w-selfanswer", spec: { cwd: stateDir, prompt: "self-answer test" },
+      });
+      const selfChild = harnesses[0]._runs.get(selfRunId);
+      const selfToken = selfChild.spec.env.CTD_PRINCIPAL_TOKEN;
+
+      selfChild.child.stdin.write(`${JSON.stringify({
+        type: "ask", requestId: "req-self", toolName: "Bash", description: "rm -rf /",
+        input: { command: "rm -rf /" },
+      })}\n`);
+      const ask = await waitFor(
+        () => supervisor.asks({ runId: selfRunId }).find((a) => a.harnessRequestId === "req-self"),
+        { timeoutMs: 5000, what: "the self-answer test's parked ask" },
+      );
+
+      const selfAttempt = await request(sock, {
+        id: "sa1", cmd: "answerAsk", token: selfToken, askId: ask.askId, allow: true, answeredBy: "totally-not-human",
+      });
+      assert.equal(selfAttempt.ok, false, "a worker must not be able to answer its OWN parked ask");
+      assert.match(selfAttempt.error, /may not answer its own ask/);
+      assert.equal(db.prepare("SELECT resolved FROM asks WHERE id = ?").get(ask.askId).resolved, 0,
+        "the refused attempt must not have resolved the ask");
+
+      // The owner CAN answer it — and the stored attribution is DERIVED from the authenticated
+      // principal, ignoring the caller's own `answeredBy` claim entirely (not just for the self-answer
+      // case above).
+      const ownerAnswer = await request(sock, {
+        id: "sa2", cmd: "answerAsk", token: ownerToken, askId: ask.askId, allow: true, answeredBy: "totally-not-human",
+      });
+      assert.equal(ownerAnswer.ok, true, JSON.stringify(ownerAnswer));
+      assert.equal(db.prepare("SELECT answered_by FROM asks WHERE id = ?").get(ask.askId).answered_by, "human",
+        "attribution must be derived from the authenticated principal, never the caller's claimed answeredBy");
+      await supervisor.stop(selfRunId);
+      console.log("  14. answerAsk refuses a worker answering its own ask, and derives attribution from the authenticated principal, never the request");
+    }
+
+    // ── 15 ───────────────────────────────────────────────────────────────────────────
+    // review-sol-2026-09-13.md finding 3: case 14 only closed a worker answering its OWN ask. A
+    // DIFFERENT worker (never touched that run) held `ask:answer` too, so it could decide a peer's
+    // parked TOOL-APPROVAL — the exact side-effecting decision `ask:answer`'s own preset comment says
+    // is "reserved for a human/CTO" — as long as it wasn't the run's own principal. A plain "question"
+    // ask (the collaborative-unblock case that capability grant actually exists for) must still be
+    // answerable cross-worker.
+    {
+      const sock = sockPath(stateDir);
+      createWorker(db, { workerId: "w-peer-a", nickname: "peer-a", role: "coder" });
+      createWorker(db, { workerId: "w-peer-b", nickname: "peer-b", role: "coder" });
+      const { runId: peerARun } = await supervisor.start({
+        harnessId: "fake", workerId: "w-peer-a", spec: { cwd: stateDir, prompt: "peer tool-approval test" },
+      });
+      const { runId: peerBRun } = await supervisor.start({
+        harnessId: "fake", workerId: "w-peer-b", spec: { cwd: stateDir, prompt: "peer question test" },
+      });
+      const peerAChild = harnesses[0]._runs.get(peerARun);
+      const peerBToken = harnesses[0]._runs.get(peerBRun).spec.env.CTD_PRINCIPAL_TOKEN;
+
+      peerAChild.child.stdin.write(`${JSON.stringify({
+        type: "ask", requestId: "req-peer-tool", toolName: "Bash", description: "rm -rf /tmp/x",
+        input: { command: "rm -rf /tmp/x" },
+      })}\n`);
+      const toolAsk = await waitFor(
+        () => supervisor.asks({ runId: peerARun }).find((a) => a.harnessRequestId === "req-peer-tool"),
+        { timeoutMs: 5000, what: "peer A's parked tool-approval ask" },
+      );
+      assert.equal(toolAsk.kind, "tool-approval");
+
+      const peerAttempt = await request(sock, {
+        id: "pa1", cmd: "answerAsk", token: peerBToken, askId: toolAsk.askId, allow: true, answeredBy: "totally-not-human",
+      });
+      assert.equal(peerAttempt.ok, false, "a DIFFERENT worker must not be able to decide a peer's tool-approval ask");
+      assert.match(peerAttempt.error, /may not decide a tool-approval ask/);
+      assert.equal(db.prepare("SELECT resolved FROM asks WHERE id = ?").get(toolAsk.askId).resolved, 0);
+
+      // A plain "question" ask (requiresUserInteraction: true) is a different decision class and must
+      // still be answerable by a peer worker — this fix must not have silently broken that.
+      const peerQuestion = "which approach?";
+      peerAChild.child.stdin.write(`${JSON.stringify({
+        type: "ask", requestId: "req-peer-question", toolName: "AskUserQuestion", requiresUserInteraction: true,
+        input: { questions: [{ question: peerQuestion, header: "Approach", options: [{ label: "one" }, { label: "two" }] }] },
+      })}\n`);
+      const questionAsk = await waitFor(
+        () => supervisor.asks({ runId: peerARun }).find((a) => a.harnessRequestId === "req-peer-question"),
+        { timeoutMs: 5000, what: "peer A's parked question ask" },
+      );
+      assert.equal(questionAsk.kind, "question");
+      const peerQuestionAnswer = await request(sock, {
+        id: "pa2", cmd: "answerAsk", token: peerBToken, askId: questionAsk.askId,
+        answers: { [peerQuestion]: "one" }, answeredBy: "totally-not-human",
+      });
+      assert.equal(peerQuestionAnswer.ok, true, `a peer worker must still be able to answer a plain question ask; got ${JSON.stringify(peerQuestionAnswer)}`);
+
+      await supervisor.stop(peerARun);
+      await supervisor.stop(peerBRun);
+      console.log("  15. answerAsk forbids a peer worker from deciding another run's tool-approval ask, while still allowing a peer to answer a plain question");
     }
   } finally {
     try { if (ipc) await ipc.shutdown(); } catch { /* teardown */ }

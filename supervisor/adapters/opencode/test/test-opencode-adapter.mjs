@@ -74,6 +74,24 @@ async function drainUntilTurnEnd(runId, { timeoutMs = 5000 } = {}) {
   return events;
 }
 
+// Unlike drainUntilTurnEnd, does NOT stop at the first turn.end — it drains until the generator
+// itself naturally returns (observe()'s own `sawTerminal` exit) or the timeout. Needed to prove a
+// SECOND, redundant turn.end was actually suppressed rather than merely unobserved because the test
+// itself stopped looking right after the first one.
+async function drainAll(runId, { timeoutMs = 3000 } = {}) {
+  const events = [];
+  const overallTimeout = sleep(timeoutMs).then(() => 'timeout');
+  const iter = adapter.observe(runId);
+  while (true) {
+    const result = await Promise.race([iter.next(), overallTimeout]);
+    if (result === 'timeout') break;
+    const { value, done } = result;
+    if (value !== undefined) events.push(value);
+    if (done) break;
+  }
+  return events;
+}
+
 // ---------------------------------------------------------------------------
 // Finding M14: preflight() must succeed for a present binary and fail
 // clearly for a missing one.
@@ -222,6 +240,158 @@ async function test_sessionless_nonallowlisted_event_is_dropped() {
     await adapter.stop(runIdB);
   } finally {
     delete process.env.FAKE_OC_EMIT_LEAK_EVENT;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Older should-fix backlog: a real OpenCode abort emits BOTH session.error
+// (MessageAbortedError) and session.idle for the SAME logical turn ending
+// (measured, see interrupt()'s own doc comment) — both map to turn.end, so
+// an aborted run used to get overwritten to status "completed" by the
+// second, redundant event in any last-wins consumer (event-pump.js's
+// updateDerived does exactly this).
+// ---------------------------------------------------------------------------
+async function test_abort_does_not_emit_a_redundant_second_turn_end() {
+  process.env.FAKE_OC_NEVER_FINISH = '1';
+  try {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-adapter-test-cwd-'));
+    const runId = await adapter.start({ prompt: 'this turn never naturally finishes', cwd });
+    await sleep(100); // let the turn genuinely be in flight before aborting it
+    await adapter.interrupt(runId);
+
+    // drainAll, not drainUntilTurnEnd: the latter stops at the FIRST turn.end by design, which
+    // would make this assertion pass trivially (never even looking for a second one) regardless
+    // of whether the adapter actually suppressed it.
+    const events = await drainAll(runId, { timeoutMs: 3000 });
+    const turnEnds = events.filter((e) => e.type === 'turn.end');
+    assert.equal(
+      turnEnds.length, 1,
+      `an abort must produce exactly ONE turn.end, not the server's real two-event sequence leaking through; got ${JSON.stringify(turnEnds)}`,
+    );
+    assert.equal(turnEnds[0].status, 'aborted', 'the real (first) event\'s status must survive, not get overwritten to "completed" by the redundant second one');
+  } finally {
+    delete process.env.FAKE_OC_NEVER_FINISH;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Older should-fix backlog: `server.instance.disposed` mapped to `null` (a
+// deliberate liveness-only broadcast), so a run still mid-turn when its
+// server tore itself down never got ANY terminal event — observe() would
+// wait forever for a turn.end that could now never arrive.
+// ---------------------------------------------------------------------------
+async function test_server_disposed_mid_turn_synthesizes_turn_end() {
+  process.env.FAKE_OC_NEVER_FINISH = '1';
+  try {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-adapter-test-cwd-'));
+    const runId = await adapter.start({ prompt: 'this turn never naturally finishes', cwd });
+    const baseUrl = runId.split('::')[0];
+
+    // Give the (never-finishing) turn a moment to genuinely be in flight, then dispose the
+    // server out from under it — the exact "server ends before the turn does" ordering the
+    // backlog note describes, not something a fast synchronous turn could ever race into.
+    await sleep(100);
+    const disposeRes = await fetch(`${baseUrl}/debug/dispose`, { method: 'POST' });
+    assert.equal(disposeRes.ok, true, 'precondition: the fake server must have accepted the dispose trigger');
+
+    const events = await drainUntilTurnEnd(runId, { timeoutMs: 3000 });
+    const turnEnd = events.find((e) => e.type === 'turn.end');
+    assert.ok(
+      turnEnd,
+      `a run whose server was disposed mid-turn must still get a synthesized turn.end, not hang forever; got events: ${JSON.stringify(events)}`,
+    );
+    assert.equal(turnEnd.status, 'error');
+    assert.equal(turnEnd.isError, true);
+    assert.match(turnEnd.error, /disposed/i);
+  } finally {
+    delete process.env.FAKE_OC_NEVER_FINISH;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Older should-fix backlog: verifyRunIdentity()'s HTTP-unavailable fallback
+// (entry.sessionsKnown) used to be add-only — discardSession() never removed
+// an entry once the session was genuinely deleted server-side, so a check
+// landing during a transient HTTP outage fell back to that stale cache and
+// reported a REAL server's 404 as a false "sessionKnown: true".
+// ---------------------------------------------------------------------------
+async function test_discarded_session_does_not_falsely_report_known_on_http_failure() {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-adapter-test-cwd-'));
+  const runId = await adapter.start({ prompt: 'discard me', cwd });
+
+  const discarded = await adapter.discardSession(runId);
+  assert.equal(discarded.discarded, true, `precondition: the fake server must have actually deleted the session; got ${JSON.stringify(discarded)}`);
+
+  // Force the SAME failure mode verifyRunIdentity()'s catch block handles: the server process
+  // itself is still alive (verifyRunIdentity's `serverAlive` check is process-based, keyed by
+  // `run.cwd`, untouched here), but the HTTP call to it fails. Pointing `run.baseUrl` at a port
+  // nothing listens on makes the fetch fail fast (ECONNREFUSED) without needing to actually stop
+  // responding to the real server, which would be slow and non-deterministic to arrange.
+  const run = adapter._getRunForTest(runId);
+  const realBaseUrl = run.baseUrl;
+  run.baseUrl = 'http://127.0.0.1:1';
+  let identity;
+  try {
+    identity = await adapter.verifyRunIdentity(runId);
+  } finally {
+    run.baseUrl = realBaseUrl;
+  }
+
+  assert.equal(identity.serverAlive, true, 'the server process itself is still alive — only the HTTP call to it failed');
+  assert.equal(
+    identity.sessionKnown, false,
+    `a discarded session must not be falsely reported as known just because the HTTP check itself failed; got ${JSON.stringify(identity)}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Older should-fix backlog: "full adapter-iterator cancellation needs an
+// AbortSignal on both adapters' observe() — iterator.return() is invoked
+// now, but return() on an async generator suspended inside an await is
+// queued until it resumes, so a generator blocked on a socket read cannot
+// be cancelled at all." That JS semantics fact is real in general, but this
+// checks whether it actually manifests as a hang against THIS adapter's
+// actual observe() shape: its only internal await is bounded by its own
+// 200ms setTimeout safety net (see observe()'s own doc comment), never a
+// raw indefinite socket read — so return() should settle a parked next()
+// well within that window, not "not at all."
+// ---------------------------------------------------------------------------
+async function test_iterator_return_settles_a_parked_next_within_bounded_time() {
+  process.env.FAKE_OC_NEVER_FINISH = '1';
+  try {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-adapter-test-cwd-'));
+    const runId = await adapter.start({ prompt: 'this turn never naturally finishes', cwd });
+    // Give the delta a moment to actually land in the run's buffered event log before observing,
+    // so the drain loop below can tell "already buffered" from "genuinely parked" by TIMING rather
+    // than by an event count this test would otherwise have to hardcode.
+    await sleep(150);
+    const iter = adapter.observe(runId);
+    // Drain whatever is already buffered (worker.env, the delta) so the NEXT next() call is
+    // genuinely the one that parks — a call answered instantly by already-buffered events would
+    // not exercise the cancellation path being measured here at all. A next() call that does NOT
+    // resolve within a short bound (well under observe()'s own 200ms safety-net poll) is the
+    // genuinely-parked one; treat it as `parkedNext` rather than looping on it.
+    let parkedNext;
+    for (;;) {
+      const candidate = iter.next();
+      const raced = await Promise.race([candidate.then(() => 'resolved'), sleep(60).then(() => 'pending')]);
+      if (raced === 'pending') { parkedNext = candidate; break; }
+      if ((await candidate).done) { parkedNext = candidate; break; }
+    }
+    const start = Date.now();
+    // The pump's own cancellation contract (runtime/event-pump.js's cancelIterator): call
+    // return() while a next() may already be outstanding, exactly as it does during real teardown.
+    const returned = iter.return();
+    const settled = await Promise.race([
+      Promise.all([parkedNext, returned]).then(() => 'settled'),
+      sleep(1000).then(() => 'timeout'),
+    ]);
+    const elapsedMs = Date.now() - start;
+
+    assert.equal(settled, 'settled', `the parked next() must settle once return() is called, not hang; waited ${elapsedMs}ms`);
+    assert.ok(elapsedMs < 500, `expected cancellation well within the 200ms safety-net window (plus margin); took ${elapsedMs}ms`);
+  } finally {
+    delete process.env.FAKE_OC_NEVER_FINISH;
   }
 }
 
@@ -435,6 +605,10 @@ const tests = [
   ['turn.end status shape (completed)', test_turnEnd_status_shape],
   ['turn.end status shape (rejected prompt synthesizes error)', test_turnEnd_prompt_rejected_synthesizes_error],
   ['session-less, non-allowlisted event is dropped, not broadcast', test_sessionless_nonallowlisted_event_is_dropped],
+  ['server disposed mid-turn synthesizes a real turn.end, does not hang observe()', test_server_disposed_mid_turn_synthesizes_turn_end],
+  ['abort does not emit a redundant second turn.end', test_abort_does_not_emit_a_redundant_second_turn_end],
+  ['a discarded session does not falsely report sessionKnown:true on HTTP failure', test_discarded_session_does_not_falsely_report_known_on_http_failure],
+  ['iterator.return() settles a parked next() within bounded time', test_iterator_return_settles_a_parked_next_within_bounded_time],
   ['verifyRunIdentity() reports two independent levels', test_verifyRunIdentity_two_levels],
   ['two runs share serverPid but not sessionID', test_two_runs_share_server_pid_but_not_sessionID],
   ['env: a per-run environment declaration is refused, not ignored', test_env_declaration_is_refused_not_ignored],

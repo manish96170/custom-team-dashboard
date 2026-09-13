@@ -103,6 +103,10 @@ This is the reference for "when you press this and the situation is this, it sho
 this." All keybindings act on the **currently focused pane context** (a team selected
 in the top bar + tree), not globally.
 
+**For the actual rendered screens this table describes — real captured frames, not
+mockups, plus a gap list of what's in this table but not yet wired — see
+`TUI-GUIDE.md`.**
+
 | Key | Situation | Result |
 |---|---|---|
 | `<-` / `->` or `h` / `l` | Top team bar has more teams than fit on screen | Move selection across the team bar |
@@ -113,6 +117,12 @@ in the top bar + tree), not globally.
 | Click a worker, then `m` | — | Pins that worker's run as `mainWorkerId` for the task — overrides most-recent-message default until unpinned |
 | Click a worker, then `v` | — | Opens a quick effort/variant picker scoped to that one run (PLAN.md section 11) — Claude Code's "effort" and OpenCode's "variant" shown as one generic control; changes the running instance only, not the stored default |
 | Click the Requests panel, then `h` | Requests panel focused (backlog feature — PLAN.md section 14.4) | Hides the panel, returns to default pane layout (see section 6a — same `h` key, scoped by focus, not a collision) |
+| `t` (BUILT 2026-09-11 — PLAN.md section 5) | Anywhere | Hides/shows the TREE panel — pane area expands to fill the freed 15% width when hidden. Selection (`selectedNodeId`, `treeScroll`) is preserved while hidden, same "hide is a view change, not a reset" rule section 7 already applies to hiding a team from the top bar. |
+| `R` (BUILT 2026-09-11 — PLAN.md section 14.4) | Anywhere | Shows/hides the Requests panel regardless of pending count — unlike the row above, works even while requests ARE pending, to reclaim space temporarily. **Corrected 2026-09-13 (finding 41): auto-reappearance only happens on an empty-then-new-batch transition — a new request landing while an EARLIER one is still pending and the panel is hidden stays invisible too**, see §6a's own note below for the exact rule. Capital, distinct from lowercase `r` (toggle all reviewers) — this codebase's own `decodeKey` returns a shifted letter as its own string, verified before picking it. |
+| Click a request too long to fit inline, or `return` on it (BUILT 2026-09-11 — the UI half; server-side Accept/Decline is still backlog, PLAN.md section 14.4/FLOWS section 6c) | Requests panel focused | Pane area + tree HIDE entirely (not fullscreened); full-width Request Detail view shows the whole message plus `[a] Accept` `[d] Decline` |
+| `a` (BUILT 2026-09-11, UI half — section 6c) | Request Detail view open | Accept — hands off to `app.js` as `pendingRequestDecision` (same split `pendingChat` already uses); today a status-line no-op, since there is still no wire command to create the task (section 6b) — restores the pane area exactly as it was regardless |
+| `d` (BUILT 2026-09-11, UI half — section 6c) | Request Detail view open | Decline — same handoff, restores the pane area exactly as it was. **Deliberately reuses `d`**, scoped by focus like `h`'s existing panel-vs-team-bar split above — while the Request Detail view is focused, `d` cannot also mean "toggle direct chat" (there is no worker pane to target), so the two meanings never compete. |
+| `esc` (BUILT 2026-09-11 — section 6c) | Request Detail view open | Back, no decision made — restores the pane area exactly as it was |
 | `1` | Review pane open | Toggle Reviewer 1 pane on/off |
 | `2` | Review pane open | Toggle Reviewer 2 pane on/off |
 | `p` | Review pane open | Toggle Parent-reviewer pane on/off |
@@ -151,15 +161,18 @@ in the top bar + tree), not globally.
 +-------------------------------------------------------------------------+
 ```
 
-## 6a. Requests panel (backlog — PLAN.md section 14.4; top-left, height configurable, default ~12%)
+## 6a. Requests panel (backlog — PLAN.md section 14.4; top-left, height configurable, default ~30% —
+raised from an earlier ~12% draft, 2026-09-11: a request's raw text doesn't fit legibly in a
+line-height strip)
 
 ```
 +- TEAMS (online) --------------------------------------------- <- -> -+
 |  [Vite Migration]  [Biome Lint]  [Stripe Fix]  [Checkout] ...       |
 +-----------+-----------------------------------------------------------+
-| REQUESTS ~12% (configurable) --------------+  TREE 15% resumes below |
+| REQUESTS ~30% (configurable) --------------+  TREE 15% resumes below |
 | [Accepted] [Declined] [Completed] [Team Requests]                   |
-| > @nj in #your-mr-channel: "@you please review..."                  |
+| > @nj in #your-mr-channel: "@you please review !4821 before         |
+|   standup, this one touches the payment webhook so it's not..."     |
 +-----------+-----------------------------------------------------------+
 | TREE 15%  |  PANE AREA (unchanged from section 6)                    |
 | ...       |  ...                                                     |
@@ -167,10 +180,50 @@ in the top bar + tree), not globally.
 ```
 
 - Collapsed by default when there are zero pending requests; appears the moment one
-  lands. Click into it, press `h` to hide again (table row above) — the panel does not
-  permanently take screen space when there's nothing to triage.
+  lands. `R` (BUILT 2026-09-11 — not `h`, which already means "move teams" outside this panel's focus)
+  shows/hides it independent of pending count, so a human can reclaim space temporarily without marking
+  anything read.
+  **CORRECTED 2026-09-13 (review-sol-2026-09-13.md finding 41) — "a new request landing while manually
+  hidden still auto-reappears" is OVERSTATED as written.** `withRequests()`'s actual rule un-hides only
+  when the pending list transitions THROUGH EMPTY: if request A is hidden and still pending when request
+  B arrives, the panel stays hidden — B is invisible too, despite this rule's original intent that a new
+  request should never be silently swallowed. It reliably un-hides on the next empty-then-new-batch
+  transition, not on every individual new arrival while something else is still pending.
 - When a request's raw message is shown, the button row may collapse to keep the whole
   panel within its configured height rather than growing the panel.
+- **A request too long for the panel's width expands to a full detail view instead of truncating** —
+  see 6c below. This is a different operation from clicking a shorter one that already fits inline.
+
+## 6c. Expanding a long request — the pane area hides, not just resizes
+
+```
+BEFORE (request selected, but not yet expanded — panel shows a truncated preview):
++- TEAMS ---------------------------------------------------------------+
++- REQUESTS ~30% ---------------------------------------------------------+
+| > @nj in #your-mr-channel: "@you please review !4821 before stand…" |
++-----------+-------------------------------------------------------------+
+| TREE 15%  |  PANE AREA (dev/review panes, as normal)                  |
++-----------+-------------------------------------------------------------+
+
+AFTER clicking that truncated request (or pressing return on it):
++- TEAMS ---------------------------------------------------------------+
++- REQUEST DETAIL (full width, replaces TREE + PANE AREA entirely) -----+
+|  @nj in #your-mr-channel, 14:02                                       |
+|  "@you please review !4821 before standup, this one touches the       |
+|   payment webhook so it's not just a lint fix, can you take a look    |
+|   before the meeting? there's also a flaky test in the same file"     |
+|                                                                         |
+|  [a] Accept    [d] Decline                                            |
++-------------------------------------------------------------------------+
+| footer: [esc] back                                                    |
++-------------------------------------------------------------------------+
+```
+
+The coding/review pane area and the tree are HIDDEN entirely here, not fullscreened-to-one-pane — `f`
+(FLOWS §5) fullscreens whichever pane already has focus; this is a different operation, because a
+request is not a pane. `esc` (or Accept/Decline resolving it) restores the pane area exactly as it was
+before — same "restore what was there" rule `r`'s reviewer-restore already follows, not a reset to
+whatever the type-driven default would pick.
 
 ## 6b. Review-request lifecycle (backlog)
 
