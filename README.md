@@ -2,8 +2,16 @@
 
 A Claude Code / OpenCode plugin for running and watching a virtual team of named agent
 sessions — leads, coders, reviewers, QA — from one screen, with a CTO-style chat as the
-control point. Status: **design complete, not yet built**. See ROADMAP.md for the
-build order and PLAN.md / FLOWS.md for the full design.
+control point. **STATUS, updated 2026-09-14: Phases 0a-10 built** (supervisor daemon,
+capability-based authorization, resource leases, MCP tool pooling with a per-role tool
+allowlist, Slack outbound notifications, a read-only Obsidian vault projection) **and
+Phase 11 (conservative harness onboarding) investigated and closed** — see
+`ROADMAP.md`'s own status pointer and `HANDOFF.md`'s top header for the current,
+authoritative picture; this paragraph is a summary, not the source of truth. **The CTO
+chat itself does not exist yet** (Phase 6/8) — every capability below the chat layer
+(assign, approve, clear, reset, onboard a harness) is a real, tested, capability-gated
+command reachable over the control socket, but nothing routes plain language to it yet.
+See PLAN.md / FLOWS.md for the full design.
 
 ## What this is for
 
@@ -20,21 +28,32 @@ this gives you:
   consolidated review of four independent AI architecture reviews rejected that as
   unsafe under concurrent writes — see PLAN.md section 3.)
 
-## How you'll use it (once built)
+## How to use it today
 
-1. Run `/custom-team-dashboard` to launch the dashboard. The CTO chat is always on
-   screen at the bottom.
-2. Group existing running sessions into a team by telling the CTO: *"make these
+This repo is now also a real, installable Claude Code plugin (`.claude-plugin/`) — the
+plugin manifest lives in this same repo, at this same commit; there is no separate
+packaging step. Once installed:
+
+1. Run `/custom-team-dashboard:dashboard` to start the supervisor daemon (or confirm
+   it's already running). It will then tell you the exact command to attach the TUI
+   yourself in your own terminal — the TUI is a real interactive terminal app and
+   cannot be launched through a tool call. No CTO chat exists yet (see below); every
+   other capability described past this point is design intent for Phase 6/8, not yet
+   built.
+
+## How you'll use it once the CTO chat exists (Phase 6/8, not yet built)
+
+1. Group existing running sessions into a team by telling the CTO: *"make these
    sessions a team called Vite Migration."*
-3. Click a team in the top bar to switch to it. The tree on the left (15% width) shows
+2. Click a team in the top bar to switch to it. The tree on the left (15% width) shows
    that team's structure; click a member to see their session directly, or click the
    team/lead to get the sensible default view for whatever's in progress.
-4. Ask the CTO anything conversational — *"who is reviewing NJ's MR?"* — and get an
+3. Ask the CTO anything conversational — *"who is reviewing NJ's MR?"* — and get an
    answer without hunting through panes.
-5. For a quick one-off task, DM a session directly (toggle with `d`) or just tell the
+4. For a quick one-off task, DM a session directly (toggle with `d`) or just tell the
    CTO — *"@Purus fix the lint warning in checkout.ts"* — no team ceremony required.
    It still gets logged like everything else.
-6. Use keybindings to control what's on screen — hide/show reviewer panes, fullscreen
+5. Use keybindings to control what's on screen — hide/show reviewer panes, fullscreen
    one pane, jump between teams. Full table in FLOWS.md, section 5.
 
 ## What it will never do (by design)

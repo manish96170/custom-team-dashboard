@@ -27,9 +27,12 @@
 // of protocol awareness that can enforce a bound — not a general MCP client/server implementation), and
 //   - filters `tools/list` RESPONSES down to only the allowed names before relaying them to the harness,
 //   - refuses `tools/call` REQUESTS naming a disallowed tool directly (a real JSON-RPC error carrying the
-//     caller's own request id), without ever forwarding them to the real server at all.
-// Every other frame (in either direction) is relayed byte-for-byte, unexamined — this is a bound on
-// WHICH tools are reachable, not a reimplementation of the protocol.
+//     caller's own request id), without ever forwarding them to the real server at all,
+//   - drops (never forwards) a client-side frame this proxy could not itself parse as JSON — added
+//     2026-09-14: an unparseable frame is one this proxy cannot examine, so relaying it blind would be
+//     the one input shape every check above could never see.
+// Every other frame is relayed byte-for-byte, unexamined — this is a bound on WHICH tools are reachable,
+// not a reimplementation of the protocol.
 //
 // Without `--allow-tools`, this is the original pure byte relay (kept for backward compatibility with
 // any caller that does not set one) — `runtime/supervisor.js`'s `start()` always sets one for every pool
@@ -50,16 +53,26 @@ function parseArgs(argv) {
 }
 
 /** Line-buffered newline-delimited JSON-RPC framing, same convention leo-mcp's own transports use on
- *  both sides — a chunk boundary from a real socket/pipe has no relationship to a message boundary. */
+ *  both sides — a chunk boundary from a real socket/pipe has no relationship to a message boundary.
+ *
+ *  Buffers RAW BYTES, not strings — a hardening fix (2026-09-14, external review): the original version
+ *  buffered with `buf += chunk`, which implicitly `.toString('utf8')`-decodes each incoming Buffer chunk
+ *  INDEPENDENTLY the instant it arrives, before a multi-byte UTF-8 character split across a chunk
+ *  boundary has all its bytes. Each half then decodes to U+FFFD replacement characters on its own —
+ *  reproduced directly: a real tool-name string split mid-character corrupted into mangled text. Now
+ *  every chunk is concatenated as bytes first, and `.toString('utf8')` is called exactly once, on a
+ *  complete line (delimited by a real `\n` byte) — a multi-byte character can never be mid-decode at a
+ *  chunk boundary because decoding never happens until the whole line is assembled. */
 function makeLineBuffer(onLine) {
-  let buf = "";
+  let buf = Buffer.alloc(0);
   return (chunk) => {
-    buf += chunk;
+    buf = Buffer.concat([buf, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
     let nl;
     // eslint-disable-next-line no-cond-assign
-    while ((nl = buf.indexOf("\n")) !== -1) {
-      const line = buf.slice(0, nl);
+    while ((nl = buf.indexOf(0x0a)) !== -1) {
+      const lineBuf = buf.slice(0, nl);
       buf = buf.slice(nl + 1);
+      const line = lineBuf.toString("utf8");
       const trimmed = line.trim();
       if (trimmed) onLine(line);
     }
@@ -103,9 +116,16 @@ function main() {
     const onClientLine = makeLineBuffer((line) => {
       const msg = tryParseJson(line);
       if (msg === undefined) {
-        // Not parseable as JSON — relay verbatim rather than guessing at malformed input; only frames
-        // this proxy can actually understand are ones it acts on.
-        socket.write(`${line}\n`);
+        // Hardening fix (2026-09-14, external review): an unparseable CLIENT line used to be relayed
+        // verbatim, same as the server side. On the server side that's harmless (nothing forwarded to the
+        // real server as a result). On the CLIENT side, once `--allow-tools` is set, this proxy IS a
+        // security boundary — relaying a frame it could not itself parse and therefore could never check
+        // means every enforcement decision above is bypassable by the one input shape this proxy cannot
+        // examine. Both this proxy and the real pooled server run the same JSON.parse-based dispatch, so
+        // there is no known real frame this would ever legitimately reject and the server would accept —
+        // but "no known case today" is not the same guarantee as "structurally impossible," so refuse
+        // rather than relay blind.
+        process.stderr.write(`mcp-stdio-proxy: dropping an unparseable client frame while --allow-tools is active (never forwarded)\n`);
         return;
       }
       if (msg.method === "tools/list") pendingToolsListIds.add(msg.id);
@@ -116,8 +136,13 @@ function main() {
             `mcp-stdio-proxy: refusing tools/call for "${toolName}" — not in the allowed set [${allowTools.join(", ")}]\n`,
           );
           process.stdout.write(
+            // `msg.id ?? null`: a JSON-RPC NOTIFICATION (no `id` at all, valid but unusual for `tools/call`)
+            // must not silently vanish from `JSON.stringify` (which drops an `undefined` property) — the
+            // refusal is unconditional either way (this line never reaches `socket.write` below regardless
+            // of whether it's a request or a notification), this only keeps the error frame's own shape
+            // honest about which case it was.
             `${JSON.stringify({
-              jsonrpc: "2.0", id: msg.id,
+              jsonrpc: "2.0", id: msg.id ?? null,
               error: { code: -32601, message: `tool "${toolName}" is not allowed for this role` },
             })}\n`,
           );

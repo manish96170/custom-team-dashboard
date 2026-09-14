@@ -146,6 +146,15 @@ export function createVaultProjector({ db, logger = console, loadConfig = loadVa
     }
 
     fs.mkdirSync(config.vaultPath, { recursive: true });
+    // Phase 12 (Release hardening) permissions review: `mkdirSync` with no `mode` leaves this directory
+    // at whatever the process umask dictates (typically 0755, world-readable) — fine while `vaultPath`
+    // lives under the state dir's own 0700 (the default), but `config/vault-projector.js` explicitly lets
+    // an operator point it OUTSIDE the state dir, where nothing else protects it. Chmod the ROOT only —
+    // Unix directory traversal is enforced at every level, so a 0700 root already blocks every other
+    // local user from entering any subdirectory beneath it, the same way the state dir's own 0700 already
+    // protects everything nested inside IT (`db/paths.js`). Best-effort, matching `mcp-pool.js`'s own
+    // socket-chmod convention: a failure here must never break a projection that otherwise succeeded.
+    try { fs.chmodSync(config.vaultPath, 0o700); } catch (err) { logger.warn?.(`[vault-projector] could not chmod vault directory ${config.vaultPath}: ${err.message}`); }
 
     const teamNames = new Set();
     for (const team of teams) {

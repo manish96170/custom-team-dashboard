@@ -901,25 +901,124 @@ rewritten while the workflow is still changing shape. See PLAN.md section 18.)*
       Mid/advanced tiers (tier-3 handoffs as notes, Kanban view, presentation-field write-back) are
       explicitly NOT built — out of scope for this pass, per PLAN.md §18's own tiering.
 
-## Phase 11 — Conservative harness onboarding
-- [ ] Register pre-installed, versioned adapters that declare a capability matrix and
-      pass the conformance suite (PLAN.md section 9) — no runtime adapter generation.
-- [ ] Turn "onboard agy" into this repeatable registration flow (FLOWS.md diagram 4).
-- [ ] **Spike, before committing: does ACP (Agent Client Protocol) replace bespoke per-harness
-      adapters** (PLAN.md section 9, added 2026-09-10 after reviewing `hydra-acp`). Check whether
-      either current harness speaks ACP today; if not, weigh a translation shim's cost against the two
-      adapters it would replace. If it clears that bar, ACP is a *transport* — still registered and
-      conformance-tested exactly per section 9, not a bypass of that model.
+## Phase 11 — Conservative harness onboarding — **CLOSED 2026-09-14, investigated not built (checkboxes 1-2
+already satisfied by earlier phases; checkbox 3 is a completed spike, not a code change)**
+- [x] Register pre-installed, versioned adapters that declare a capability matrix and
+      pass the conformance suite (PLAN.md section 9) — no runtime adapter generation. **Already fully
+      built and tested, verified 2026-09-14, no new code needed.** `conformance/matrix.js` (the declared
+      shape) + `conformance/suite.js` (`runConformance`) + `runtime/supervisor.js`'s `onboardHarness({
+      harnessId, spec, timeoutMs })` (persists the result via `db/index.js`'s `upsertHarness` — a real
+      `INSERT ... ON CONFLICT(id) DO UPDATE`, confirmed to handle both "never registered before" and
+      "already registered" correctly in one statement) together ARE this checkbox. `runtime/test/
+      conformance.test.js`'s 8 cases (re-run 2026-09-14, still pass) already prove: a conforming adapter
+      is flipped to `active`; a missing/partial matrix lands in `wrapper`, never silently `active`; a
+      declared-but-unimplemented capability fails the method cross-check and degrades to `wrapper`; a
+      declared-but-broken capability fails the behavioural check. No runtime adapter generation exists
+      anywhere in this tree (confirmed by this session's repeated greps for it across every earlier pass).
+- [x] Turn "onboard agy" into this repeatable registration flow (FLOWS.md diagram 4). **Steps B-G of that
+      diagram are already ONE real, tested, capability-gated call** — `onboardHarness` (above) IS
+      "harnesses table: add row, status=pending-setup" through "conformance suite runs" through "status=
+      active/degraded" through "new runs go through the supervisor," confirmed wired as a real wire
+      command (`domain/capabilities.js`: `onboardHarness: "harness:onboard"`; `commandHandlers()`'s own
+      `onboardHarness:` entry). Step C ("adapter package installed") is an operational precondition, not
+      code. **Only step A — a natural-language "CTO chat" trigger — is not built**, and cannot be without
+      inventing an NL-routing layer that does not exist anywhere in this codebase (the same gap Phase 8's
+      own investigation already found and documented — `tuiChat` refuses `cmd.target === "cto"` outright;
+      see `domain/session-intent.js`'s header for the same reasoning applied to clean-vs-kill). The
+      repeatable registration flow exists in its structured form today: an operator/script calls
+      `onboardHarness({ harnessId: "agy", spec })` directly, or via the wire command — exactly the
+      structured-signal resolution this session already used elsewhere instead of faking an NL parser.
+- [x] **Spike done, 2026-09-14 — real answer, no shim built.** Ran both real CLIs directly: `opencode
+      --help` lists a genuine `opencode acp` subcommand (`opencode acp --help` confirms it: "start ACP
+      (Agent Client Protocol) server", a real, working server mode) — OpenCode speaks ACP today. `claude
+      --help` has no ACP-shaped output anywhere — Claude Code does not. **Recommendation: do not adopt ACP
+      now.** PLAN.md's own bar is "does adopting it cost less than the two bespoke adapters it would
+      replace" — with only ONE of the two current harnesses speaking ACP, replacing both adapters would
+      still require either a translation shim for Claude Code (the exact cost PLAN.md warned might exceed
+      the two adapters it replaces) or running ACP for OpenCode alongside a bespoke Claude Code adapter,
+      which is not fewer transports than today's two bespoke adapters — no net simplification either way.
+      Revisit if Claude Code ever ships native ACP support, or a third, ACP-only harness is added.
 
 ## Phase 12 — Release hardening
-- [ ] Crash injection testing, migration testing, install/update/uninstall flows,
+- [x] Crash injection testing, migration testing, install/update/uninstall flows,
       permissions review, secret scanning across the database, event log, and any
-      vault projection.
-- [ ] Package as a Claude Code plugin (`marketplace.json`, `plugin.json`, skills,
-      hooks, MCP server) bundling the supervisor + both harness adapters. **Packaging
-      is a release gate here, not a first test** — Phase 0b already proved the
-      daemon-layout model works; this phase hardens and ships it.
-- [ ] Same artifact doubles as the open-source repo — no separate packaging step.
+      vault projection. **Investigated per sub-item 2026-09-14 — mostly already covered by earlier
+      phases; two real, narrow gaps found and fixed; one sub-item is Claude Code's job, not this
+      repo's.**
+      - **Crash injection**: `runtime/test/crash-recovery.test.js`/`daemon-crash.test.js` (real SIGKILL,
+        confirmed already there) cover the supervisor process itself. The newer subsystems built THIS
+        session already have their own real-process crash-shaped coverage, checked directly rather than
+        assumed: `mcp-pool.test.js` case 6 simulates the exact state a supervisor crash leaves (a live
+        orphaned child + a stale `ready` row, a FRESH manager with no in-memory handle) and proves boot
+        reconciliation kills/marks it correctly; `worktree.test.js`'s finding-3 case reproduces a crash
+        mid-discard with real git/DB and proves recovery no longer resurrects a deliberately deleted
+        worktree; `vault-projector.js`'s full-regeneration-every-time design (no incremental/persisted
+        intermediate state) means there is structurally nothing a crash mid-debounce could corrupt —
+        the next `project()` call (boot, or the next real command) simply re-derives everything fresh.
+        No new crash test built — the existing coverage is real, not merely logic-level, and adding a
+        second, heavier SIGKILL-the-daemon test per subsystem would duplicate what `daemon-crash.test.js`
+        already proves at the supervisor level.
+      - **Migration testing**: real gap found and closed. Migrations 0017/0018 (both added this session)
+        had only the generic fresh-database check — new `db/test/migration-0017-to-0018.test.js`, same
+        pattern as `migration-0013-to-0016.test.js` (real pre-existing rows at v16, upgraded to latest,
+        NULL — not guessed — values for both new columns, `PRAGMA integrity_check` still `ok`).
+      - **Install/update/uninstall**: investigated — nothing exists anywhere in this repo today (no
+        installer script, no update/uninstall flow), and this pass concluded that's the right shape: this
+        checklist item is satisfied by this repo BECOMING a Claude Code plugin (the concurrent packaging
+        pass, below) — Claude Code's own plugin manager handles install/update/uninstall of a registered
+        plugin; there is nothing left for this repo itself to build on top of that.
+      - **Permissions review**: real, listed every artifact this daemon creates on disk and checked its
+        ACTUAL mode bits via `fs.statSync`, not by reading the code that's supposed to set them. State
+        dir (0700) and db file+WAL/SHM (0600) already covered (`db/test/permissions.test.js`); the
+        control socket needs no separate check — it always resolves under the SAME state-dir root
+        (`ipc/paths.js` delegates to `paths.js`'s one resolver), so it inherits that 0700 by construction
+        (Unix directory traversal is enforced at the parent). Two real gaps found and fixed: (1) the MCP
+        pool socket's `chmod 0600` (built in an earlier pass) had no test asserting the real mode bits —
+        new case 14 in `mcp-pool.test.js`, reverted-and-confirmed-failing before restoring; (2)
+        `vault-projector.js`'s `mkdirSync` had no explicit mode at all — fine while `vaultPath` lives
+        under the state dir's own 0700 (the default), but `config/vault-projector.js` explicitly permits
+        pointing it OUTSIDE that protection, where a plain `mkdirSync` would leave it at the process
+        umask (0755, world-readable, measured on this machine). Fixed: the vault root is now chmod 0700
+        after creation; new case 2b in `vault-projector.test.js` uses a path deliberately OUTSIDE the
+        state dir (so the parent's own protection can't make the assertion pass by accident), reverted
+        and confirmed failing (0755) before restoring.
+      - **Secret scanning**: the vault-projection half already has its own real scan
+        (`vault-projector.test.js` cases 4-5 — a real principal token and a real secret-shaped ask
+        question, grepped for in every written file). New `db/test/secret-scan.test.js` closes the
+        database/event-log half: mints a real principal exactly the way `ensureWorkerPrincipal` does (a
+        random 32-byte hex token, only its SHA-256 hash ever handed to `mintPrincipal`), runs a realistic
+        burst of `recordEvent`/`journalAppend` writes, then scans the RAW on-disk sqlite bytes (main file
+        + WAL) for the raw token — absent — while confirming the token's OWN hash IS found (sanity: the
+        scan can actually detect a real match, not passing vacuously). Verified the scan itself is real,
+        not just quiet: temporarily leaked the raw token into a journal write and confirmed the test
+        fails, before restoring the clean version.
+- [~] Package as a Claude Code plugin (`marketplace.json`, `plugin.json`, skills,
+      hooks, MCP server) bundling the supervisor + both harness adapters. **DONE,
+      2026-09-14, for the honestly-buildable subset — the MCP-server half is a real,
+      identified gap, not built.** `.claude-plugin/marketplace.json`+`plugin.json`
+      (repo root, schema copied from three real working plugins already on this
+      machine — gitnexus's, understand-anything's, OpenAgentsControl's — not guessed),
+      `commands/dashboard.md` (starts the daemon via Bash, tells the user the real
+      command to attach the TUI themselves — a TUI needs a real tty a tool call
+      cannot hand off), `skills/custom-team-dashboard/SKILL.md` (what's real to claim
+      today: read-only DB inspection, the vault projection if enabled; explicitly
+      refuses to claim the CTO-chat capabilities that don't exist yet). **No `.mcp.json`
+      built**: this project's control plane is a persistent DAEMON meant to keep
+      supervising other sessions across many separate Claude Code invocations — the
+      standard "plugin declares an MCP server, Claude Code spawns/owns it for one
+      session" model (gitnexus's own `.mcp.json`: `npx gitnexus mcp`, a fresh
+      per-session process) does not fit a daemon by construction. The architecturally
+      right shape — a thin MCP-protocol front end that proxies to the already-running
+      daemon's control socket (`ipc/server.js`/`ipc/protocol.js`), the same
+      "resident process, thin per-caller proxy" shape `runtime/mcp-stdio-proxy.js`
+      already uses for pooled MCP servers — is real new code inside `supervisor/ipc/`
+      that a concurrent pass did not build and this pass deliberately did not invent
+      (out of scope: no existing one-shot CLI/MCP entrypoint to the control socket
+      exists yet either). Flagged, not faked.
+- [x] Same artifact doubles as the open-source repo — no separate packaging step.
+      Confirmed by construction: `.claude-plugin/marketplace.json`'s one plugin entry
+      is `"source": "."` — the plugin root IS this repo's own root, at whatever commit
+      is checked out, not a generated subdirectory or build output.
 
 ## Backlog — deferred, but architected for (do not build yet)
 

@@ -44,11 +44,6 @@ import {
   listUndeliveredAnswers,
   taskIdForRun,
   workerIdForRun,
-  claimTaskWorktreeSlot,
-  finalizeTaskWorktreeSlot,
-  releaseTaskWorktreeClaim,
-  reclaimStaleTaskWorktreeClaim,
-  WORKTREE_CLAIM_PENDING,
   sleepSync,
   parseJsonColumn,
   redactResolvedAskPayload,
@@ -57,9 +52,6 @@ import {
   markRunAdopted,
   findAdoptedRun,
   listAdoptedRuns,
-  deletePreflightRun,
-  listPreflightRuns,
-  recordModelHealth,
   getModelHealth,
   listModelHealth,
   recordTaskHandoff,
@@ -105,6 +97,8 @@ import { loadSlackNotifications } from "../config/slack-notifications.js";
 import { createSlackOutboxDrain } from "./slack-outbox.js";
 import { loadVaultProjectorConfig } from "../config/vault-projector.js";
 import { createVaultProjector } from "./vault-projector.js";
+import { createWorktreeService } from "./worktree-service.js";
+import { createPreflightService } from "./preflight-service.js";
 import { runFightLoop, resolvePushDestination } from "../agents/git-create-push.js";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
@@ -119,21 +113,14 @@ import {
   authorize, canGrantApproval, argsHash, requireArgs, PRESETS, COMMAND_CAPABILITIES, isSensitive,
 } from "../domain/capabilities.js";
 import { randomBytes, createHash } from "node:crypto";
-import { execFileSync, execFile } from "node:child_process";
-import { promisify } from "node:util";
-
-// review-sol-2026-09-13.md finding 23: the worktree lifecycle (create/status/discard/request) used to
-// run every git call through `execFileSync` — blocking the WHOLE daemon event loop for as long as the
-// child runs (a real `git worktree add`/`remove` can legitimately take up to its own internal timeout).
-// Not just this call's own logic — every socket command, ask, digest, and lease-renewal timer on the
-// SAME daemon process stalls too, for however long the git process takes. `execFile` (promisified) waits
-// on the child via libuv without blocking the event loop — the exact fix `agents/git-create-push.js`
-// already applies to its own git calls (see that file's own `execFileAsync`). The sequence of git calls
-// and what they mean is UNCHANGED here too — only how each one is awaited.
-const execFileAsync = promisify(execFile);
+import { execFileSync } from "node:child_process";
+// `execFile`/`promisify` (the non-blocking git-call fix, review-sol-2026-09-13.md finding 23) moved to
+// `runtime/worktree-service.js` with the worktree lifecycle functions that were its only real callers
+// (ChatGPT review, 2026-09-14 extraction) — `execFileSync` above is still used directly by
+// `currentHeadFor`/`changedPathsFor` (the review-orchestration functions), which stayed here.
 import fs from "node:fs";
 import { planAssignment, isActionable } from "../domain/assignment.js";
-import { isTerminal, autoBlockTarget } from "../domain/task-states.js";
+import { isTerminal, autoBlockTarget, TERMINAL } from "../domain/task-states.js";
 import { instructionForRole } from "../domain/utility-instructions.js";
 import { rolesFor } from "../domain/workflow-profiles.js";
 import path from "node:path";
@@ -255,6 +242,22 @@ export function createSupervisor({
     db: database, logger,
     loadConfig: (opts) => loadVaultProjectorConfig({ ...opts, stateDir: stateDirOf() }),
     debounceMs: vaultProjectorDebounceMs,
+  });
+
+  // ChatGPT review, 2026-09-14: extracted from this file (pure code move, zero behavioral change) — the
+  // shared per-task worktree lifecycle (PLAN.md §7) has its own state machine (WORKTREE_CLAIM_PENDING
+  // claim/finalize/release/reclaim), its own crash-recovery invariants, and its own dedicated tests
+  // (`runtime/test/worktree.test.js`) — a genuinely useful extraction seam, not code moved merely to
+  // shrink this file. `database` was the only real dependency these functions ever touched.
+  const { createTaskWorktree, discardTaskWorktree, requestWorktree } = createWorktreeService({ database });
+
+  // ChatGPT review, 2026-09-14: extracted from this file (pure code move, zero behavioral change) — its
+  // own lifecycle (start -> wait for a real turn -> classify -> confirmed-kill cleanup -> record
+  // model_health), its own dedicated tests (`runtime/test/preflight.test.js`). `start`/`reap`/`harnessOf`/
+  // `adapterFor` are hoisted function declarations further down this same closure — safe to reference by
+  // name here, since none of them is actually CALLED until well after every one of them is assigned.
+  const { preflight, discardPreflightRun, sweepPreflightRuns } = createPreflightService({
+    database, logger, adapters, harnessCache, adapterFor, harnessOf, start, reap,
   });
 
   /**
@@ -1642,7 +1645,37 @@ export function createSupervisor({
     // reconciliation never examined it, `list()` never showed it, the shared-pgid refusal never
     // counted it, and generation 2's own completion write was rejected by `endRun`'s
     // `ended_at IS NULL` guard — which also meant its asks were never scheduled.
-    const reopened = reopenRun(database, runId) === 1;
+    // EXTERNAL REVIEW (ChatGPT, 2026-09-14) finding 2: the terminal-task check above ran at the TOP
+    // of this function, before a whole round of real async work (MCP re-attach, spawning the
+    // resumed process) — a task that transitioned to terminal DURING that window would still get a
+    // freshly reopened run, since this call's own WHERE clause never re-checked task state. Passing
+    // `TERMINAL` here makes `reopenRun` re-verify atomically, at the one moment that actually
+    // matters — see its own doc comment in `db/index.js`.
+    const reopened = reopenRun(database, runId, { terminalStates: TERMINAL }) === 1;
+    if (!reopened && database.prepare(`SELECT ended_at FROM runs WHERE run_id = ?`).get(runId)?.ended_at != null) {
+      // The row is still closed, and it was genuinely closed before this call (not "already open,
+      // nothing to do" — the pre-existing, unrelated reason `reopened` could already be false). The
+      // ONLY way a genuinely-closed row now refuses `reopenRun` is the terminal-state guard just
+      // added: the task went terminal while this resume was in flight. `adapter.resume()` above
+      // ALREADY spawned/resumed a real process — leaving it running with no row that will ever
+      // track it again is the exact invisible-orphan shape this whole codebase exists to prevent.
+      // Stop it and refuse, rather than reporting a resume that must not be allowed to have happened.
+      for (const attachmentId of resumeMcpAttach.mcpAttachmentIds) {
+        mcpPool.detach(attachmentId).catch((detachErr) => {
+          logger.warn?.(`[supervisor] mcp-pool detach ${attachmentId} after refusing a resume whose task went terminal mid-flight for ${runId} failed (best-effort): ${detachErr.message}`);
+        });
+      }
+      try {
+        await adapter.stop(runId);
+      } catch (err) {
+        logger.error?.(`[supervisor] resume ${runId}: task went terminal mid-resume, and the just-resumed process could not be stopped: ${err.message}`);
+      }
+      return {
+        ok: false, refused: "task-terminal",
+        error: `run ${runId}'s task became terminal while this resume was in flight — refusing to leave a `
+          + "newly resumed process running with no live row tracking it; it has been stopped",
+      };
+    }
     // A resumed run is a NEW process: its recorded identity must be replaced, or a later
     // reap verifies against the identity of the process that already exited.
     const identity = await persistIdentity(runId, adapter);
@@ -1799,222 +1832,6 @@ export function createSupervisor({
       // Derived from the pump's stream, never asserted.
       derived: pump.derived(runId),
     };
-  }
-
-  // ── preflight: verify a harness/model, keep the verdict, leave nothing behind ──────────
-  //
-  // PLAN.md 12.1. Verifying that a harness/model combination is reachable means starting a REAL
-  // session and sending a REAL prompt, which writes a real `runs` row and real `event_log` rows.
-  // None of that is work anyone will ever want to read, and all of it pollutes the history a human
-  // or the CTO reads back -- "who did what" becomes twenty sessions saying "hi". So cleanup is part
-  // of the check rather than a tidy-up someone remembers later.
-  //
-  // WHAT SURVIVES: one `model_health` row -- reachable, an error CLASS, latency, when. That is a
-  // fact about the model, which is why it outlives the session; section 12.3's denylist and the
-  // settings surface read it and neither wants a run id.
-
-  /** The prompt. Short and boring on purpose: this measures reachability, not capability. */
-  const PREFLIGHT_PROMPT = "Reply with the single word: ok";
-
-  /**
-   * Classify a failure into something section 12.3 can GROUP.
-   *
-   * A free-text provider message cannot answer "is everything on Bedrock failing?", which is the
-   * question the denylist is for. The message is kept separately in `detail` for a human.
-   */
-  function classifyPreflightError(err) {
-    const m = String(err?.message ?? err ?? "").toLowerCase();
-    if (m.includes("timed out") || m.includes("timeout")) return "timeout";
-    if (m.includes("enoent") || m.includes("spawn")) return "spawn-failed";
-    if (m.includes("credential") || m.includes("unauthor") || m.includes("forbidden")
-        || m.includes("expired") || m.includes("api key") || m.includes("auth")) return "auth";
-    if (m.includes("throttl") || m.includes("rate limit") || m.includes("quota")) return "throttled";
-    return "harness-error";
-  }
-
-  /**
-   * preflight({ harnessId, workerId, cwd, model, timeoutMs }) -> the verdict.
-   *
-   * Cheap enough to run liberally, which is the whole design constraint: a check nobody runs
-   * because it is expensive protects nothing.
-   */
-  async function preflight({
-    harnessId,
-    workerId,
-    cwd,
-    model = null,
-    timeoutMs = 60_000,
-    prompt = PREFLIGHT_PROMPT,
-  } = {}) {
-    if (!harnessId) throw new Error("preflight: harnessId is required");
-    if (!workerId) throw new Error("preflight: workerId is required");
-    if (!cwd) throw new Error("preflight: cwd is required");
-    // Called for its throw, not its value: an unknown harness must fail here rather than after a
-    // `runs` row exists. `adapterFor` is the single place that knows what is registered.
-    adapterFor(harnessId);
-
-    const startedAt = Date.now();
-    let runId = null;
-    let verdict = null;
-
-    try {
-      // The TIGHTEST environment available (PLAN.md 4.1): answering "ok" needs no MCP servers, no
-      // hooks and no skills, and every one of those is pure cost on a check whose point is being
-      // cheap. `ephemeral` adds `--no-session-persistence` where the harness supports it, so there
-      // is no harness-side session to clean up at all -- not writing it beats deleting it, because
-      // a delete can fail and a crash can pre-empt it.
-      //
-      // `envProfile` is NOT passed to harnesses that refuse it (OpenCode), so this builds the spec
-      // per harness rather than sending one shape everywhere and hoping. The refusal is deliberate
-      // over there and working around it here would defeat the point of having it.
-      const spec = {
-        prompt,
-        cwd,
-        isPreflight: true,
-        ephemeral: true,
-        ...(model ? { model } : {}),
-        ...(harnessId === "claude-code" ? { envProfile: "none", approvalMode: "off" } : {}),
-      };
-
-      ({ runId } = await start({ harnessId, workerId, spec }));
-
-      // Wait for the harness to actually produce a turn. `turn.end` is the normalized terminal
-      // event both adapters emit (Group 4 finding B4), so this does not care which harness it is.
-      const deadline = startedAt + timeoutMs;
-      let sawTurnEnd = null;
-      for (;;) {
-        const events = database
-          .prepare(`SELECT type, payload_json FROM event_log WHERE run_id = ? ORDER BY seq`)
-          .all(runId);
-        sawTurnEnd = events.find((e) => e.type === "turn.end");
-        if (sawTurnEnd) break;
-        // A process that died without ever producing a turn is a distinct, useful outcome: the
-        // binary ran but the model never answered.
-        const died = events.find((e) => e.type === "process.exit" || e.type === "process.error");
-        if (died) {
-          verdict = { reachable: false, errorClass: "no-response", detail: `process ended before any turn (${died.type})` };
-          break;
-        }
-        if (Date.now() > deadline) {
-          verdict = { reachable: false, errorClass: "timeout", detail: `no turn within ${timeoutMs}ms` };
-          break;
-        }
-        await new Promise((r) => setTimeout(r, 100));
-      }
-
-      if (!verdict && sawTurnEnd) {
-        const payload = sawTurnEnd.payload_json ? JSON.parse(sawTurnEnd.payload_json) : {};
-        // BOTH fields, not either alone. `turn.end` carries a normalized `status`
-        // (completed|error|aborted) and a derived `isError` (Group 4 finding B4), but not every
-        // adapter sets both on every path -- the fake harness emits `status` with no `isError`, so
-        // trusting `isError` alone would read an errored turn as a success. `aborted` counts as a
-        // failure here too: an interrupted turn did not demonstrate the model answering, which is
-        // the only thing this check claims to establish.
-        const failed = payload.isError === true || (payload.status && payload.status !== "completed");
-        verdict = failed
-          ? { reachable: false, errorClass: "harness-error", detail: `turn.end status=${payload.status ?? "?"} isError=${payload.isError ?? "?"}` }
-          : { reachable: true, errorClass: "ok", detail: null };
-      }
-    } catch (err) {
-      verdict = { reachable: false, errorClass: classifyPreflightError(err), detail: String(err?.message ?? err) };
-    }
-
-    // ── cleanup, and it runs on EVERY path ───────────────────────────────────────────────
-    // Recorded BEFORE the cleanup, so a cleanup failure cannot cost us the verdict. The whole
-    // point of the check is the verdict; tidying up is bookkeeping and must not outrank it.
-    const latencyMs = Date.now() - startedAt;
-    try {
-      recordModelHealth(database, {
-        harnessId,
-        providerId: model?.providerID ?? model?.providerId ?? "",
-        modelId: typeof model === "string" ? model : (model?.modelID ?? model?.modelId ?? ""),
-        reachable: verdict.reachable,
-        errorClass: verdict.errorClass,
-        detail: verdict.detail,
-        latencyMs,
-      });
-    } catch (err) {
-      logger.error?.(`[supervisor] preflight verdict could not be recorded: ${err.message}`);
-    }
-
-    const cleanup = runId ? await discardPreflightRun(runId, harnessId) : { deleted: false, reason: "never started" };
-    return { ...verdict, latencyMs, harnessId, cleanup };
-  }
-
-  /**
-   * Stop a preflight run, drop the harness's own session record where it can be dropped, and
-   * delete the rows.
-   *
-   * Separate from `preflight()` because reconciliation needs it too: a preflight that CRASHED is
-   * found by the ordinary orphan path (PLAN.md 12.1 -- "the same reconciliation path, not a second
-   * mechanism"), and once that path has done its terminal write the row still has to be removed.
-   */
-  async function discardPreflightRun(runId, harnessId = harnessOf(runId)) {
-    const adapter = harnessId ? adapters[harnessId] : null;
-    try {
-      await adapter?.stop?.(runId);
-    } catch (err) {
-      logger.warn?.(`[supervisor] preflight ${runId} would not stop cleanly: ${err.message}`);
-    }
-
-    // Only where the harness kept a session at all. Claude Code preflights pass
-    // `--no-session-persistence`, so there is nothing to delete; OpenCode has no such flag, so its
-    // adapter deletes BY THE ID IT CREATED -- never by enumerating, because its session store is
-    // global and enumerating would read other projects' history.
-    // Detach the pump BEFORE the rows go, and this ordering is load-bearing rather than tidy.
-    // The pump keeps consuming the adapter's stream until it is closed, and every event it
-    // persists for a deleted run violates the `event_log.run_id` foreign key. Measured on the real
-    // CLI before this line existed: each preflight logged
-    // "[pump] recordEvent failed ... FOREIGN KEY constraint failed" as the tail of the stream
-    // arrived after the delete. Non-fatal, but it is a run whose state the pump still holds and a
-    // warning on every single check -- and log noise that is expected is log noise nobody reads.
-    //
-    // `closeRun` is the same call `stop`/`reap` use, so this is not a preflight-specific mechanism.
-    pump.closeRun(runId);
-
-    let sessionDiscarded = null;
-    if (typeof adapter?.discardSession === "function") {
-      sessionDiscarded = await adapter.discardSession(runId);
-      if (!sessionDiscarded.discarded) {
-        logger.warn?.(`[supervisor] preflight ${runId}: harness session not discarded (${sessionDiscarded.reason})`);
-      }
-    }
-
-    try {
-      const removed = deletePreflightRun(database, runId);
-      harnessCache.delete(runId);
-      // NOT dropping pump state here. It is retained for completed runs on purpose (see
-      // runtime/FINDINGS.md's open items: that state is what `status()`/`list()` read for
-      // `derived`, so releasing it makes a just-finished run report `derived: null`). An earlier
-      // draft called a `pump.forget()` that does not exist, via `?.` -- so it silently did nothing
-      // and read as though cleanup were happening. Bounded retention is the real fix and is
-      // tracked there, not worked around here.
-      return { ...removed, sessionDiscarded };
-    } catch (err) {
-      // A refusal here means the runId was not a preflight, which is a caller bug and must be
-      // loud: this is the only destructive delete in the codebase.
-      logger.error?.(`[supervisor] preflight rows for ${runId} were NOT deleted: ${err.message}`);
-      return { deleted: false, reason: err.message, sessionDiscarded };
-    }
-  }
-
-  /**
-   * Sweep preflight rows that outlived their check -- a supervisor killed mid-preflight leaves one.
-   *
-   * Only TERMINAL preflights are deleted. An OPEN one may still be running (its own supervisor may
-   * be alive and mid-check), and deleting the row of a live process is how you manufacture an
-   * orphan nothing can ever reap -- the exact bug migration 0003 exists to prevent. So this waits
-   * for reconciliation to reach a terminal state first, and only then removes the row.
-   */
-  async function sweepPreflightRuns() {
-    const stale = listPreflightRuns(database).filter((r) => r.ended_at !== null);
-    const swept = [];
-    for (const row of stale) {
-      const result = await discardPreflightRun(row.run_id, row.harness_id);
-      if (result.deleted) swept.push(row.run_id);
-    }
-    if (swept.length) logger.log?.(`[supervisor] swept ${swept.length} finished preflight run(s)`);
-    return { swept };
   }
 
   // ── tier-3 task handoffs (PLAN.md section 8, Rule 4) ────────────────────────────────
@@ -3449,583 +3266,6 @@ export function createSupervisor({
   }
 
   /**
-   * Resolve a linked worktree's main repo root by asking git, rather than assuming a path convention.
-   *
-   * Used by `discardTaskWorktree`/`requestWorktree`, which only have a worktree path in hand (not the
-   * original `repoPath` a caller supplied to `createTaskWorktree`) — `git worktree remove`/`git worktree add`
-   * both need to run with the repo root as `cwd`, and re-deriving it via git is robust to whatever path
-   * convention `createTaskWorktree` uses, rather than hard-coding "three `dirname()` calls up".
-   */
-  async function repoRootFromWorktree(worktreePath) {
-    try {
-      const { stdout } = await execFileAsync("git", ["rev-parse", "--git-common-dir"], {
-        cwd: worktreePath, encoding: "utf8", timeout: 10_000,
-      });
-      const raw = String(stdout).trim();
-      const commonDir = path.isAbsolute(raw) ? raw : path.resolve(worktreePath, raw);
-      return path.dirname(commonDir); // commonDir is "<repoRoot>/.git"
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * createTaskWorktree(taskId, { repoPath, branch }) -> the shared per-task worktree (PLAN.md §7).
-   *
-   * ONE worktree per task, not one per session or run: a task's coder(s) and reviewer(s) are deliberately
-   * looking at the same revision (§13's quorum on one commit), so every worker later assigned to the task
-   * attaches to this same path through `assignTask`'s existing `cwd ?? task.worktree_id` fallback — nothing
-   * downstream needs to change for that to work.
-   *
-   * `repoPath` is caller-supplied on purpose. `tasks.repo_id` exists in the schema but nothing anywhere reads
-   * or writes it (checked, not assumed) — inventing a repo-path registry here would be a second, unrequested
-   * design decision. This follows the same pattern `assignTask({ cwd })` already uses for the same reason.
-   *
-   * Idempotent: if the task already has a `worktree_id` and that path still exists on disk, this returns it
-   * rather than re-running `git worktree add` — a retried `start`, or a caller that doesn't know whether an
-   * earlier attempt actually landed, is safe to call again.
-   */
-  /**
-   * Cross-process creation race, added 2026-09-11 (`codexdoc/review-phase7-uncommitted.md` finding 2,
-   * blocking): two processes could both read `worktree_id = NULL` for the same task, both run real
-   * `git worktree add` in parallel, and both get `created: true` back — Git's per-repo lock has nothing
-   * to say about the per-TASK invariant "one worktree, one registered path." Fixed with the same
-   * "claim a status marker before doing the real work, only the winner proceeds" pattern already proven
-   * for `mcp-pool.js`'s `claimPoolSlot`: `claimTaskWorktreeSlot` reserves the slot with
-   * `WORKTREE_CLAIM_PENDING` inside a `BEGIN IMMEDIATE` compare-and-swap, so exactly one caller ever runs
-   * git for a given task at a time. A caller that loses the claim polls (bounded, ~2s total) for the
-   * winner's real result rather than racing it or hanging forever.
-   */
-  // How long a PENDING claim can sit unfinalized before another caller is allowed to try recovering it
-  // (`codexdoc/review-luna-2026-09-11.md` finding 6). Deliberately far above the poll budget below (a
-  // real `git worktree add` has its own 30s timeout) — this is "the claimant probably crashed", not
-  // "the claimant is slow."
-  const STALE_WORKTREE_CLAIM_MS = 60_000;
-
-  /** `.git/ctd-worktrees/<taskId>` is the one deterministic path every claimant for a given
-   *  `(repoPath, taskId)` pair computes — used both by a normal claim and by stale-claim recovery to
-   *  check whether a dead claimant's git work already landed before deciding whether to redo it. */
-  function taskWorktreePath(resolvedRepoPath, taskId) {
-    return path.join(resolvedRepoPath, ".git", "ctd-worktrees", taskId);
-  }
-
-  /** A real linked worktree has a `.git` FILE (not a repo) pointing back at the main repo's gitdir —
-   *  cheap, local, no git invocation needed, sufficient to tell "the crashed claimant already finished"
-   *  from "nothing happened yet." */
-  function looksLikeRealWorktree(worktreePath) {
-    try {
-      return fs.existsSync(worktreePath) && fs.existsSync(path.join(worktreePath, ".git"));
-    } catch {
-      return false;
-    }
-  }
-
-  async function runGitWorktreeAdd({ resolvedRepoPath, worktreePath, worktreeBranch }) {
-    try {
-      await execFileAsync("git", ["worktree", "add", "-b", worktreeBranch, worktreePath], {
-        cwd: resolvedRepoPath, timeout: 30_000,
-      });
-      return { ok: true };
-    } catch {
-      // The branch may already exist — a prior partial attempt, or one created out of band — so retry
-      // attaching to it before giving up, rather than treating "branch exists" as a hard failure.
-      try {
-        await execFileAsync("git", ["worktree", "add", worktreePath, worktreeBranch], {
-          cwd: resolvedRepoPath, timeout: 30_000,
-        });
-        return { ok: true };
-      } catch (err2) {
-        return { ok: false, error: err2 };
-      }
-    }
-  }
-
-  async function createTaskWorktree(taskId, { repoPath, branch, principal = null } = {}) {
-    if (!taskId) throw new Error("createTaskWorktree: taskId is required");
-    // review-sol-2026-09-13.md finding 2 (create side): same ownership boundary as `discardTaskWorktree`
-    // below — a worker/reviewer principal may create a worktree only for the task it is assigned to.
-    if (principal?.workerId) {
-      const assignedTaskId = database.prepare(`SELECT task_id FROM workers WHERE worker_id = ?`).get(principal.workerId)?.task_id ?? null;
-      if (assignedTaskId !== taskId) {
-        return {
-          ok: false, refused: "not-your-task",
-          error: `principal is authenticated as worker ${principal.workerId}, assigned to task ${assignedTaskId ?? "(none)"}, `
-            + `not ${taskId} — a worker may only create the worktree of its own currently-assigned task`,
-        };
-      }
-    }
-    if (!repoPath) {
-      throw new Error(
-        "createTaskWorktree: repoPath is required — there is no repo-path registry (tasks.repo_id is unused), "
-        + "so the caller must say where the repo lives",
-      );
-    }
-    // Canonicalized once, up front — this is both the identity a mismatch is checked against
-    // (`codexdoc/review-luna-2026-09-11.md` finding 5) and the value persisted alongside the claim.
-    const resolvedRepoPath = path.resolve(repoPath);
-
-    const POLL_ATTEMPTS = 40;
-    const POLL_INTERVAL_MS = 50;
-
-    for (let attempt = 0; attempt <= POLL_ATTEMPTS; attempt += 1) {
-      const task = database
-        .prepare(`SELECT id, worktree_id, branch, worktree_repo_path FROM tasks WHERE id = ?`)
-        .get(taskId);
-      if (!task) throw new Error(`createTaskWorktree: no such task ${taskId}`);
-
-      // Finding 5: a conflicting caller must be refused, not handed someone else's repo/branch as if it
-      // were idempotent success — checked against BOTH an already-finalized worktree (below) and a
-      // still-pending claim (further down), because the row now carries this identity from claim time.
-      const repoMismatch = task.worktree_repo_path && task.worktree_repo_path !== resolvedRepoPath;
-      const branchMismatch = branch && task.branch && branch !== task.branch;
-      const mismatchResult = (kind) => ({
-        ok: false, refused: kind,
-        error: kind === "worktree-repo-mismatch"
-          ? `task ${taskId}'s worktree is bound to ${task.worktree_repo_path}, not ${resolvedRepoPath} — `
-            + "refusing to hand a conflicting caller a different repository's worktree"
-          : `task ${taskId}'s worktree is bound to branch "${task.branch}", not "${branch}"`,
-      });
-
-      if (task.worktree_id && task.worktree_id !== WORKTREE_CLAIM_PENDING && fs.existsSync(task.worktree_id)) {
-        if (repoMismatch) return mismatchResult("worktree-repo-mismatch");
-        if (branchMismatch) return mismatchResult("worktree-branch-mismatch");
-        return { taskId, worktreeId: task.worktree_id, branch: task.branch, created: false };
-      }
-
-      if (task.worktree_id === WORKTREE_CLAIM_PENDING) {
-        if (repoMismatch) return mismatchResult("worktree-repo-mismatch");
-        if (branchMismatch) return mismatchResult("worktree-branch-mismatch");
-
-        // A DIFFERENT caller is claiming right now — wait for its result rather than racing it.
-        if (attempt === POLL_ATTEMPTS) {
-          // Finding 6: the poll budget alone can't tell "a real, still-running claimant" from "a dead
-          // one" — a real `git worktree add` can legitimately take up to its own 30s timeout. Only
-          // treat this as recoverable once the claim has sat unfinalized far longer than any real
-          // attempt should.
-          const staleBeforeIso = new Date(Date.now() - STALE_WORKTREE_CLAIM_MS).toISOString();
-          const reclaim = reclaimStaleTaskWorktreeClaim(database, taskId, { staleBeforeIso });
-          if (!reclaim.reclaimed) {
-            return {
-              ok: false, refused: "worktree-claim-pending",
-              error: `another process is creating task ${taskId}'s worktree — retry shortly`,
-            };
-          }
-
-          // We now own the previously-stale claim, under a FRESH token (finding 9) — the original
-          // claimant, if it wakes up later and still holds only its OLD token, can no longer finalize or
-          // release this claim; only this reclaim's own `claimToken` can from this point on. The dead
-          // claimant may have finished the real `git worktree add` before it died — check disk before
-          // redoing work that already landed.
-          const worktreeBranch = task.branch ?? branch ?? `ctd/${taskId}`;
-          const worktreePath = taskWorktreePath(resolvedRepoPath, taskId);
-
-          // review-consolidated-2026-09-14.md finding 3: the dead claimant might not have been a CREATE
-          // at all — a `discardTaskWorktree` call can crash after `git worktree remove` (the directory is
-          // genuinely, deliberately gone) but before finalizing to NULL. Without this check, seeing "no
-          // directory" below reads identically to "a create never got that far" and this function's own
-          // recovery would run `git worktree add`, REVERSING a completed, deliberate deletion. `op` is
-          // whatever the DEAD claimant recorded when it claimed (see migration 0017) — a discard op with
-          // no real directory on disk means the deletion already happened; refuse instead of redoing.
-          if (reclaim.op === "discard" && !looksLikeRealWorktree(worktreePath)) {
-            const finalizedAsDiscarded = finalizeTaskWorktreeSlot(database, taskId, {
-              worktreeId: null, branch: null, repoPath: null, claimToken: reclaim.claimToken,
-            });
-            return {
-              ok: false, refused: "worktree-was-discarded",
-              error: `task ${taskId}'s worktree was already discarded by a crashed process (its claim just `
-                + `recovered) — refusing to recreate a worktree that was deliberately deleted`
-                + (finalizedAsDiscarded.finalized ? "" : "; the task row may still show a stale claim, investigate manually"),
-            };
-          }
-
-          if (looksLikeRealWorktree(worktreePath)) {
-            const finalizedAdopt = finalizeTaskWorktreeSlot(database, taskId, {
-              worktreeId: worktreePath, branch: worktreeBranch, repoPath: resolvedRepoPath, claimToken: reclaim.claimToken,
-            });
-            // review-sol-2026-09-13.md finding 9's other half: a `finalized: false` here means a THIRD
-            // party reclaimed this same claim out from under us (our own reclaim itself sat unfinalized
-            // past the stale window) — retry rather than reporting success for a write that did not land.
-            if (!finalizedAdopt.finalized) {
-              return {
-                ok: false, refused: "worktree-claim-superseded",
-                error: `task ${taskId}'s worktree claim was reclaimed by another process before this adoption could finalize — retry`,
-              };
-            }
-            return {
-              taskId, worktreeId: worktreePath, branch: worktreeBranch, created: false,
-              recoveredFromCrashedClaim: true,
-            };
-          }
-
-          fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
-          const added = await runGitWorktreeAdd({ resolvedRepoPath, worktreePath, worktreeBranch });
-          if (!added.ok) {
-            releaseTaskWorktreeClaim(database, taskId, { previousValue: null, claimToken: reclaim.claimToken });
-            return { ok: false, error: added.error.message, refused: "git-worktree-add-failed" };
-          }
-          const finalizedRedo = finalizeTaskWorktreeSlot(database, taskId, {
-            worktreeId: worktreePath, branch: worktreeBranch, repoPath: resolvedRepoPath, claimToken: reclaim.claimToken,
-          });
-          if (!finalizedRedo.finalized) {
-            return {
-              ok: false, refused: "worktree-claim-superseded",
-              error: `task ${taskId}'s worktree claim was reclaimed by another process before this redo could finalize — retry`,
-            };
-          }
-          return {
-            taskId, worktreeId: worktreePath, branch: worktreeBranch, created: true,
-            recoveredFromCrashedClaim: true,
-          };
-        }
-        await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-        continue;
-      }
-
-      // `task.worktree_id` is NULL, or a stale path nothing exists at any more — attempt the claim.
-      const worktreeBranch = branch ?? task.branch ?? `ctd/${taskId}`;
-      const claim = claimTaskWorktreeSlot(database, taskId, {
-        previousValue: task.worktree_id, repoPath: resolvedRepoPath, branch: worktreeBranch, op: "create",
-      });
-      if (!claim.claimed) {
-        // Something changed between our read and our claim attempt (another claim landed, or a result
-        // did) — re-read and decide again rather than assuming we permanently lost.
-        continue;
-      }
-
-      // We hold the claim: we are the ONLY caller running git for this task right now.
-      const worktreePath = taskWorktreePath(resolvedRepoPath, taskId);
-      fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
-
-      const added = await runGitWorktreeAdd({ resolvedRepoPath, worktreePath, worktreeBranch });
-      if (!added.ok) {
-        releaseTaskWorktreeClaim(database, taskId, {
-          previousValue: task.worktree_id, previousBranch: task.branch, previousRepoPath: task.worktree_repo_path,
-          claimToken: claim.claimToken,
-        });
-        return { ok: false, error: added.error.message, refused: "git-worktree-add-failed" };
-      }
-
-      const finalized = finalizeTaskWorktreeSlot(database, taskId, {
-        worktreeId: worktreePath, branch: worktreeBranch, repoPath: resolvedRepoPath, claimToken: claim.claimToken,
-      });
-      if (!finalized.finalized) {
-        // finding 9's other half: our own claim sat unfinalized long enough that a later caller's
-        // `reclaimStaleTaskWorktreeClaim` minted a NEW token and took it over before this real `git
-        // worktree add` (which just succeeded) could finalize. The work on disk is real and will be
-        // discovered/adopted by whoever now holds the claim (`looksLikeRealWorktree`, above) — reporting
-        // success here for a write that did not land would be the exact lie this fix exists to prevent.
-        return {
-          ok: false, refused: "worktree-claim-superseded",
-          error: `task ${taskId}'s worktree claim was reclaimed by another process before this could finalize — retry`,
-        };
-      }
-      return { taskId, worktreeId: worktreePath, branch: worktreeBranch, created: true };
-    }
-
-    // Unreachable in practice — the pending-poll branch above returns at its own budget — but a loop
-    // that could theoretically fall through must not return `undefined`.
-    return { ok: false, refused: "worktree-claim-timeout", error: `could not claim task ${taskId}'s worktree slot` };
-  }
-
-  /**
-   * discardTaskWorktree(taskId) -> removes the shared worktree once the task no longer needs it.
-   *
-   * Refuses on a non-terminal task, the same "refuse rather than silently do something surprising" pattern
-   * `reap` already uses for an adopted run — a worker or reviewer could still be attached to this path, and
-   * removing it out from under a live run is exactly the accident §7's clean-vs-kill rule exists to prevent
-   * elsewhere.
-   */
-  /** `git status --porcelain` against a worktree path — empty output means clean. Returns `false` (not
-   *  dirty) if git itself can't answer, since a discard should not be blocked on an unreadable tree; the
-   *  caller-facing consequence is the same "refuse rather than guess" posture as everywhere else here. */
-  /**
-   * review-sol-2026-09-13.md finding 7: this used to return a bare boolean, and its `catch` returned
-   * `false` — meaning "clean" — for a `git status` failure OR timeout, not just a genuinely clean
-   * worktree. `discardTaskWorktree`'s caller then ran `git worktree remove --force` on that "clean"
-   * verdict, so a permissions error, repo corruption, or a slow disk authorized destroying real
-   * uncommitted work that was never actually checked. Now returns one of three states so "could not
-   * tell" is a distinguishable, refusable outcome rather than silently downgraded to "clean".
-   */
-  async function worktreeStatus(worktreePath) {
-    try {
-      const { stdout } = await execFileAsync("git", ["status", "--porcelain"], {
-        cwd: worktreePath, encoding: "utf8", timeout: 10_000,
-      });
-      return { state: String(stdout).trim().length > 0 ? "dirty" : "clean" };
-    } catch (err) {
-      return { state: "error", error: err.message };
-    }
-  }
-
-  async function discardTaskWorktree(taskId, { actor = "owner", force = false, principal = null } = {}) {
-    if (!taskId) throw new Error("discardTaskWorktree: taskId is required");
-    // review-sol-2026-09-13.md finding 2: `task:worktree` is granted to `worker`/`reviewer` so a run can
-    // `requestWorktree` its own overlay (that self-service case is already ownership-bound, see
-    // `requestWorktree` above) — but `discardTaskWorktree` took ANY taskId with no ownership check at
-    // all, so a worker assigned to task A could force-discard task B's worktree, and `force: true` was
-    // reachable by a worker-backed principal at all. A worker/reviewer principal may act only on the
-    // task it is CURRENTLY assigned to (`workers.task_id`), and may never pass `force: true` — that is
-    // reserved for owner/CTO (no `workerId` on the principal), same boundary `requestWorktree` draws.
-    if (principal?.workerId) {
-      if (force) {
-        return {
-          ok: false, refused: "force-not-permitted",
-          error: "a worker/reviewer principal may not force-discard a worktree — force is reserved for owner/CTO",
-        };
-      }
-      const assignedTaskId = database.prepare(`SELECT task_id FROM workers WHERE worker_id = ?`).get(principal.workerId)?.task_id ?? null;
-      if (assignedTaskId !== taskId) {
-        return {
-          ok: false, refused: "not-your-task",
-          error: `principal is authenticated as worker ${principal.workerId}, assigned to task ${assignedTaskId ?? "(none)"}, `
-            + `not ${taskId} — a worker may only discard the worktree of its own currently-assigned task`,
-        };
-      }
-    }
-    const task = database
-      .prepare(`SELECT id, state, worktree_id, branch, worktree_repo_path FROM tasks WHERE id = ?`)
-      .get(taskId);
-    if (!task) throw new Error(`discardTaskWorktree: no such task ${taskId}`);
-    if (!isTerminal(task.state)) {
-      return {
-        ok: false, refused: "not-terminal",
-        error: `task ${taskId} is "${task.state}", not terminal — refusing to discard a worktree work may still be attached to`,
-      };
-    }
-    if (!task.worktree_id) return { taskId, discarded: false, reason: "no worktree to discard" };
-    // Someone else (a concurrent createTaskWorktree redo/adoption, or another discard that landed the
-    // instant before this read) already holds the slot — `claimTaskWorktreeSlot`'s CAS is keyed on
-    // `previousValue` matching the CURRENT row, so passing the pending marker itself through as
-    // `previousValue` would incorrectly "succeed" at re-claiming an already-claimed slot and mint a
-    // second, competing token. Refuse instead of racing it — UNLESS the claim has gone stale, in which
-    // case a caller that only ever refused here forever is exactly review-consolidated-2026-09-14.md
-    // finding 3's "permanently wedged discard": nothing but manual DB surgery could ever clear it, since
-    // `reclaimStaleTaskWorktreeClaim` (before this fix) had exactly one caller — `createTaskWorktree`.
-    if (task.worktree_id === WORKTREE_CLAIM_PENDING) {
-      const staleBeforeIso = new Date(Date.now() - STALE_WORKTREE_CLAIM_MS).toISOString();
-      const reclaim = reclaimStaleTaskWorktreeClaim(database, taskId, { staleBeforeIso });
-      if (!reclaim.reclaimed) {
-        return {
-          ok: false, refused: "worktree-claim-conflict",
-          error: `task ${taskId}'s worktree slot is already claimed by another in-flight create/discard — retry shortly`,
-        };
-      }
-      // We now hold the previously-stale claim under a fresh token. Whatever the dead claimant was
-      // doing, THIS call's own goal is always the same end state: no worktree, `worktree_id = NULL`.
-      // `task.worktree_repo_path`/`task.branch` are the values recorded AT CLAIM TIME (migration 0014),
-      // which for a legitimate crashed discard are the task's own real values, read and re-passed
-      // unchanged by discard's own claim call below — that is what lets us reconstruct the real,
-      // deterministic worktree path here even though `task.worktree_id` itself is just the marker.
-      const recoveredWorktreePath = task.worktree_repo_path ? taskWorktreePath(task.worktree_repo_path, taskId) : null;
-      if (recoveredWorktreePath && looksLikeRealWorktree(recoveredWorktreePath)) {
-        const openRunsDuringRecovery = database.prepare(
-          `SELECT r.run_id AS runId FROM runs r JOIN workers w ON r.worker_id = w.worker_id
-            WHERE w.task_id = ? AND r.ended_at IS NULL`,
-        ).all(taskId);
-        if (openRunsDuringRecovery.length > 0) {
-          // Leave the claim pending under our fresh token rather than releasing it back to a marker a
-          // dead process no longer controls — a later retry (after this run ends, or after another
-          // stale window) will reclaim it again and can proceed once it's actually safe to.
-          return {
-            ok: false, refused: "open-run",
-            error: `task ${taskId} has ${openRunsDuringRecovery.length} open run(s) still assigned — `
-              + "refusing to finish a crashed discard's removal while one is live; stop or reap them first",
-          };
-        }
-        const recoveryRepoRoot = await repoRootFromWorktree(recoveredWorktreePath) ?? task.worktree_repo_path;
-        try {
-          await execFileAsync("git", ["worktree", "remove", "--force", recoveredWorktreePath], {
-            cwd: recoveryRepoRoot, timeout: 30_000,
-          });
-        } catch (err) {
-          return { ok: false, error: err.message, refused: "git-worktree-remove-failed" };
-        }
-      }
-      // Either the directory never existed by the time we got here (the crashed process's own `git
-      // worktree remove` already succeeded before it died) or we just finished removing it above —
-      // either way, the end state is the same: finalize to NULL.
-      const finalizedRecovery = finalizeTaskWorktreeSlot(database, taskId, {
-        worktreeId: null, branch: null, repoPath: null, claimToken: reclaim.claimToken,
-      });
-      if (!finalizedRecovery.finalized) {
-        return {
-          ok: false, refused: "worktree-claim-superseded",
-          error: `task ${taskId}'s worktree was removed on disk, but the claim was superseded before the `
-            + "database could be finalized — the task row may still show a stale claim; investigate manually",
-        };
-      }
-      return { taskId, discarded: true, actor, recoveredFromCrashedClaim: true };
-    }
-
-    // review-sol-2026-09-13.md finding 8: everything below used to be a plain check-then-act against
-    // `task.worktree_id` with no reservation of its own — the open-run check, the clean/dirty check, and
-    // `git worktree remove` could all observe a safe state and still race a CONCURRENT
-    // `createTaskWorktree`/`assignTask` call landing in the same window, which uses `task.worktree_id`
-    // (including mid-removal) as a spawn `cwd`. Claiming the slot with the SAME CAS `createTaskWorktree`
-    // itself uses closes that: it flips `worktree_id` to the pending marker atomically, so a concurrent
-    // `createTaskWorktree` sees `WORKTREE_CLAIM_PENDING` and polls (never a half-removed directory), and
-    // `assignTask`'s `cwd: task.worktree_id` resolution — which cannot itself hold this claim — spawns
-    // against the marker string and fails loudly instead of writing into a directory about to be deleted.
-    const claim = claimTaskWorktreeSlot(database, taskId, {
-      previousValue: task.worktree_id, repoPath: task.worktree_repo_path ?? null, branch: task.branch ?? null, op: "discard",
-    });
-    if (!claim.claimed) {
-      return {
-        ok: false, refused: "worktree-claim-conflict",
-        error: `task ${taskId}'s worktree slot changed before discard could claim it (now: ${claim.currentValue ?? "(none)"}) `
-          + "— another create/discard is in progress for this task, retry",
-      };
-    }
-    const releaseClaim = () => releaseTaskWorktreeClaim(database, taskId, {
-      previousValue: task.worktree_id, previousBranch: task.branch, previousRepoPath: task.worktree_repo_path,
-      claimToken: claim.claimToken,
-    });
-
-    // TASK STATE AND RUN TERMINATION ARE SEPARATE MECHANISMS — `mergeTask` itself moves a task to
-    // `merged` without stopping any run using it, so "terminal task state" was never actually the safety
-    // backstop this function's comment above claimed. An open run can still be writing into this exact
-    // worktree when the task above it is already cancelled/failed/merged. Found by both codex reviews
-    // (`codexdoc/review-phase7-uncommitted.md` finding 3, `codexdoc/REVIEW-NOTES.md` finding 4), fixed
-    // 2026-09-11. `runs` carries no task_id of its own (task attribution is via the worker's CURRENT
-    // assignment) — same join `changedPathsFor`/other task-scoped run lookups already use.
-    const openRuns = database.prepare(
-      `SELECT r.run_id AS runId FROM runs r JOIN workers w ON r.worker_id = w.worker_id
-        WHERE w.task_id = ? AND r.ended_at IS NULL`,
-    ).all(taskId);
-    if (openRuns.length > 0) {
-      releaseClaim();
-      return {
-        ok: false, refused: "open-run",
-        error: `task ${taskId} has ${openRuns.length} open run(s) still assigned (${openRuns.map((r) => r.runId).join(", ")}) — `
-          + "terminal task state alone is not a filesystem-lifecycle lock; stop or reap them first",
-      };
-    }
-
-    // The open-run check above protects a LIVE worker, not the DATA a dead one already produced —
-    // `codexdoc/review-luna-2026-09-11.md` finding 8: a terminal task with no open run can still have an
-    // uncommitted file sitting in its worktree, and the unconditional `--force` below deleted it with no
-    // trace. Refuse by default; `force: true` is the explicit, named override, not a default no one chose.
-    // Note: `force` reaching this point at all means the caller was owner/CTO — the check above already
-    // refused it for a worker/reviewer principal.
-    if (!force) {
-      const status = await worktreeStatus(task.worktree_id);
-      if (status.state !== "clean") {
-        releaseClaim();
-        return {
-          ok: false, refused: status.state === "dirty" ? "worktree-dirty" : "worktree-status-unknown",
-          error: status.state === "dirty"
-            ? `task ${taskId}'s worktree has uncommitted changes — pass { force: true } to discard them anyway`
-            : `could not determine whether task ${taskId}'s worktree is clean (${status.error}) — `
-              + "refusing to discard on an unverified status; pass { force: true } to discard anyway",
-        };
-      }
-    }
-
-    const repoRoot = await repoRootFromWorktree(task.worktree_id);
-    if (!repoRoot) {
-      releaseClaim();
-      return { ok: false, refused: "git-error", error: `could not resolve the repo root for ${task.worktree_id}` };
-    }
-    try {
-      await execFileAsync("git", ["worktree", "remove", "--force", task.worktree_id], {
-        cwd: repoRoot, timeout: 30_000,
-      });
-    } catch (err) {
-      releaseClaim();
-      return { ok: false, error: err.message, refused: "git-worktree-remove-failed" };
-    }
-
-    const finalized = finalizeTaskWorktreeSlot(database, taskId, {
-      worktreeId: null, branch: null, repoPath: null, claimToken: claim.claimToken,
-    });
-    if (!finalized.finalized) {
-      // The claim sat unfinalized long enough (or was otherwise superseded) that this write did not
-      // land — the git-level removal already happened, but reporting `discarded: true` here would claim
-      // a database write that did not take effect.
-      return {
-        ok: false, refused: "worktree-claim-superseded",
-        error: `task ${taskId}'s worktree was removed on disk, but the claim was superseded before the database `
-          + "could be finalized — the task row may still show a stale worktree_id; investigate manually",
-      };
-    }
-
-    return { taskId, discarded: true, actor };
-  }
-
-  /**
-   * requestWorktree(runId, { reason }) -> an isolated OVERLAY worktree for one run (PLAN.md §7's explicit
-   * opt-out from the task's shared worktree).
-   *
-   * The default is the task's ONE shared worktree, created by `createTaskWorktree`; this exists only for a
-   * run that needs isolated testing/experimentation it does not want landing in the shared tree. `reason` is
-   * required — §16's "never guess an underspecified request" — and logged to `agent_journal`, the same
-   * "task history, not memory" log every other command already writes through `authorizedCommandHandlers()`,
-   * so it is queryable later: which runs branched off for isolated work, and why. (That wrapper already
-   * journals this call generically on every outcome; the extra call below mirrors `grantApproval`'s own
-   * pattern of a SECOND, human-readable entry carrying detail the generic one does not capture — here, the
-   * actual reason text, not just the command name and taskId.)
-   *
-   * Branches off the task's CURRENT HEAD, at a path alongside the shared worktree rather than nested inside
-   * it, so discarding one never touches the other.
-   */
-  async function requestWorktree(runId, { reason, principal = null } = {}) {
-    if (!runId) throw new Error("requestWorktree: runId is required");
-    if (!reason) {
-      return { ok: false, refused: "missing-reason", error: "a reason is required for an isolated worktree request" };
-    }
-    // Cross-run ownership binding, added 2026-09-11 (`codexdoc/review-phase7-uncommitted.md` finding 4):
-    // a worker-backed principal may only request an overlay for ITS OWN run — without this, worker A's
-    // token could request (and later be journaled as the requester of) an overlay for worker B's run. A
-    // principal with no `workerId` (owner/CTO) is unrestricted — that delegation question is deliberately
-    // not decided here, same boundary `recordVerdict`'s sibling fix drew.
-    if (principal?.workerId && workerIdForRun(database, runId) !== principal.workerId) {
-      return {
-        ok: false, refused: "not-your-run",
-        error: `principal is authenticated as worker ${principal.workerId}, which does not own run ${runId} — `
-          + "a worker may only request an overlay for its own run",
-      };
-    }
-
-    const taskId = taskIdForRun(database, runId);
-    if (!taskId) return { ok: false, refused: "no-task", error: `no task found for run ${runId}` };
-    const task = database.prepare(`SELECT id, worktree_id FROM tasks WHERE id = ?`).get(taskId);
-    if (!task?.worktree_id) {
-      return { ok: false, refused: "no-shared-worktree", error: `task ${taskId} has no shared worktree yet — create one first` };
-    }
-
-    const repoRoot = await repoRootFromWorktree(task.worktree_id);
-    if (!repoRoot) {
-      return { ok: false, refused: "git-error", error: `could not resolve the repo root for ${task.worktree_id}` };
-    }
-
-    const overlayPath = path.join(repoRoot, ".git", "ctd-overlays", runId);
-    // A DIFFERENT top-level ref namespace than the task branch (`ctd/<taskId>`), not a child of it: git
-    // refs are a filesystem-like hierarchy, so `refs/heads/ctd/<taskId>/overlay-<runId>` cannot coexist
-    // with `refs/heads/ctd/<taskId>` — "cannot lock ref ... refs/heads/ctd/<taskId> exists" (measured, not
-    // assumed; hit this exact collision while building this).
-    const overlayBranch = `ctd-overlay/${taskId}/${runId}`;
-    fs.mkdirSync(path.dirname(overlayPath), { recursive: true });
-
-    try {
-      await execFileAsync("git", ["worktree", "add", "-b", overlayBranch, overlayPath, "HEAD"], {
-        cwd: task.worktree_id, timeout: 30_000,
-      });
-    } catch (err) {
-      return { ok: false, error: err.message, refused: "git-worktree-add-failed" };
-    }
-
-    if (principal) {
-      const hash = argsHash({ runId, reason });
-      journalAppend(database, {
-        principalId: principal.id, action: "task:worktree", argsSha256: hash, taskId,
-        argsPreview: `requestWorktree ${runId}: ${reason}`.slice(0, 200), outcome: "done", detail: reason,
-      });
-    }
-
-    return { runId, taskId, worktreePath: overlayPath, branch: overlayBranch, sharedWorktreePath: task.worktree_id };
-  }
-
-  /**
    * gitCreatePush(taskId, { runId, principal, message, remote, targetBranch, ttlMs }) -> PLAN.md §8 Rule
    * 2's `push()` contract (Phase 7 step 5, 2026-09-10): `{ status: 'pushed'|'blocked'|'failed', mrUrl?,
    * attempts, unresolved? }`.
@@ -4062,6 +3302,36 @@ export function createSupervisor({
           files: [],
         },
       };
+    }
+
+    // EXTERNAL REVIEW (ChatGPT, 2026-09-14) finding 5: `paths` (`agents/git-create-push.js`'s own
+    // header, unchanged) is a real tool but was purely OPT-IN — nothing forces a real caller to use
+    // it, and `git-push-runner`'s own prompt (`domain/utility-instructions.js`) never mentions it, so
+    // a normal worker call with just `message` runs `git add -A` on a worktree PLAN.md §7 deliberately
+    // shares across every worker assigned to the task. The `git:identity` lease below only serializes
+    // concurrent PUSHES against each other — it is not, and was never meant to be, an edit lock; a
+    // coder or reviewer sharing this worktree can still write to it while this push is mid-flight,
+    // and an unscoped `add -A` would sweep that unrelated, uncommitted change into THIS commit.
+    // `runFightLoop` itself is left untouched (it is pure git mechanics with its own direct tests that
+    // deliberately exercise the plain `-A` default) — this gate lives at the one real entry point both
+    // wire commands funnel through, and only actually bites when the risk is real: a SOLO-worker task
+    // has nothing else that could be editing this worktree, so the existing default stays exactly as
+    // safe as before for the common case.
+    if (!paths) {
+      const workerCount = database.prepare(`SELECT COUNT(*) AS n FROM workers WHERE task_id = ?`).get(taskId).n;
+      if (workerCount > 1) {
+        return {
+          status: "failed",
+          attempts: [],
+          unresolved: {
+            class: "hook-other",
+            oneParagraphDiagnosis: `task ${taskId} has ${workerCount} workers sharing this worktree — an unscoped `
+              + '"git add -A" push risks staging and committing another worker\'s unrelated, uncommitted change. '
+              + 'Pass an explicit "paths" array naming exactly the files this push is for.',
+            files: [],
+          },
+        };
+      }
     }
 
     const lease = acquireLease({

@@ -192,10 +192,14 @@ await runTest("tui replay by cursor", async () => {
       });
       // Driven through `refresh()` with a scripted client, so this exercises the real code path rather
       // than a re-implementation of it.
+      // `runs` names r1 in every entry — a real server (`tuiSnapshot`) never sends a transcript for a
+      // run it doesn't also list in `runs`, and `pruneTranscripts` (ChatGPT review, 2026-09-14) relies on
+      // exactly that invariant to drop entries for runs that genuinely no longer exist.
+      const r1Run = { runId: "r1", workerId: "w1", endedAt: null, lastEventAt: "2026-09-14T00:00:00.000Z", controllable: true };
       const script = [
-        { ok: true, teams: [], tasks: [], workers: [], runs: [], transcripts: { r1: ["one"] }, provisional: { r1: "half a sen" }, cursors: { r1: 5 }, gaps: {} },
-        { ok: true, teams: [], tasks: [], workers: [], runs: [], transcripts: { r1: [] }, provisional: { r1: "half a sentence" }, cursors: { r1: 5 }, gaps: {} },
-        { ok: true, teams: [], tasks: [], workers: [], runs: [], transcripts: { r1: ["half a sentence", "two"] }, provisional: { r1: null }, cursors: { r1: 9 }, gaps: { r1: 3 } },
+        { ok: true, teams: [], tasks: [], workers: [], runs: [r1Run], transcripts: { r1: ["one"] }, provisional: { r1: "half a sen" }, cursors: { r1: 5 }, gaps: {} },
+        { ok: true, teams: [], tasks: [], workers: [], runs: [r1Run], transcripts: { r1: [] }, provisional: { r1: "half a sentence" }, cursors: { r1: 5 }, gaps: {} },
+        { ok: true, teams: [], tasks: [], workers: [], runs: [r1Run], transcripts: { r1: ["half a sentence", "two"] }, provisional: { r1: null }, cursors: { r1: 9 }, gaps: { r1: 3 } },
       ];
       let i = 0;
       const scripted = createTuiApp({
@@ -384,7 +388,8 @@ await runTest("tui replay by cursor", async () => {
             await sleep(80); // genuinely slow, so a second tick's refresh() call really does land mid-flight
             inFlight -= 1;
             return {
-              ok: true, teams: [], tasks: [], workers: [], runs: [],
+              ok: true, teams: [], tasks: [], workers: [],
+              runs: [{ runId: "r1", workerId: "w1", endedAt: null, lastEventAt: "2026-09-14T00:00:00.000Z", controllable: true }],
               transcripts: { r1: ["settled-once"] }, provisional: {}, cursors: { r1: 1 }, gaps: {},
             };
           },

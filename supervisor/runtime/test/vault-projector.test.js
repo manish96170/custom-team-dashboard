@@ -9,6 +9,8 @@
 //      even created
 //   2. enabled: real files appear — one per team/task/worker, correct YAML frontmatter, correct
 //      wikilinks, plus Dashboard.md grouping tasks by state
+//   2b. a vault directory OUTSIDE the state dir's own 0700 protection is still forced to 0700, not left
+//      at the process umask (Phase 12, permissions review, 2026-09-14)
 //   3. a deleted task's file is REMOVED on the next regeneration (strictly derived, not accumulated)
 //   4. a principal token inserted into the DB never appears in ANY written file, checked by grepping the
 //      actual file contents, not by trusting the column allowlist by inspection
@@ -73,6 +75,25 @@ await runTest("vault-projector", async () => {
       assert.match(dashboard, /### created \(1\)/);
       assert.match(dashboard, /\[\[task-1\|migrate checkout app\]\]/);
       console.log("  2. enabled: real files with correct frontmatter and wikilinks, plus Dashboard.md");
+    }
+
+    // ── 2b ───────────────────────────────────────────────────────────────────────────
+    // Phase 12 (Release hardening) permissions review: `vaultPath` defaults under the state dir (already
+    // 0700, per `db/paths.js`), but `config/vault-projector.js` explicitly lets an operator point it
+    // OUTSIDE that protection — a plain `mkdirSync` there would leave the vault at whatever the process
+    // umask dictates (typically 0755, world-readable). Use a sibling of `stateDir`, deliberately NOT
+    // nested under it, so the parent's own 0700 can't be the thing making this assertion pass by accident.
+    {
+      const outsidePath = path.join(path.dirname(stateDir), `vault-outside-${Date.now()}`);
+      try {
+        const projector = createVaultProjector({ db, loadConfig: fixedConfig({ enabled: true, vaultPath: outsidePath }) });
+        projector.project();
+        const mode = fs.statSync(outsidePath).mode & 0o777;
+        assert.equal(mode, 0o700, `expected a vault directory outside the state dir to be chmod 0700 regardless of umask, got ${mode.toString(8)}`);
+        console.log("  2b. a vault directory OUTSIDE the state dir's own 0700 is still forced to 0700, not left at the process umask");
+      } finally {
+        fs.rmSync(outsidePath, { recursive: true, force: true });
+      }
     }
 
     // ── 3 ────────────────────────────────────────────────────────────────────────────

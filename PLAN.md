@@ -803,6 +803,15 @@ harness (Claude Code, OpenCode) actually speak ACP today, or would supporting it
 maintaining a translation shim — which could cost more than the two bespoke adapters it
 was meant to replace.
 
+**SPIKE DONE, 2026-09-14 (ROADMAP.md Phase 11) — decision: do not adopt ACP now.** Ran both real
+CLIs directly rather than guessing: `opencode acp --help` is a real, working subcommand ("start ACP
+(Agent Client Protocol) server") — OpenCode speaks ACP today. `claude --help` has nothing ACP-shaped
+anywhere. With only one of the two current harnesses speaking it, adopting ACP as *the* transport still
+needs either a translation shim for Claude Code (the exact cost this note already warned about) or
+running ACP for OpenCode alongside a still-bespoke Claude Code adapter — not fewer transports than
+today's two bespoke adapters either way. Revisit if Claude Code ships native ACP support, or a third,
+ACP-only harness is added — the leverage case above would then actually hold.
+
 ## 10. Direct-message / adhoc sessions
 
 - Toggling a worker's pane (click header or a keybind) switches the bottom bar's target

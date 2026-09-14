@@ -36,7 +36,9 @@ import { execFileSync, spawn } from "node:child_process";
 import {
   openDb, closeDb, upsertHarness, createTask, createWorker, createRun, endRun, WORKTREE_CLAIM_PENDING,
   claimTaskWorktreeSlot, reclaimStaleTaskWorktreeClaim, finalizeTaskWorktreeSlot, releaseTaskWorktreeClaim,
+  reopenRun,
 } from "../../db/index.js";
+import { TERMINAL } from "../../domain/task-states.js";
 import { createSupervisor } from "../supervisor.js";
 import { COMMAND_CAPABILITIES, assertCoversCommands } from "../../domain/capabilities.js";
 import { createFakeHarness } from "./_fake-harness-adapter.js";
@@ -772,6 +774,46 @@ await runTest("shared per-task worktree lifecycle", async () => {
       assert.equal(finalRow.worktree_claim_token, null, "no claim must be left dangling after self-recovery");
       assert.equal(finalRow.worktree_claim_op, null);
       console.log("  23. discardTaskWorktree can now reclaim and finish its OWN crashed claim, instead of refusing worktree-claim-conflict forever");
+    }
+
+    // ── 24 ───────────────────────────────────────────────────────────────────────────
+    // External review (ChatGPT, 2026-09-14) finding 2: case 21 above proves `resume()`'s OWN
+    // top-of-function check refuses a task that is ALREADY terminal — but that check ran once, well
+    // before a whole round of real async work (MCP re-attach, spawning the resumed process), leaving
+    // a genuine window in which the task could become terminal AFTER the check passed but BEFORE the
+    // actual DB reopen. `reopenRun` itself never re-checked task state at the one moment that
+    // matters — the write. This case reproduces that ordering deterministically (no timing/concurrency
+    // machinery needed: it is a plain ordering fact, not a race that only sometimes fires) by calling
+    // `reopenRun` directly, exactly as if `resume()`'s own async gap had let a concurrent
+    // `approveTask`/`mergeTask` land in between.
+    {
+      createTask(db, { id: "t-reopen-toctou", title: "reopenRun TOCTOU", type: "feature" });
+      createWorker(db, { workerId: "w-reopen-toctou", nickname: "reopen-toctou", role: "coder", taskId: "t-reopen-toctou" });
+      createRun(db, { runId: "r-reopen-toctou", workerId: "w-reopen-toctou", harnessId: "fake", prompt: "closed run" });
+      endRun(db, "r-reopen-toctou", { exitReason: "finished" });
+
+      // The exact ordering `resume()`'s own terminal-task check ran BEFORE: closed, non-terminal task
+      // — reopenRun would have been perfectly safe to call here, matching every existing caller's
+      // assumption (and case 1-20's own worktree-claim work never touches this at all).
+      const reopenedWhileNonTerminal = reopenRun(db, "r-reopen-toctou", { terminalStates: TERMINAL });
+      assert.equal(reopenedWhileNonTerminal, 1, "reopenRun must still succeed normally against a non-terminal task's closed run");
+      endRun(db, "r-reopen-toctou", { exitReason: "finished" }); // close it again for the actual test below
+
+      // NOW the task goes terminal — modeling the concurrent approveTask/mergeTask that could land
+      // inside resume()'s real async window.
+      db.prepare("UPDATE tasks SET state = 'merged' WHERE id = 't-reopen-toctou'").run();
+
+      const refusedChanges = reopenRun(db, "r-reopen-toctou", { terminalStates: TERMINAL });
+      assert.equal(refusedChanges, 0, "reopenRun must refuse to reopen a run whose task has ALREADY gone terminal by the time of the actual write, not just at some earlier check");
+      const stillClosed = db.prepare("SELECT ended_at FROM runs WHERE run_id = 'r-reopen-toctou'").get();
+      assert.ok(stillClosed.ended_at, "the run row must remain closed — a terminal task must never end up with a reopened, live run");
+
+      // Without `terminalStates`, the pre-existing (and every OTHER existing caller's) behavior is
+      // completely unchanged — this fix is opt-in per call, not a silent behavior change for anyone
+      // who hasn't been updated to pass it.
+      const legacyBehaviorUnaffected = reopenRun(db, "r-reopen-toctou");
+      assert.equal(legacyBehaviorUnaffected, 1, "omitting terminalStates must preserve the exact pre-fix behavior for any caller not yet updated to pass it");
+      console.log("  24. reopenRun refuses to reopen a run whose task went terminal between resume()'s own check and the actual write — closing the TOCTOU, not just the top-of-function race");
     }
   } finally {
     try { await supervisor?.shutdown({ timeoutMs: 3000 }); } catch { /* best effort */ }

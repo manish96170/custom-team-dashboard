@@ -365,6 +365,46 @@ await runTest("git-create-push agent (supervisor glue)", async () => {
       console.log("  9. gitPush/gitPushProtected refuse a worker-backed principal naming a task it is not assigned to; owner/CTO unrestricted");
     }
 
+    // ── 10 ───────────────────────────────────────────────────────────────────────────
+    // External review (ChatGPT, 2026-09-14) finding 5: `paths` was purely opt-in — nothing forced a
+    // real caller to use it on a task whose shared worktree (PLAN.md §7) more than one worker is
+    // actually assigned to, so a plain `git add -A` push risked staging and committing another
+    // worker's unrelated, uncommitted change. `gitCreatePush` now refuses outright when the task has
+    // more than one worker and no explicit `paths` was given — a solo-worker task (every OTHER case in
+    // this file) is completely unaffected, matching this repo's own established "fail closed only when
+    // the risk is real" convention.
+    {
+      const repoDir = path.join(stateDir, "repo-10");
+      const remoteDir = path.join(stateDir, "remote-10.git");
+      makeRepo(repoDir);
+      makeBareRemote(remoteDir);
+      createTask(db, { id: "t-shared-10", title: "shared worktree, two workers", type: "feature" });
+      createWorker(db, { workerId: "w-coder-10a", nickname: "coder-10a", role: "coder", taskId: "t-shared-10" });
+      createWorker(db, { workerId: "w-coder-10b", nickname: "coder-10b", role: "coder", taskId: "t-shared-10" });
+      const created = await supervisor.createTaskWorktree("t-shared-10", { repoPath: repoDir });
+      git(created.worktreeId, ["remote", "add", "origin", remoteDir]);
+      fs.writeFileSync(path.join(created.worktreeId, "mine.txt"), "content\n");
+      fs.writeFileSync(path.join(created.worktreeId, "other-workers-unrelated-change.txt"), "not mine\n");
+
+      const refused = await supervisor.gitCreatePush("t-shared-10", { principal: owner, message: "push without paths" });
+      assert.equal(refused.status, "failed", `a two-worker task with no explicit paths must refuse, got ${JSON.stringify(refused)}`);
+      assert.equal(refused.unresolved.class, "hook-other");
+      assert.match(refused.unresolved.oneParagraphDiagnosis, /2 workers sharing this worktree/);
+      assert.deepEqual(listActiveLeases(db, "git:identity"), [], "a refused-before-acquiring push must never leave the lease held");
+      // Nothing was staged/committed/pushed — the risky unrelated file is still just sitting there.
+      const statusAfterRefusal = git(created.worktreeId, ["status", "--porcelain"]);
+      assert.match(statusAfterRefusal, /mine\.txt/);
+      assert.match(statusAfterRefusal, /other-workers-unrelated-change\.txt/);
+
+      const scoped = await supervisor.gitCreatePush("t-shared-10", { principal: owner, message: "push mine.txt only", paths: ["mine.txt"] });
+      assert.equal(scoped.status, "pushed", `passing explicit paths on the same two-worker task must still succeed, got ${JSON.stringify(scoped)}`);
+      const committedFiles = git(created.worktreeId, ["show", "--name-only", "--format=", "HEAD"]).trim().split("\n");
+      assert.deepEqual(committedFiles, ["mine.txt"], "the explicit-paths push must commit ONLY the named file, not the other worker's unrelated change");
+      const statusAfterScopedPush = git(created.worktreeId, ["status", "--porcelain"]);
+      assert.match(statusAfterScopedPush, /other-workers-unrelated-change\.txt/, "the unrelated file must still be sitting there, uncommitted, after the scoped push");
+      console.log("  10. gitCreatePush refuses a two-worker task's unscoped push by default, and an explicit paths push on the same task still commits only what was named");
+    }
+
     closeDb(db);
   } finally {
     rmScratchDir(stateDir);

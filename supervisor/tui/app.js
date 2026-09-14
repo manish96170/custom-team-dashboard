@@ -42,7 +42,12 @@ export function decodeKey(chunk) {
   if (s.startsWith(`${ESC}[`)) {
     return { A: "up", B: "down", C: "right", D: "left" }[s[2]] ?? null;
   }
-  if (s.length === 1) return s;
+  // `[...s].length` (iterates by CODE POINT), not `s.length` (UTF-16 CODE UNITS): a 4-byte UTF-8
+  // character (most emoji) decodes to a UTF-16 SURROGATE PAIR, two code units — `s.length === 1` was
+  // false for a single, complete emoji even with no fragmentation involved at all, so it was silently
+  // dropped (ChatGPT review, 2026-09-14). A 2-byte UTF-8 character (e.g. "é") was already fine either
+  // way, since it fits in one UTF-16 unit.
+  if ([...s].length === 1) return s;
   return null;
 }
 
@@ -71,6 +76,133 @@ export function decodeMouse(chunk) {
   return { col: Number(col) - 1, row: Number(row) - 1 };
 }
 
+/**
+ * A real terminal-stream parser (ChatGPT review, 2026-09-14 — confirmed real before fixing, not assumed):
+ * `decodeKey`/`decodeMouse` above each decode exactly ONE chunk as if it were exactly one complete
+ * token. Raw stdin makes no such guarantee — verified directly against the ORIGINAL code before writing
+ * this: a single chunk `"abc"` decoded to `null` (silently DROPPED, not three keys); `ESC` alone
+ * immediately decoded to `"escape"` even though the very next chunk was `"[A"` (an arrow key whose `ESC`
+ * happened to land in a separate `data` event) — and that trailing `"[A"` itself then decoded to `null`
+ * and was ALSO dropped. Fast typing, paste, and a slow/fragmenting pipe can all produce exactly these
+ * shapes; a real keyboard rarely does, which is why this bug is easy to miss by hand-testing.
+ *
+ * This buffers bytes ACROSS calls to `feed()` and only emits a decoded event once it has a COMPLETE
+ * token, reusing `decodeKey`/`decodeMouse` themselves to decode each complete token (one source of truth
+ * for what a token MEANS; this only decides where one token ENDS). A single `feed()` call can emit
+ * multiple events (`"jjjj"` -> four key events) or zero (an incomplete sequence, buffered for the next
+ * call).
+ *
+ * A bare `ESC` byte is the one genuinely ambiguous case: it is either a real, standalone Escape keypress,
+ * or the start of an arrow/mouse sequence whose remaining bytes have not arrived yet — and there is no
+ * way to tell which from the byte alone. Resolved with a short real timer (`escapeTimeoutMs`, default
+ * 25ms, comfortably longer than any real escape sequence takes to arrive as one write, per how terminals
+ * actually emit them): if nothing else arrives within the window, the buffered ESC is flushed as a real
+ * `"escape"` key. This is the same escape-timeout technique real terminal libraries use for the same
+ * ambiguity — not invented for this file specifically.
+ */
+export function createInputDecoder({ onEvent, escapeTimeoutMs = 25 } = {}) {
+  let buf = Buffer.alloc(0);
+  let escapeTimer = null;
+
+  function clearEscapeTimer() {
+    if (escapeTimer) { clearTimeout(escapeTimer); escapeTimer = null; }
+  }
+
+  /** UTF-8 lead-byte -> total byte length of the character it starts (1 for plain ASCII / continuation
+   *  garbage, which is treated as its own 1-byte "character" rather than blocking forever on a byte
+   *  sequence that will never complete). */
+  function utf8CharLength(byte) {
+    if ((byte & 0xe0) === 0xc0) return 2;
+    if ((byte & 0xf0) === 0xe0) return 3;
+    if ((byte & 0xf8) === 0xf0) return 4;
+    return 1;
+  }
+
+  const MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/;
+  // A mouse report still being written: `ESC[<` plus digits/semicolons and no terminator yet.
+  const MOUSE_PREFIX_RE = /^\x1b\[<[\d;]*$/;
+  // A runaway, never-terminating "mouse-shaped" prefix must not buffer forever — a real SGR report is
+  // always short (button/col/row are all well under this many digits).
+  const MOUSE_PREFIX_MAX_LEN = 32;
+
+  function tryFlush() {
+    for (;;) {
+      if (buf.length === 0) return;
+      if (buf[0] !== 0x1b) {
+        // A plain byte, or the lead byte of a (possibly still-arriving) multi-byte UTF-8 character.
+        const need = utf8CharLength(buf[0]);
+        if (buf.length < need) return; // incomplete multi-byte character — wait for the rest
+        const token = buf.slice(0, need);
+        buf = buf.slice(need);
+        const key = decodeKey(token);
+        if (key !== null) onEvent({ type: "key", key });
+        continue;
+      }
+
+      // buf[0] === ESC from here on.
+      const lookahead = buf.slice(0, Math.min(buf.length, MOUSE_PREFIX_MAX_LEN)).toString("latin1");
+      const mouseMatch = MOUSE_RE.exec(lookahead);
+      if (mouseMatch) {
+        const token = buf.slice(0, mouseMatch[0].length);
+        buf = buf.slice(mouseMatch[0].length);
+        clearEscapeTimer();
+        const click = decodeMouse(token);
+        if (click) onEvent({ type: "mouse", click });
+        continue;
+      }
+      if (MOUSE_PREFIX_RE.test(lookahead) && lookahead.length < MOUSE_PREFIX_MAX_LEN) {
+        return; // a mouse report is still being written — wait for the rest, no timeout needed: a real
+        // terminal writes an SGR report as one burst, and this shape can ONLY be a forming mouse report.
+      }
+      if (buf.length >= 3 && buf[1] === 0x5b /* '[' */) {
+        // A complete `ESC[X` — an arrow key if X is A-D, otherwise an unrecognized 3-byte sequence
+        // (dropped, matching the ORIGINAL decodeKey's own `?? null` for any other letter here).
+        const token = buf.slice(0, 3);
+        buf = buf.slice(3);
+        clearEscapeTimer();
+        const key = decodeKey(token);
+        if (key !== null) onEvent({ type: "key", key });
+        continue;
+      }
+      if (buf.length === 2 && buf[1] === 0x5b) {
+        return; // `ESC[` so far — could still become an arrow key or the start of a mouse report; wait.
+      }
+      if (buf.length === 1) {
+        // A bare ESC — genuinely ambiguous (see the function's own header comment). Wait briefly for
+        // more bytes; if none arrive, it really was a standalone Escape keypress.
+        if (!escapeTimer) {
+          escapeTimer = setTimeout(() => {
+            escapeTimer = null;
+            if (buf.length >= 1 && buf[0] === 0x1b) {
+              buf = buf.slice(1);
+              onEvent({ type: "key", key: "escape" });
+              tryFlush();
+            }
+          }, escapeTimeoutMs);
+        }
+        return;
+      }
+      // `ESC` followed by something other than `[` — not one of the six sequences this project decodes
+      // (Alt+key and similar are out of scope, same as the original decoder). Consume just the ESC byte
+      // as a standalone Escape keypress and let whatever follows decode as its own token on the next
+      // loop iteration, rather than getting stuck on bytes this parser does not understand.
+      buf = buf.slice(1);
+      clearEscapeTimer();
+      onEvent({ type: "key", key: "escape" });
+    }
+  }
+
+  return {
+    feed(chunk) {
+      buf = Buffer.concat([buf, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
+      tryFlush();
+    },
+    /** For tests and `stop()`: cancel a pending escape-disambiguation timer so it can't fire after the
+     *  app has already torn down (and so a test doesn't have to wait out the real timeout to exit). */
+    dispose() { clearEscapeTimer(); },
+  };
+}
+
 export function createTuiApp({
   client,                 // { request(cmd), close() } — the socket, injected so tests need none
   out = process.stdout,
@@ -90,15 +222,51 @@ export function createTuiApp({
    * Keeping them out of the state object also keeps `state.js` pure and keeps the frame comparison in
    * `paint()` honest — a growing transcript buffer in state would make every tick look like a change.
    */
-  const transcripts = new Map();  // runId -> { lines: string[], cursor: number, provisional: string|null }
+  const transcripts = new Map();  // runId -> { lines: string[], cursor: number, provisional: string|null, touchedAt: number }
 
   /** Rule 4 tier 1 is bounded everywhere else; a client that accumulates for hours must bound it too. */
   const MAX_LINES_PER_RUN = 500;
 
+  // ChatGPT review, 2026-09-14 — confirmed real before fixing: `transcripts` was NEVER pruned, so a
+  // long-lived TUI session accumulated one entry (up to `MAX_LINES_PER_RUN` lines each) per run for
+  // EVERY run the server has ever reported, forever — `tuiSnapshot`'s own handler
+  // (`runtime/supervisor.js`) sends every run system-wide on every tick via `listRunsForDisplay`, with no
+  // per-tick filtering by visibility, so this Map's growth tracks the WHOLE system's run history, not
+  // just what this TUI instance has shown on screen.
+  //
+  // Two distinct kinds of staleness, both handled:
+  //   * a run whose DB ROW IS GONE (a preflight, cleaned up after its probe — normal runs are never
+  //     deleted, PLAN.md's "task history, not memory") no longer appears in `snap.runs` at all. Its
+  //     transcript entry is pure dead weight and is dropped outright — `pruneTranscripts` below.
+  //   * a normal run that ended keeps existing (and keeps being reported) forever, so the Map can still
+  //     grow without bound purely from the passage of time. Bounded with a GLOBAL cap
+  //     (`MAX_TRACKED_RUNS`) plus touch-order eviction: `touchedAt` is bumped both when new data arrives
+  //     (`transcriptFor`) and when a pane actually DISPLAYS the run (`linesFor`) — so a run currently on
+  //     screen is touched every single tick and is therefore always the LAST thing evicted, never the
+  //     first, with no separate "is this pinned/selected" bookkeeping needed.
+  const MAX_TRACKED_RUNS = 200;
+  let touchCounter = 0;
+
   function transcriptFor(runId) {
     let t = transcripts.get(runId);
-    if (!t) { t = { lines: [], cursor: 0, provisional: null }; transcripts.set(runId, t); }
+    if (!t) { t = { lines: [], cursor: 0, provisional: null, touchedAt: 0 }; transcripts.set(runId, t); }
+    t.touchedAt = touchCounter += 1;
     return t;
+  }
+
+  /** Drop transcript entries for runs the server no longer reports at all, then enforce the global cap
+   *  by evicting the LEAST recently touched entries first. `currentRunIds` is the full run-id set from
+   *  the LATEST snapshot — `snap.runs`, not `snap.transcripts` (which is empty for a caller lacking
+   *  `observe:run`, and would wrongly prune everything for such a caller otherwise). */
+  function pruneTranscripts(currentRunIds) {
+    for (const runId of transcripts.keys()) {
+      if (!currentRunIds.has(runId)) transcripts.delete(runId);
+    }
+    const over = transcripts.size - MAX_TRACKED_RUNS;
+    if (over > 0) {
+      const oldest = [...transcripts.entries()].sort((a, b) => a[1].touchedAt - b[1].touchedAt);
+      for (const [runId] of oldest.slice(0, over)) transcripts.delete(runId);
+    }
   }
 
   // `out.columns` is undefined when stdout is a pipe rather than a TTY, so COLUMNS/LINES are honoured
@@ -154,6 +322,7 @@ export function createTuiApp({
       const snap = await client.request({ cmd: "tuiSnapshot", cursors });
       if (snap?.ok) {
         applyTranscripts(snap);
+        pruneTranscripts(new Set((snap.runs ?? []).map((r) => r.runId)));
         state = {
           ...state,
           teams: snap.teams ?? [],
@@ -231,10 +400,13 @@ export function createTuiApp({
     }
   }
 
-  /** What a pane shows: everything settled, plus the line still being written. */
+  /** What a pane shows: everything settled, plus the line still being written. Reading counts as
+   *  activity for `pruneTranscripts`'s eviction order — a run actually on screen must never be the
+   *  first thing dropped just because it has gone quiet. */
   function linesFor(runId) {
     const t = transcripts.get(runId);
     if (!t) return [];
+    t.touchedAt = touchCounter += 1;
     return t.provisional ? [...t.lines, t.provisional] : t.lines;
   }
 
@@ -388,14 +560,20 @@ export function createTuiApp({
   // remove them. Restarting or embedding this TUI (each `start()` adding another pair with no way to
   // undo the previous ones) accumulated listeners without bound, and a stopped app could keep repainting
   // on a resize event nobody meant to still be listening for. Named here so `stop()` can `off()` them.
+  // ChatGPT review, 2026-09-14: raw stdin is a byte STREAM, not a one-chunk-per-key API — `createInputDecoder`
+  // (above) buffers across chunks and only emits a decoded event once it has a complete token. Replaces
+  // the old `decodeMouse(chunk) then decodeKey(chunk)` pair, which assumed the whole chunk was exactly
+  // one token (confirmed real before fixing: a chunk `"abc"` decoded to `null` and was silently dropped
+  // entirely, and a fragmented arrow key — `ESC` in one chunk, `"[A"` in the next — decoded to `"escape"`
+  // plus a second dropped chunk, never `"up"`).
+  const inputDecoder = createInputDecoder({
+    onEvent: (evt) => {
+      if (evt.type === "mouse") { handleClick(evt.click); return; }
+      handleKey(evt.key).then(() => { if (state.quit) stop(); });
+    },
+  });
   function onInputData(chunk) {
-    // Mouse FIRST: an SGR report starts with `ESC[`, so `decodeKey` would otherwise read `ESC[<...`
-    // as an unrecognised arrow key and drop it — silently, which is the worst of the three outcomes.
-    const click = decodeMouse(chunk);
-    if (click) { handleClick(click); return; }
-    const key = decodeKey(chunk);
-    if (key === null) return;
-    handleKey(key).then(() => { if (state.quit) stop(); });
+    inputDecoder.feed(chunk);
   }
   function onResize() { lastFrame = []; paint(); }
 
@@ -420,6 +598,10 @@ export function createTuiApp({
     if (timer) clearInterval(timer);
     input.off?.("data", onInputData);
     out.off?.("resize", onResize);
+    // A pending escape-disambiguation timer must not fire after teardown — it would call `handleKey`
+    // against a `state`/`client` this app no longer owns, and it is also the one thing that would
+    // otherwise keep a test (or a real process) alive past `stop()`.
+    inputDecoder.dispose();
     // Restore the terminal on EVERY exit path. A TUI that leaves raw mode on, the cursor hidden, or
     // MOUSE REPORTING ON makes the user's shell appear broken — mouse reporting is the worst of the
     // three, because the shell then prints escape sequences whenever the user moves the pointer.

@@ -450,13 +450,35 @@ export function listOrphanedRuns(db) {
  * not true of this one. Any grace deadline on an unresolved ask is cancelled, because the run is
  * answerable again.
  */
-export function reopenRun(db, runId) {
+/**
+ * `terminalStates`, if given, closes a real TOCTOU (external review, ChatGPT, 2026-09-14, finding 2):
+ * `resume()` used to check the run's task was non-terminal, then do a round of real async work
+ * (MCP re-attach, spawning the resumed process) BEFORE ever calling this function — so a task that
+ * transitioned to terminal (`approveTask`/`mergeTask`) DURING that window still got a freshly reopened,
+ * live run, because this UPDATE's own `WHERE` clause never re-checked task state at the one moment that
+ * actually matters: the write itself. `db/index.js` deliberately never imports `domain/task-states.js`
+ * (no db-layer -> domain-layer dependency anywhere in this codebase), so the caller — which already
+ * imports it — passes the terminal-state list in, and it is bound into the SAME atomic UPDATE via a
+ * `NOT EXISTS` subquery: SQLite's own single-writer serialization means the task-state check and the
+ * reopen happen as one indivisible unit, not two operations with a window between them. A run with no
+ * task at all (a preflight, or a worker row predating the task join) has nothing for the subquery to
+ * match, so `NOT EXISTS` holds vacuously and it reopens exactly as before — unaffected, matching every
+ * existing caller's assumption. Omitting `terminalStates` (or passing `[]`) preserves the exact
+ * pre-existing behavior for any caller that hasn't been updated to pass it.
+ */
+export function reopenRun(db, runId, { terminalStates = [] } = {}) {
   const reopen = db.transaction(() => {
+    const guard = terminalStates.length
+      ? `AND NOT EXISTS (
+           SELECT 1 FROM runs r2 JOIN workers w ON w.worker_id = r2.worker_id JOIN tasks t ON t.id = w.task_id
+            WHERE r2.run_id = ? AND t.state IN (${terminalStates.map(() => "?").join(",")})
+         )`
+      : "";
     const info = db.prepare(
       `UPDATE runs SET ended_at = NULL, exit_reason = NULL, reconciled_at = NULL, reaped_at = NULL,
                        lifecycle = 'managed'
-         WHERE run_id = ? AND ended_at IS NOT NULL`,
-    ).run(runId);
+         WHERE run_id = ? AND ended_at IS NOT NULL ${guard}`,
+    ).run(runId, ...(terminalStates.length ? [runId, ...terminalStates] : []));
     if (info.changes === 1) {
       db.prepare(`UPDATE asks SET auto_close_at = NULL WHERE run_id = ? AND resolved = 0`).run(runId);
     }

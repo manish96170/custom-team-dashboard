@@ -26,6 +26,8 @@
 // Standing rule: every case asserts. This script cannot exit 0 with a broken claim.
 
 import assert from "node:assert/strict";
+import { spawnManaged } from "../spawn.js";
+import { isProcessGroupLive } from "../procinfo.js";
 import {
   openDb,
   closeDb,
@@ -36,6 +38,7 @@ import {
   createRun,
   getRun,
   endRun,
+  recordRunProcess,
   listOpenRuns,
   listRunsForDisplay,
   listPreflightRuns,
@@ -69,11 +72,19 @@ await runTest("preflight", async () => {
   try {
     db = openDb({ stateDir });
     upsertHarness(db, { id: "fake", displayName: "Fake Harness" });
+    upsertHarness(db, { id: "do-nothing-stop", displayName: "Do-Nothing-Stop Harness" });
     createWorker(db, { workerId: "w1", nickname: "tester", role: "worker" });
     createTask(db, { id: "t1", title: "preflight", type: "feature" });
 
     harness = createFakeHarness({ label: "preflight" });
-    supervisor = createSupervisor({ db, adapters: { fake: harness }, logger: quiet, askSweepIntervalMs: 0 });
+    // review (external, 2026-09-14) finding 1: a harness whose `stop()` does NOTHING to the real
+    // process at all — a starker version of the real Claude Code adapter's actual bug (SIGINT +
+    // an unawaited, merely SCHEDULED 3s-later SIGKILL fallback). Used only by case 11, below, to
+    // prove `discardPreflightRun` no longer trusts an adapter's own `stop()` for confirmation.
+    const doNothingStopAdapter = { stop: async () => {}, capabilities: () => ({}) };
+    supervisor = createSupervisor({
+      db, adapters: { fake: harness, "do-nothing-stop": doNothingStopAdapter }, logger: quiet, askSweepIntervalMs: 0,
+    });
     await supervisor.boot();
 
     // ── 1 ────────────────────────────────────────────────────────────────────────────
@@ -327,6 +338,39 @@ await runTest("preflight", async () => {
       assert.equal(db.prepare("SELECT COUNT(*) AS n FROM mcp_pool_attachments WHERE run_id = ?").get(runId).n, 0);
       assert.equal(getRun(db, runId) ?? null, null, "and the run row itself is gone");
       console.log("  10. deletePreflightRun succeeds despite FK-referencing resource_leases/mcp_pool_attachments rows, deleting them too");
+    }
+
+    // ── 11 ───────────────────────────────────────────────────────────────────────────
+    // External review (ChatGPT, 2026-09-14) finding 1, confirmed real: `discardPreflightRun` used
+    // to `await adapter?.stop?.(runId)` and treat its return as proof of death — but `stop()`
+    // returning proves nothing; the real Claude Code adapter's own `stop()` is synchronous and only
+    // SCHEDULES a SIGKILL fallback 3s later. This case uses a harness whose `stop()` does even less
+    // (nothing at all) against a REAL spawned process that ignores SIGTERM (so it needs the real
+    // escalation to SIGKILL to die) — proving cleanup now genuinely waits for CONFIRMED death
+    // (`reap()`'s own `killProcessGroup`) rather than trusting the adapter.
+    {
+      const child = spawnManaged({
+        command: process.execPath,
+        args: ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 60000);"],
+      });
+      const identity = await child.identity;
+      assert.ok(identity.verified, "precondition: the real spawned process's identity must verify");
+
+      const runId = "preflight-slow-to-die";
+      createRun(db, {
+        runId, workerId: "w1", harnessId: "do-nothing-stop", prompt: "slow to die", isPreflight: true,
+      });
+      recordRunProcess(db, runId, { pid: identity.pid, processGroup: identity.pgid, procLstart: identity.lstart });
+
+      assert.ok(await isProcessGroupLive(identity.pgid), "precondition: the real process is genuinely alive before cleanup");
+
+      const result = await supervisor.discardPreflightRun(runId, "do-nothing-stop");
+
+      assert.equal(await isProcessGroupLive(identity.pgid), false,
+        "the real process must be CONFIRMED dead by the time discardPreflightRun resolves — an adapter whose stop() does nothing must not be trusted");
+      assert.equal(result.deleted, true, `cleanup must have proceeded once death was confirmed, got ${JSON.stringify(result)}`);
+      assert.equal(getRun(db, runId) ?? null, null, "and the row is gone");
+      console.log("  11. a real process that a do-nothing adapter.stop() cannot kill is still confirmed dead (via reap()'s own killProcessGroup) before cleanup reports success");
     }
   } finally {
     try { await supervisor?.shutdown({ timeoutMs: 3000 }); } catch { /* best effort */ }

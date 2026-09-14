@@ -19,7 +19,27 @@
 //   7. --allow-tools refuses a disallowed tools/call directly — a real JSON-RPC error carrying the
 //      caller's own request id — and the disallowed call NEVER reaches the real server at all
 //   8. --allow-tools still relays an ALLOWED tools/call straight through, unmodified
-//   9. with no --allow-tools at all, tools/list is relayed completely unfiltered (backward compat)
+//   9. with no --allow-tools at all, tools/list is relayed completely unfiltered
+//
+// Cases 10-17 below, added 2026-09-14 per an external (ChatGPT) security-boundary review of this exact
+// file — each item was independently traced against the CURRENT code before being trusted:
+//   10. a tools/call with missing/null/non-string params.name is safely refused, never crashes, never
+//       forwarded (already-correct behavior, locked in)
+//   11. a tools/call shaped as a JSON-RPC NOTIFICATION (no "id" at all) for a disallowed tool is still
+//       refused and never forwarded, even though a notification expects no reply
+//   12. a REAL bug, fixed: a multi-byte UTF-8 character split exactly at a socket chunk boundary used to
+//       corrupt into replacement characters; a large multi-line JSON-RPC frame with an intentionally
+//       fragmented multi-byte tool name now survives byte-for-byte
+//   13. multiple complete JSON-RPC frames arriving in a single chunk are both processed (already-correct
+//       behavior, locked in)
+//   14. a REAL hardening fix: an unparseable (non-JSON) client-side line is now DROPPED, never relayed to
+//       the real server, while --allow-tools is active
+//   15. a Unicode homoglyph tool name (visually similar to an allowed name, not byte-identical) is safely
+//       refused, never treated as a match
+//   16. the real pooled server disconnecting mid-request makes the proxy exit promptly rather than
+//       leaving a pending tools/call hanging forever
+//   17. --allow-tools "" (present but explicitly empty) blocks EVERY tool outright — the safe primitive a
+//       future caller can rely on to guarantee zero-tool access, distinct from omitting the flag entirely (backward compat)
 
 import assert from "node:assert/strict";
 import net from "node:net";
@@ -205,6 +225,165 @@ await runTest("mcp-stdio-proxy", async () => {
       unfilteredProxy.stdin.end();
       unfilteredServerSocket.destroy();
       await unfilteredExited;
+    }
+
+    // Shared setup for cases 10-17: a fresh filtered proxy+server pair, same shape as case 6-9's own
+    // inline setup, factored out since seven more cases need it.
+    async function openFilteredPair(allowToolsArg) {
+      const proxy = spawnProxy(["--socket", socketPath, "--allow-tools", allowToolsArg]);
+      const [srv] = await waitForEvent(server, "connection");
+      const state = { stdout: "", server: "", stderr: "" };
+      proxy.stdout.on("data", (c) => { state.stdout += c.toString("utf8"); });
+      proxy.stderr.on("data", (c) => { state.stderr += c.toString("utf8"); });
+      srv.on("data", (c) => { state.server += c.toString("utf8"); });
+      return { proxy, srv, state };
+    }
+    function closePair({ proxy, srv }) {
+      const exited = waitForEvent(proxy, "exit");
+      proxy.stdin.end();
+      try { srv.destroy(); } catch { /* already gone */ }
+      return exited;
+    }
+    function findResponseFor(buf, id) {
+      const line = buf.trim().split("\n").find((l) => l.includes(`"id":${id}`));
+      return line ? JSON.parse(line) : null;
+    }
+
+    // ── 10 ───────────────────────────────────────────────────────────────────────────
+    {
+      const pair = await openFilteredPair("git_push");
+      const before = pair.state.server;
+      pair.proxy.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 300, params: {} })}\n`);
+      pair.proxy.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 301, params: null })}\n`);
+      pair.proxy.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 302, params: { name: 12345 } })}\n`);
+      await waitForBuffer(() => pair.state.stdout, (b) => b.includes('"id":302'));
+      for (const id of [300, 301, 302]) {
+        const resp = findResponseFor(pair.state.stdout, id);
+        assert.ok(resp?.error, `expected id ${id} (missing/null/non-string params.name) to be refused with an error, got ${JSON.stringify(resp)}`);
+      }
+      assert.equal(pair.state.server, before, "none of the three malformed tools/call frames must ever reach the real server");
+      // The proxy must still be alive and functional afterward — no crash from the malformed input.
+      pair.proxy.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 303, params: { name: "git_push" } })}\n`);
+      await waitForBuffer(() => pair.state.server, (b) => b.includes('"id":303'));
+      await closePair(pair);
+      console.log("  10. a tools/call with missing/null/non-string params.name is safely refused, never crashes, never forwarded");
+    }
+
+    // ── 11 ───────────────────────────────────────────────────────────────────────────
+    {
+      const pair = await openFilteredPair("git_push");
+      const before = pair.state.server;
+      // No "id" field at all — a valid JSON-RPC NOTIFICATION shape, unusual for tools/call but not invalid.
+      pair.proxy.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "tools/call", params: { name: "slack_delete_message" } })}\n`);
+      await new Promise((r) => setTimeout(r, 150)); // no id to wait on — give a wrongful forward time to arrive
+      assert.equal(pair.state.server, before, "a disallowed notification-shaped tools/call must never reach the real server either");
+      const refusalLine = pair.state.stdout.trim().split("\n").find((l) => l.includes("slack_delete_message"));
+      assert.ok(refusalLine, "the refusal must still be reported somewhere on stdout");
+      assert.equal(JSON.parse(refusalLine).id, null, `a notification has no id; the error frame's own id must be null, not dropped or a stale value, got ${refusalLine}`);
+      await closePair(pair);
+      console.log("  11. a tools/call shaped as a JSON-RPC notification (no id) for a disallowed tool is still refused and never forwarded");
+    }
+
+    // ── 12 ───────────────────────────────────────────────────────────────────────────
+    // review, 2026-09-14: reproduced directly against the PRE-FIX `buf += chunk` implementation before
+    // this fix landed — a multi-byte character split at a chunk boundary decoded to replacement
+    // characters on each half independently. This name is deliberately multi-byte AND long enough that a
+    // real OS pipe is likely to deliver it across more than one `data` event even without an artificial
+    // delay, but the delay below makes the two-chunk split deterministic rather than hoped-for.
+    {
+      const toolName = "日本語ツール名前確認用文字列テスト用ツール";
+      const pair = await openFilteredPair(toolName);
+      const frame = Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 400, params: { name: toolName } })}\n`, "utf8");
+      // Split at a byte offset chosen to land inside one of the multi-byte characters, not on a boundary.
+      let splitAt = Math.floor(frame.length / 2);
+      while (splitAt > 0 && (frame[splitAt] & 0xc0) === 0x80) splitAt -= 1; // land ON a continuation byte, not before one
+      splitAt += 1;
+      pair.proxy.stdin.write(frame.slice(0, splitAt));
+      await new Promise((r) => setTimeout(r, 30));
+      pair.proxy.stdin.write(frame.slice(splitAt));
+      await waitForBuffer(() => pair.state.server, (b) => b.includes('"id":400'));
+      const forwarded = findResponseFor(pair.state.server, 400) ?? JSON.parse(pair.state.server.trim().split("\n").find((l) => l.includes('"id":400')));
+      assert.equal(forwarded.params.name, toolName,
+        `the multi-byte tool name must survive a chunk split byte-for-byte; got ${JSON.stringify(forwarded.params?.name)}`);
+      await closePair(pair);
+      console.log("  12. a multi-byte UTF-8 tool name split exactly at a socket chunk boundary survives byte-for-byte (was corrupted pre-fix)");
+    }
+
+    // ── 13 ───────────────────────────────────────────────────────────────────────────
+    {
+      const pair = await openFilteredPair("git_push");
+      const line1 = JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 500, params: { name: "git_push" } });
+      const line2 = JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 501, params: { name: "slack_delete_message" } });
+      pair.proxy.stdin.write(`${line1}\n${line2}\n`); // two complete frames, one write, one chunk
+      await waitForBuffer(() => pair.state.server, (b) => b.includes('"id":500'));
+      await waitForBuffer(() => pair.state.stdout, (b) => b.includes('"id":501'));
+      assert.ok(pair.state.server.includes('"id":500'), "the first (allowed) frame in the coalesced chunk must be forwarded");
+      assert.ok(!pair.state.server.includes('"id":501'), "the second (disallowed) frame in the SAME coalesced chunk must still be refused, not let through");
+      await closePair(pair);
+      console.log("  13. two complete JSON-RPC frames arriving in a single chunk are both processed independently");
+    }
+
+    // ── 14 ───────────────────────────────────────────────────────────────────────────
+    {
+      const pair = await openFilteredPair("git_push");
+      const before = pair.state.server;
+      pair.proxy.stdin.write("this is not json at all\n");
+      await waitForBuffer(() => pair.state.stderr, (b) => b.includes("dropping"));
+      assert.equal(pair.state.server, before, "an unparseable client-side line must never reach the real server while --allow-tools is active");
+      // Still alive afterward.
+      pair.proxy.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 600, params: { name: "git_push" } })}\n`);
+      await waitForBuffer(() => pair.state.server, (b) => b.includes('"id":600'));
+      await closePair(pair);
+      console.log("  14. an unparseable (non-JSON) client-side line is dropped, never relayed, while --allow-tools is active");
+    }
+
+    // ── 15 ───────────────────────────────────────────────────────────────────────────
+    {
+      const pair = await openFilteredPair("git_push");
+      const before = pair.state.server;
+      // Cyrillic "і" (U+0456) in place of Latin "i" — visually near-identical, byte-distinct.
+      const homoglyph = "gіt_push";
+      pair.proxy.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 700, params: { name: homoglyph } })}\n`);
+      await waitForBuffer(() => pair.state.stdout, (b) => b.includes('"id":700'));
+      assert.equal(pair.state.server, before, "a Unicode homoglyph of an allowed name must never be treated as a match");
+      const resp = findResponseFor(pair.state.stdout, 700);
+      assert.ok(resp?.error, "the homoglyph name must be refused with a real error");
+      await closePair(pair);
+      console.log("  15. a Unicode homoglyph tool name is safely refused, never treated as a match for the real allowed name");
+    }
+
+    // ── 16 ───────────────────────────────────────────────────────────────────────────
+    {
+      const pair = await openFilteredPair("git_push");
+      pair.proxy.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 800, params: { name: "git_push" } })}\n`);
+      await waitForBuffer(() => pair.state.server, (b) => b.includes('"id":800'));
+      const exited = waitForEvent(pair.proxy, "exit", { timeoutMs: 3000 });
+      pair.srv.destroy(); // the real pooled server disappears mid-request, no response ever sent
+      // The real invariant is "does not hang forever" — `waitForEvent`'s own timeout would REJECT (not
+      // resolve) if the proxy never exited, which is what actually proves this. The exit CODE itself
+      // (0 vs non-zero) depends on whether a clean `.destroy()` fires this socket's `close` or `error`
+      // handler first — both already exit promptly (see the file's own `socket.on("close"/"error")`), so
+      // the exact code is not the property worth asserting here.
+      await exited;
+      console.log("  16. the real pooled server disconnecting mid-request makes the proxy exit promptly rather than hanging");
+    }
+
+    // ── 17 ───────────────────────────────────────────────────────────────────────────
+    {
+      const pair = await openFilteredPair(""); // present, but explicitly empty — "allow nothing," not "unrestricted"
+      pair.proxy.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 900, params: { name: "git_push" } })}\n`);
+      await waitForBuffer(() => pair.state.stdout, (b) => b.includes('"id":900'));
+      assert.ok(findResponseFor(pair.state.stdout, 900)?.error, "an explicitly empty --allow-tools must refuse EVERY tool, including one that would be allowed elsewhere");
+      assert.equal(pair.state.server, "", "nothing must ever reach the real server when the allowlist is explicitly empty");
+
+      pair.proxy.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "tools/list", id: 901 })}\n`);
+      await waitForBuffer(() => pair.state.server, (b) => b.includes('"id":901'));
+      pair.srv.write(`${JSON.stringify({ jsonrpc: "2.0", id: 901, result: { tools: [{ name: "git_push" }] } })}\n`);
+      await waitForBuffer(() => pair.state.stdout, (b) => b.includes('"id":901'));
+      const listResp = findResponseFor(pair.state.stdout, 901);
+      assert.deepEqual(listResp.result.tools, [], "tools/list must be filtered down to an empty array when the allowlist is explicitly empty");
+      await closePair(pair);
+      console.log("  17. --allow-tools \"\" (present but explicitly empty) blocks every tool outright, distinct from omitting the flag entirely");
     }
   } finally {
     for (const p of spawnedProxies) {

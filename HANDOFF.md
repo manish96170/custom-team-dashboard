@@ -1,6 +1,57 @@
 # Handoff — custom-team-dashboard (updated 2026-09-14, forty-eighth pass — read this
 whole header before doing anything else in a fresh session).
 
+## `runtime/mcp-stdio-proxy.js` hardened against a security-boundary review (2026-09-14)
+
+An external review (ChatGPT, reading the current `main`) flagged this file as needing to be treated as a
+real security boundary, not merely a transport shim, and listed nine concrete things to trace against
+the actual current code before trusting or dismissing them. Each was independently verified — two were
+real bugs, fixed; the rest were already correct, now locked in by regression tests (cases 10-17 in
+`runtime/test/mcp-stdio-proxy.test.js`):
+
+- **Real bug, fixed — multi-byte UTF-8 corruption at a chunk boundary.** `makeLineBuffer`'s line-buffering
+  used to concatenate incoming `Buffer` chunks into a plain JS string (`buf += chunk`), which implicitly
+  `.toString('utf8')`-decodes EACH chunk independently the instant it arrives — a multi-byte character
+  split exactly at a chunk boundary decodes to U+FFFD replacement characters on both halves, corrupting
+  the reassembled line. Reproduced directly (a real tool name split mid-character, decoded to mangled
+  text) before fixing. Fixed by buffering raw bytes (`Buffer.concat`) and calling `.toString('utf8')`
+  exactly once, on a complete line already delimited by a real `\n` byte — a character can never be
+  mid-decode at a chunk boundary because decoding never happens until the whole line exists.
+- **Real hardening fix — unparseable client frames used to be relayed blind.** A client-side line this
+  proxy's own `JSON.parse` rejected was relayed to the real server verbatim, on the reasoning that
+  malformed input shouldn't be guessed at. On the CLIENT side specifically, once `--allow-tools` is set,
+  that's the one input shape every enforcement check above it can never examine — now dropped (never
+  forwarded), logged to stderr, with the proxy proven to stay alive and functional afterward.
+- **Already correct, now locked in by tests**: malformed `tools/call` (missing/null/non-string
+  `params.name`) was already safely refused, never crashing; a JSON-RPC notification (no `id`) for a
+  disallowed tool was already refused and never forwarded (its error frame's `id` is now explicitly
+  `null` rather than silently dropped by `JSON.stringify`, a minor spec-correctness fix alongside it);
+  multiple complete frames arriving in one chunk were already both processed independently; a Unicode
+  homoglyph tool name was already never treated as a match; the real pooled server disconnecting
+  mid-request was already handled — the proxy exits promptly rather than hanging (proven with a real
+  socket destroy mid-call, bounded by a real timeout that would have failed the test if it hung);
+  `--allow-tools ""` (present but explicitly empty) was already the correct primitive for "block every
+  tool," distinct from omitting the flag entirely (unrestricted, backward-compat only).
+- **Investigated, left alone by design (not a bug)**: duplicate tool names in a real `tools/list`
+  response pass the allowlist filter unremarkably (nothing forwarded that shouldn't be — an upstream
+  server's own hygiene issue, not this proxy's to fix). The "no `--allow-tools` = unrestricted relay"
+  fallback default was investigated (its ONE current caller in this repo, `runtime/supervisor.js`'s
+  `attachMcpPoolsForRole`, only omits the flag when `ROLE_MCP_TOOL_ALLOWLIST[role]` is empty — today,
+  every role that reaches this code path has a real allowlist entry, so nothing hits the fallback in
+  practice) — but that call site's `if (allowedTools.length) args.push("--allow-tools", ...)` is a
+  genuine latent trap: a FUTURE role added to `domain/mcp-manifest.js`'s `ROLE_MCP_NEEDS` without a
+  matching `ROLE_MCP_TOOL_ALLOWLIST` entry would silently fall through to unrestricted access with no
+  test catching it. Left unfixed here on purpose — this file's directive scoped edits to
+  `mcp-stdio-proxy.js` alone; fixing it means changing `runtime/supervisor.js`'s call site (always pass
+  `--allow-tools`, even an explicit empty string, never omit it), which is real, small, well-grounded work
+  for a **separate, dedicated pass** — flagged here rather than reached into out-of-scope territory.
+
+Verified: both real fixes independently reverted and confirmed to fail (case 11 for the notification-id
+fix via a full-file stash-revert; case 12 for the UTF-8 fix via an isolated revert of `makeLineBuffer`
+alone, which timed out against the pre-fix version) before being restored. All 17 cases (9 pre-existing +
+8 new) pass; full `npm test` from `supervisor/`: exit 0, 154 suites (this ran alongside several other
+concurrent passes touching other files in the same working tree — none of which this pass touched).
+
 **Forty-sixth pass, same day (2026-09-13) — a full review of every uncommitted/untracked change,
 commissioned from `opencode`'s `sol` agent (GPT-5.6 Sol via Bedrock — see
 `~/.config/opencode/opencode.json`), full report at `codexdoc/review-sol-2026-09-13.md` (50 findings, 1
@@ -1293,6 +1344,146 @@ avoid collision with the other concurrent passes' own edits to that file.
 handoffs/tier-2 digests as notes, auto-generated daily timelines) and advanced tier (read-only Kanban,
 per-team Dataview views, narrow presentation-field write-back). ROADMAP.md's Phase 10 checklist is now
 fully closed for the basic tier it actually asked for.
+
+## Fifty-third pass, 2026-09-14 — Phase 11: conservative harness onboarding, investigated not built
+
+All three of Phase 11's checkboxes are now closed — the first two by confirming earlier phases already
+built them in full, the third by actually running a real spike rather than guessing at its answer. No new
+production code this pass; everything below is verification plus one real experiment.
+
+- **Checkbox 1 (register pre-installed, conformance-tested adapters, no runtime generation) — already
+  fully built.** `conformance/matrix.js` + `conformance/suite.js`'s `runConformance` + `runtime/
+  supervisor.js`'s `onboardHarness({ harnessId, spec, timeoutMs })` together already ARE this checkbox.
+  Traced `onboardHarness`'s persistence path specifically (`db/index.js`'s `upsertHarness`): a real
+  `INSERT INTO harnesses (...) ... ON CONFLICT(id) DO UPDATE SET ...`, one statement correctly handling
+  both "never registered before" and "re-onboarding an existing row" — no separate code path, no gap.
+  Re-ran `runtime/test/conformance.test.js` (8 cases, unchanged, still pass): a conforming adapter flips
+  to `active`; a missing/partial matrix lands in `wrapper`, never silently `active`; a declared-but-
+  unimplemented capability fails the method cross-check and degrades; a declared-but-broken one fails the
+  behavioural check. Runtime adapter *generation* (research a CLI, generate adapter code, execute it with
+  no review) does not exist anywhere in this tree — confirmed by grep, matching PLAN.md's own explicit
+  rejection of that flow as backlog.
+- **Checkbox 2 ("onboard agy" as a repeatable flow, FLOWS.md diagram 4) — already fully built, MINUS the
+  one piece nothing in this codebase can build yet.** Read the diagram's 7 steps closely: B ("harnesses
+  table: add row, status=pending-setup") through G ("new runs go through the supervisor") are exactly
+  what `onboardHarness` already does in one atomic, tested call — and it is already wired as a real,
+  capability-gated wire command (`domain/capabilities.js`: `onboardHarness: "harness:onboard"`;
+  `commandHandlers()`'s own `onboardHarness:` entry). Step C ("adapter package installed") is an
+  operational precondition outside code's reach either way. **Step A — a natural-language "CTO chat"
+  trigger — is the one genuinely missing piece**, and it is the SAME gap Phase 8's own investigation
+  already found and documented (`tuiChat` refuses `cmd.target === "cto"` outright; see `domain/
+  session-intent.js`'s header for the identical reasoning applied to clean-vs-kill): there is no NL-
+  routing layer anywhere in this codebase to hook into, and building one from nothing is Phase 6/8's own
+  CTO-agent territory, not this checkbox's. The repeatable registration flow exists today in its
+  structured form — an operator or script calls `onboardHarness({ harnessId: "agy", spec })` directly, or
+  via the wire command — the same "a structured signal instead of an invented NL parser" resolution this
+  session already reached for elsewhere. Not a new fix; a confirmed-complete existing mechanism.
+- **Checkbox 3 (spike: does ACP replace bespoke per-harness adapters?) — spike actually run, real
+  answer, decision made.** Ran both real, installed CLIs directly rather than reasoning from memory:
+  `opencode acp --help` is a genuine, working subcommand ("start ACP (Agent Client Protocol) server") —
+  OpenCode speaks ACP today. `claude --help` has nothing ACP-shaped anywhere in its full option list —
+  Claude Code does not. **Decision: do not adopt ACP now.** PLAN.md's own bar for this spike is "does
+  adopting it cost less than the two bespoke adapters it would replace" — with only ONE of the two
+  current harnesses speaking it, replacing both adapters with ACP still needs either a translation shim
+  for Claude Code (the exact cost PLAN.md's own note already warned could exceed the two adapters it
+  replaces) or running ACP for OpenCode alongside a still-bespoke Claude Code adapter, which is not fewer
+  transports than the current two bespoke adapters either way — no net simplification under either path.
+  Documented in `PLAN.md`'s own ACP note as a dated, resolved spike rather than an open question; revisit
+  only if Claude Code ships native ACP support, or a third, ACP-only harness is ever added.
+
+No `npm test` run needed this pass — no production code changed, only `runtime/test/conformance.test.js`
+re-run standalone to confirm it still passes (it does, unchanged). Ran concurrently with sibling forks
+working other areas of this tree; touched no file any of them own.
+
+## Fifty-fourth pass, 2026-09-14 — Phase 12's packaging checkboxes 2 and 3 (the honestly-buildable subset)
+
+Ran concurrently with a sibling pass building Phase 12's FIRST checkbox (crash/migration/permissions/
+secret-scan hardening inside `supervisor/`) — this pass touched only repo-root packaging files and docs,
+never `supervisor/`'s own implementation code.
+
+Grounded the plugin manifest schema in three REAL, working Claude Code plugins already on this machine
+rather than guessing at field names: `~/.understand-anything/repo/.claude-plugin/`, `~/hornblower_other_
+repos/gitnexus/.claude-plugin/` (plus its nested `gitnexus-claude-plugin/`, which has a real `.mcp.json`
+and `hooks/hooks.json` — the most directly comparable reference), and `~/hornblower_other_repos/
+OpenAgentsControl/.claude-plugin/marketplace.json`.
+
+**Built**: `.claude-plugin/marketplace.json` + `.claude-plugin/plugin.json` at the repo root (one plugin,
+`"source": "."` — the plugin root IS this repo's own root, satisfying checkbox 3, "same artifact doubles
+as the repo," by construction rather than by a build step); `commands/dashboard.md` (a real slash command
+that starts the daemon via Bash and tells the user the exact command to attach the TUI THEMSELVES — a real
+interactive terminal app cannot be launched or driven through a tool call, and the command says so rather
+than pretending); `skills/custom-team-dashboard/SKILL.md` (documents what's real to claim today — read-only
+DB inspection via `sqlite3` against the real default state-dir path measured from `supervisor/paths.js`, the
+vault projection if enabled — and explicitly refuses to claim the CTO-chat capabilities that do not exist
+yet, the same honesty this session's other passes already established for that gap).
+
+**Deliberately NOT built, documented as a real gap rather than faked**: an `.mcp.json` MCP-server entry.
+This project's control plane is a persistent DAEMON meant to keep supervising other sessions across many
+separate Claude Code invocations — the standard "plugin declares an MCP server, Claude Code spawns and owns
+it for the one session's lifetime" model (confirmed directly from gitnexus's own `.mcp.json`: `npx
+gitnexus@latest mcp`, a fresh per-session process with no persistent state of its own) does not fit a daemon
+by construction. The architecturally right shape is a thin MCP-protocol front end that proxies to the
+ALREADY-RUNNING daemon's control socket (`supervisor/ipc/server.js`/`protocol.js`) — the exact same
+"resident process, thin per-caller proxy" shape `supervisor/runtime/mcp-stdio-proxy.js` already uses for
+pooled MCP servers elsewhere in this same tree — but that is real, new code inside `supervisor/ipc/`, out of
+this pass's own file-ownership boundary, and there is not yet even a one-shot CLI entrypoint to the control
+socket for such a bridge to shell out to (confirmed: `ipc/client.js` exports only a raw `connect()`, no CLI
+wrapper). Flagged for a dedicated pass, not invented here.
+
+Also corrected: `README.md`'s top-of-file status line still said "design complete, not yet built" and told
+the reader to run a bare `/custom-team-dashboard` command that never existed under that exact name — both
+now reflect the real current state and the real command name (`/custom-team-dashboard:dashboard`).
+
+No `npm test` run — no `supervisor/` code touched, only repo-root packaging/doc files. Both new JSON files
+verified to parse (`node -e "JSON.parse(...)"` on each).
+
+## Fifty-fifth pass, 2026-09-14 — Phase 12's first checkbox: crash/migration/permissions/secret-scan
+
+Ran concurrently with the packaging pass above — touched only `supervisor/`'s own code/tests, never the
+repo-root packaging files. Investigated every sub-item against what six phases of prior work already
+built before writing anything; most of it was already covered.
+
+- **Crash injection**: already extensive at the supervisor level (`crash-recovery.test.js`,
+  `daemon-crash.test.js`, real SIGKILL throughout). Checked the THREE newest subsystems specifically for
+  crash-shaped gaps: `mcp-pool.js`'s boot reconciliation already has a real test (case 6) that simulates
+  the exact state a crash leaves — a live orphaned child plus a stale `ready` row, reconciled by a FRESH
+  manager with no in-memory handle — and confirms the real kill; the worktree-claim crash-recovery work
+  (finding 3, an earlier pass) already has its own dedicated real-git/real-DB crash reproduction;
+  `vault-projector.js`'s full-regeneration-every-debounce design means there is no persisted intermediate
+  state a crash mid-debounce could corrupt in the first place — the next `project()` call just re-derives
+  everything. No new crash test built; the existing coverage is real, not merely asserted.
+- **Migration testing — real gap closed.** Migrations 0017/0018 (both from this session) had only the
+  generic fresh-database check. New `db/test/migration-0017-to-0018.test.js`, same shape as
+  `migration-0013-to-0016.test.js`: a real v16 database with real pre-existing task/request rows,
+  upgraded to latest, asserting NULL (not guessed) values for every new column and `integrity_check: ok`.
+- **Install/update/uninstall**: confirmed nothing exists in this repo for this today, and concluded that's
+  correct — the concurrent packaging pass turning this repo into a real Claude Code plugin means Claude
+  Code's own plugin manager IS the install/update/uninstall flow. Nothing left for this repo to build.
+- **Permissions review — two real gaps found and fixed.** State dir (0700) and db file+WAL/SHM (0600) were
+  already covered (`permissions.test.js`); the control socket needs no separate check since it always
+  resolves under the same state-dir root (`ipc/paths.js` delegates to the one resolver in `paths.js`), so
+  it inherits 0700 by construction. (1) `mcp-pool.js`'s existing socket `chmod 0600` had no test asserting
+  the REAL mode bits via `fs.statSync` — new case 14 in `mcp-pool.test.js`; reverted the chmod call,
+  confirmed the new assertion fails (`755`, not `600`), restored. (2) `vault-projector.js`'s `mkdirSync`
+  had no explicit mode — harmless while `vaultPath` lives under the state dir's own 0700 (the default),
+  but the config module explicitly allows pointing it OUTSIDE that protection, where a plain `mkdirSync`
+  leaves it at the process umask (measured on this machine: `0755`, world-readable). Fixed: the vault root
+  is now `chmod 0700` right after creation (best-effort, matching `mcp-pool.js`'s own socket-chmod
+  convention — a failure here must never break an otherwise-successful projection). New case 2b in
+  `vault-projector.test.js` uses a path deliberately OUTSIDE the state dir (so the parent's own 0700 can't
+  make the assertion pass by accident); reverted the fix, confirmed the new case fails (`755`), restored.
+- **Secret scanning — real gap closed for the database/event-log half** (the vault-projection half was
+  already covered by `vault-projector.test.js` cases 4-5). New `db/test/secret-scan.test.js`: mints a real
+  principal exactly the way `ensureWorkerPrincipal` does (a random 32-byte hex token, only its SHA-256
+  hash ever handed to `mintPrincipal`), runs a realistic burst of `recordEvent`/`journalAppend` writes,
+  then scans the RAW on-disk sqlite bytes (main file + WAL) for the raw token — confirmed absent — while
+  also confirming the token's own hash IS found (proves the scan can detect a real match, not passing
+  vacuously). Verified the scan itself catches a real leak: temporarily injected the raw token into a
+  journal write, confirmed the test fails, restored the clean version.
+
+`npm test`: exit 0, 152 suites (both new test files running as part of the real invocation, not just
+standalone). Not committed — the user asked to hold this batch for a combined review with the concurrent
+packaging pass before anything is committed.
 
 ## Group 1's two blocking migration bugs are now FIXED (2026-09-05, third pass)
 
@@ -2717,3 +2908,203 @@ every regression test fail against the pre-fix code before believing it.
   went through multiple independent-model reviews.
 - Don't assume a long-running background `opencode` call is stuck without checking
   CPU-time deltas first.
+
+## Fifty-sixth pass, 2026-09-14 — a ChatGPT review's two TUI findings, both confirmed real and fixed
+
+An external review (ChatGPT, reading this repo's `main`) flagged two issues in `tui/app.js`. Neither was
+trusted blindly — both were traced against the actual current code and reproduced directly before any
+fix, this file's own standing rule.
+
+- **The TUI input decoder was not a real terminal-stream parser (🔴, confirmed real).** `decodeKey(chunk)`/
+  `decodeMouse(chunk)` each assumed one stdin `data` chunk was exactly one complete token. Reproduced
+  directly against the unmodified functions before touching anything: a chunk `"abc"` decoded to `null`
+  and was SILENTLY DROPPED ENTIRELY (not three keys — worse than the review even described); `ESC` alone
+  in one chunk immediately decoded to `"escape"`, and a following chunk `"[A"` (the rest of an arrow key
+  that happened to land in a separate `data` event) ALSO decoded to `null` and was dropped — never `"up"`.
+  A genuinely complete emoji in ONE chunk (no fragmentation at all) also decoded to `null` — a separate,
+  pre-existing bug in `decodeKey` itself (`s.length === 1` is false for a 4-byte-UTF-8 character, since it
+  decodes to a UTF-16 surrogate PAIR), fixed alongside this (`[...s].length === 1`, iterating by code
+  point).
+  Fixed with a new `createInputDecoder()` in `app.js` — a real buffer that persists ACROSS `feed()` calls,
+  only emitting once it has a complete token, and reusing `decodeKey`/`decodeMouse` themselves to decode
+  each complete token (one source of truth for what a token MEANS; the new code only decides where one
+  ENDS). A bare `ESC` is genuinely ambiguous — real standalone Escape keypress, or an arrow/mouse sequence
+  whose rest hasn't arrived — resolved with a short real timer (25ms default), the same escape-timeout
+  technique real terminal libraries use for the identical ambiguity. `onInputData` now feeds every chunk
+  through one decoder instance per app; `stop()` disposes it so a pending timer can't fire after teardown.
+  New `tui/test/input-decoder.test.js`, 9 cases, run directly against the real function: coalesced input,
+  a fragmented escape sequence, a coalesced one, multiple keys in one chunk, a fragmented SGR mouse
+  report, a fragmented multi-byte UTF-8 character, a whole emoji in one chunk, a genuine standalone
+  Escape (after the disambiguation window), and `dispose()` actually cancelling a pending timer. Verified
+  to fail against the pre-fix code (a hard `SyntaxError` for the missing export, confirming the fix is
+  real code, not a test that would have passed either way) before restoring.
+- **TUI transcript memory was unbounded globally (🟠, confirmed real).** `transcripts = new Map()` bounds
+  each RUN's own lines (`MAX_LINES_PER_RUN = 500`) but was never pruned itself — and `tuiSnapshot`
+  (`runtime/supervisor.js`) sends every run system-wide on every tick with no per-tick visibility
+  filtering, so the Map's growth tracks the WHOLE system's run history, not just what this TUI instance
+  has actually shown. Two distinct kinds of staleness, both closed: (1) a run whose DB row is genuinely
+  gone (a cleaned-up preflight — normal runs are never deleted) no longer appears in the server's `runs`
+  list at all, so its entry is dropped outright; (2) a normal run that merely ended keeps existing (and
+  keeps being reported) forever, so the Map can still grow purely with time — bounded with a global cap
+  (`MAX_TRACKED_RUNS = 200`) plus touch-order eviction: a `touchedAt` counter is bumped both when new
+  data arrives and when a pane actually DISPLAYS the run, so a run currently on screen is touched every
+  tick and is therefore always the last thing evicted — no separate "is this pinned/selected" bookkeeping
+  needed. New `tui/test/transcript-memory.test.js`, 3 cases, driven through `createTuiApp`'s real
+  `refresh()` with a scripted fake client (no real socket needed, same technique
+  `runtime/test/tui-replay.test.js`'s own case 6/7 already use): a deleted run's entry disappears on the
+  next refresh; the cap evicts the oldest-touched entries first once exceeded; an actively-displayed run
+  survives real eviction pressure from many other runs even with zero new lines of its own. Verified to
+  fail against the pre-fix code (205 tracked instead of capped at 200) before restoring.
+  **Fixing this correctly required updating two PRE-EXISTING fixtures** in `runtime/test/
+  tui-replay.test.js` (cases 6 and 10) that manufactured a snapshot shape a real server never actually
+  sends — `runs: []` alongside real `transcripts` data for a run — which a real server can't produce
+  (`tuiSnapshot` derives both from the same `listRunsForDisplay` call), but which the NEW pruning logic
+  correctly treats as "this run no longer exists," breaking both tests. Fixed by adding the matching
+  `runs` entry those fixtures always should have had, not by weakening the new invariant.
+
+Neither finding needed any change outside `tui/` and the one `runtime/test/tui-replay.test.js` fixture
+fix above. `npm test`: exit 0, twice in a row (154 suites). This pass ran concurrently with sibling
+passes addressing the SAME review's other findings elsewhere in the tree; none of those files were
+touched here. One thing noticed but explicitly out of scope for this pass, worth a look later: the
+server's own `tuiSnapshot` handler sends every run system-wide, every tick, forever (no per-tick
+visibility filtering) — the client-side cap above bounds the CLIENT's own memory regardless, but the
+wire payload itself grows with total system history the same way; not touched here since it is
+`runtime/supervisor.js`, out of this pass's scope.
+
+## Fifty-seventh pass, 2026-09-14 — the same ChatGPT review's three lifecycle/concurrency findings
+
+Findings 1 (preflight cleanup), 6 (`resume()` vs. task-terminal TOCTOU), and 5 (shared-worktree
+concurrency / `git add -A`) — all confirmed real, all fixed, in `runtime/supervisor.js`, `db/index.js`,
+and `runtime/supervisor.js`'s `gitCreatePush`. Ran concurrently with the sibling TUI pass above and an
+MCP-proxy hardening pass; touched none of their files.
+
+- **Finding 1 (🔴 critical) — `discardPreflightRun` trusted `adapter.stop()` returning as proof of
+  death; it is not.** Traced `adapters/claude-code/adapter.js`'s real `stop()`: synchronous, fires
+  SIGINT, and only SCHEDULES a SIGKILL fallback 3s later via a bare `setTimeout` — it returns
+  immediately, awaiting neither the grace period nor confirmed death. `discardPreflightRun` `await`ed
+  that no-op and proceeded straight to deleting rows. Fixed by routing through `reap()` (this file's own
+  wrapper over `reconcile.js`'s `reapRun`) instead — the ONE real, already-tested confirmed-kill
+  mechanism in this codebase (`killProcessGroup`'s SIGTERM → poll → SIGKILL → poll-again, gated on the
+  OS actually reporting the group gone). It already handles both cases a preflight can be in correctly:
+  a run-owned process (Claude Code) gets killed and confirmed by pgid directly; a process sharing a
+  pooled group (OpenCode) is ended via `adapterStop`, never a group-kill, so a preflight sharing a
+  resident `opencode serve` with real work never collaterally kills it. `createRun`'s own default
+  (`started_by: 'preflight'` when `isPreflight: true`) turned out to already be exactly what `reapRun`'s
+  ownership refusal expects — this reuse was anticipated by earlier work, not bolted on. Only a real kill
+  attempt that came back unconfirmed (structurally detected — the return shape carries `pgid`, or
+  `sharedWith` with `sessionEnded` false — not by matching a `reason` string) now refuses to delete rows.
+  New `runtime/test/preflight.test.js` case 11: a REAL spawned process that ignores SIGTERM (so it needs
+  the actual escalation to die) plus a harness whose `stop()` does nothing at all — cleanup now waits for
+  genuinely confirmed death (verified via `isProcessGroupLive`) before reporting success. Verified to
+  fail against the pre-fix code (the real process was still alive when `discardPreflightRun` resolved)
+  before being restored. Also had to correct my own first attempt: the natural "not reaped and not
+  sessionEnded means unsafe" reading broke case 7 (a crashed preflight with NO recorded identity at all —
+  genuinely nothing to confirm, and safe to proceed) — the real signal is structural, not a blanket
+  binary on `reaped`.
+- **Finding 6 (🟠) — `resume()`'s terminal-task check and the actual DB reopen were two separate
+  operations with a real async window between them.** The check ran at the very top of `resume()`;
+  `reopenRun` (its actual write) ran only after a full round of real async work (MCP re-attach, spawning
+  the resumed process) — a task transitioning to terminal (`approveTask`/`mergeTask`) during that window
+  would still get a freshly reopened, live run, because `reopenRun`'s own `WHERE` clause never re-checked
+  task state at the one moment that matters. Fixed at the DB layer: `reopenRun(db, runId, {
+  terminalStates })` now binds the terminal-state list into the SAME atomic `UPDATE` via a `NOT EXISTS`
+  subquery (`db/` deliberately never imports `domain/` anywhere in this codebase, so the caller — which
+  already imports `domain/task-states.js` — passes the list in; omitting it preserves the exact pre-fix
+  behavior for any caller not yet updated). `resume()` now passes `TERMINAL`, and — since `adapter.resume()`
+  has ALREADY spawned the new process by the time this check runs — a genuine refusal now also stops that
+  just-resumed process and detaches its fresh MCP attachments, rather than leaving a live process with no
+  row tracking it. New `runtime/test/worktree.test.js` case 24 reproduces the exact ordering
+  deterministically (no timing/concurrency machinery needed — it is a plain ordering fact: call
+  `reopenRun` directly after the task has already gone terminal) and also proves the non-terminal and
+  no-`terminalStates` paths are completely unaffected. Verified to fail against the pre-fix `db/index.js`
+  (`1 !== 0`) before being restored.
+- **Finding 5 (🟠) — nothing forced a real caller to use `paths`, and the `git:identity` lease is a push
+  serializer, not an edit lock.** `agents/git-create-push.js`'s own header already documented `paths` as
+  purely opt-in; confirmed `git-push-runner`'s own prompt (`domain/utility-instructions.js`) never
+  mentions it, so a normal worker call with just `message` runs `git add -A` on a worktree PLAN.md §7
+  deliberately shares across every worker assigned to a task — while another worker sharing that exact
+  worktree can edit it at any moment, since the lease only serializes concurrent pushes against each
+  other. Considered and rejected a race-detector (snapshot-dirty-files-before-`add`, compare-after) as
+  the fix: it cannot distinguish a genuine concurrent edit from the autofix script's OWN legitimate
+  changes to files outside the original set without real risk of false positives — exactly the kind of
+  fragile "small" fix that isn't actually simple. Took the smaller, more certain path instead, matching
+  this session's own repeated pattern: `gitCreatePush` now refuses outright when a task has MORE THAN
+  ONE worker assigned and no explicit `paths` was given — a solo-worker task (every other existing test in
+  this file) has nothing else that could be editing the worktree, so the default stays exactly as
+  permissive as before for the common, actually-safe case. `runFightLoop` itself (`agents/
+  git-create-push.js`) is untouched — it is pure git mechanics with its own direct tests that deliberately
+  exercise the plain `-A` default, and this gate lives at the one real entry point both `gitPush`/
+  `gitPushProtected` wire commands funnel through. New `runtime/test/git-create-push.test.js` case 10: a
+  real two-worker task, a real unrelated uncommitted file — the unscoped call is refused (the unrelated
+  file is never staged or touched); the SAME task with explicit `paths` still pushes successfully,
+  committing only the named file, leaving the unrelated one exactly as uncommitted as before. Verified to
+  fail against the pre-fix code (a real `pushed` status, with the fight loop's own attempt log showing a
+  real commit and push having happened) before being restored.
+
+`npm test`: exit 0, twice in a row (154 suites), after all three fixes landed together.
+
+## Fifty-ninth pass, 2026-09-14 — extracting `runtime/supervisor.js`'s natural seams (ChatGPT review, finding 4)
+
+`runtime/supervisor.js` had grown to ~4900 lines / ~269KB — the review's own words: "the individual
+mechanisms are mostly separated, but the composition root is becoming a god object." Its explicit
+instruction, followed to the letter: **"I would not do a giant refactor now... Extract when a subsystem
+has its own state machine, lifecycle, tests and invariants... Only extract if the boundary is genuinely
+useful."** This is a PURE code-organization pass — zero behavioral change, verified by running the FULL
+`npm test` after every single extraction, not just at the end.
+
+**Extracted, both a genuinely useful boundary, both verified zero-regression:**
+
+- **`runtime/worktree-service.js`** — `createTaskWorktree`/`discardTaskWorktree`/`requestWorktree` and
+  their private helpers (`repoRootFromWorktree`, `taskWorktreePath`, `looksLikeRealWorktree`,
+  `runGitWorktreeAdd`, `worktreeStatus`, `STALE_WORKTREE_CLAIM_MS`). Traced first: `database` was the
+  ONLY closure dependency these functions ever touched — no `logger`, no `mcpPool`, no `pump`. A clean,
+  low-coupling seam with its own state machine (`WORKTREE_CLAIM_PENDING` claim/finalize/release/reclaim,
+  migration 0017's create/discard distinction) and its own dedicated tests
+  (`runtime/test/worktree.test.js`, 24 cases). `execFileAsync`/`execFile`/`promisify` moved with it (their
+  only real callers); `execFileSync` stayed in `supervisor.js` (still used by `currentHeadFor`/
+  `changedPathsFor`, unrelated to this seam). Verified: full `npm test` exit 0 (154 suites) immediately
+  after this extraction, plus `worktree.test.js` standalone (24/24, including the event-loop-non-blocking
+  case, which specifically proves the async git calls still don't block).
+- **`runtime/preflight-service.js`** — `preflight`/`discardPreflightRun`/`sweepPreflightRuns` and the
+  private `classifyPreflightError`/`PREFLIGHT_PROMPT`. Real dependencies: `database`, `logger`, the raw
+  `adapters` registry, `harnessCache`, plus four composition-root functions injected as closures
+  (`adapterFor`, `harnessOf`, `start`, `reap`) — all four are hoisted `function`/`async function`
+  declarations in `supervisor.js`, so referencing them by name at the (earlier-in-file) instantiation
+  call site is safe; none of them is actually CALLED until long after every one is assigned. Its own
+  lifecycle (start → wait for a real turn → classify → confirmed-kill cleanup → record `model_health`)
+  and its own dedicated tests (`runtime/test/preflight.test.js`, 11 cases). Verified: full `npm test` exit
+  0 (154 suites) immediately after this extraction too, plus `preflight.test.js` standalone (11/11,
+  including case 11, this session's own confirmed-kill fix from earlier in this pass).
+
+**Evaluated and deliberately NOT extracted — moved-but-not-decoupled, per the review's own explicit
+warning against forcing that:**
+
+- **Review orchestration** (`recordVerdict`/`approveTaskLocked`/`reviewFindings`/`reviewStatus`) — traced
+  8 real closure dependencies: `database`, `logger`, `withTaskLock`, `currentHeadFor`, `changedPathsFor`,
+  `recordTransition`, `taskHandoff`, `applyClearPolicy`. The last two are themselves broadly-shared,
+  central composition-root functions (handoff generation, the Phase 8 clear-policy hooks) — extracting
+  this seam would inject nearly as much coupling into a new file as it removes from `supervisor.js`, for
+  comparatively little size win, with real risk of subtly disturbing review-round/task-lock logic this
+  session's own earlier passes already fixed real races in.
+- **Ask management** (`recordApprovalAsk`/`withdrawApprovalAsk`/`deliverAnswer`/`answerAsk`/`sweepAsks`)
+  — traced real dependencies on `routeOrThrow`, `pump`, task-transition/clear-policy helpers, and the
+  run-event pipeline (`onEventHook`) it's interleaved with in the file. Same conclusion: genuinely
+  entangled with the run lifecycle, not a clean boundary today.
+- **Utility-task orchestration / the MCP attach glue in `start()`/`resume()`** — `attachMcpPoolsForRole`
+  is ALREADY its own extracted function (done in an earlier pass); its neighbors are tightly
+  interleaved with `start()`/`resume()`'s own spawn sequencing, not a separable seam on inspection.
+- **Session-reset** (`resetSession`) — small enough (~25 lines) that extracting it into its own file
+  would be moving code to reduce line count, not to reduce coupling — exactly what the review said not
+  to do.
+- **Command-authorization wiring** (`authorizedCommandHandlers`/`commandHandlers`) — explicitly the
+  composition root's own job per the review; not touched.
+- MCP pool / Slack outbox / vault projection are ALREADY separate modules `supervisor.js` only composes
+  — confirmed already right, not touched.
+
+**Result**: `runtime/supervisor.js` 275,567 bytes → 228,630 bytes (17% smaller) across two extractions,
+plus a small amount of now-dead-import cleanup (`WORKTREE_CLAIM_PENDING`/`claimTaskWorktreeSlot`/
+`finalizeTaskWorktreeSlot`/`releaseTaskWorktreeClaim`/`reclaimStaleTaskWorktreeClaim`/`deletePreflightRun`/
+`listPreflightRuns`/`recordModelHealth`/`execFileAsync`/`execFile`/`promisify` — each confirmed to have
+zero remaining real call sites in `supervisor.js` before removal, not just "probably unused"). `npm test`:
+exit 0, twice in a row, 154 suites both extractions and combined — no test file was edited to make this
+pass; every existing test's assertions are byte-for-byte what they were before this pass.

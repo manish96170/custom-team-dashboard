@@ -478,9 +478,10 @@ await runTest("mcp server pooling", async () => {
   {
     const stateDir = makeScratchDir("mcp-pool-delayed-bind-concurrency");
     let db;
+    let pool;
     try {
       db = openDb({ stateDir });
-      const pool = createMcpPool({ db, logger: quiet });
+      pool = createMcpPool({ db, logger: quiet });
       const delayedBind = {
         command: process.execPath,
         args: ["-e", "setTimeout(() => require('net').createServer(() => {}).listen(process.env.LEO_MCP_SOCKET_PATH, () => setInterval(() => {}, 60000)), 2000)"],
@@ -494,6 +495,36 @@ await runTest("mcp server pooling", async () => {
       const finalPool = getPool(db, a.poolId);
       assert.equal(finalPool.status, "ready", `expected the delayed-bind server to eventually be marked ready, got ${JSON.stringify(finalPool)}`);
       console.log("  13. a concurrent LOSER now waits long enough for a real, legitimately slow (~2s) bind to succeed, instead of timing out at ~1s");
+    } finally {
+      // Neither `a` nor `b`'s attachment was ever detached above (the case only asserts they share a
+      // pool row) — without this, the real delayed-bind process this case spawns outlives the test
+      // entirely. Confirmed as a genuine, always-reproducing leak (not just a failure-path gap): a
+      // standalone run of this file left exactly one matching process behind every time, across many
+      // runs this session (found via a full ChatGPT-review-prompted process-leak audit, 2026-09-14).
+      try { await pool?.disposeAll(); } catch { /* best effort */ }
+      try { closeDb(db); } catch { /* already closed */ }
+      rmScratchDir(stateDir);
+    }
+  }
+
+  // ── 14 ───────────────────────────────────────────────────────────────────────────
+  // Phase 12 (Release hardening) permissions review: `spawnOne` chmods the real socket to 0600 once it
+  // verifies it (review-consolidated-2026-09-14.md finding 12), but nothing had ever asserted the REAL
+  // mode bits via `fs.statSync` — the same "verify against the OS, don't trust the code that's supposed
+  // to set it" discipline `db/test/permissions.test.js` already applies to the state dir and db file.
+  {
+    const stateDir = makeScratchDir("mcp-pool-socket-permissions");
+    let db;
+    try {
+      db = openDb({ stateDir });
+      const pool = createMcpPool({ db, logger: quiet });
+      const a = await pool.attach("permissions-check", LONG_LIVED);
+      const row = getPool(db, a.poolId);
+      assert.ok(row.socketPath && fs.existsSync(row.socketPath), "sanity: a real socket path must exist");
+      const mode = fs.statSync(row.socketPath).mode & 0o777;
+      assert.equal(mode, 0o600, `expected the pooled socket to be chmod 0600 regardless of umask, got ${mode.toString(8)}`);
+      await pool.detach(a.attachmentId);
+      console.log("  14. a real pooled socket's own file mode is genuinely 0600, verified via statSync, not just trusted from the chmod call");
     } finally {
       try { closeDb(db); } catch { /* already closed */ }
       rmScratchDir(stateDir);

@@ -1,0 +1,17 @@
+{
+  "name": "custom-team-dashboard",
+  "description": "Single-writer SQLite supervisor + TUI orchestrating Claude Code and OpenCode agent sessions as teams/tasks/workers, with capability-based authorization, MCP tool pooling, Slack outbound notifications, and a read-only Obsidian vault projection.",
+  "version": "0.1.0",
+  "author": {
+    "name": "manish96170"
+  },
+  "repository": "https://github.com/manish96170/custom-team-dashboard",
+  "keywords": [
+    "multi-agent",
+    "claude-code",
+    "opencode",
+    "supervisor",
+    "dashboard",
+    "orchestration"
+  ]
+}
