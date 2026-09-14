@@ -105,7 +105,8 @@ import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { createEventPump } from "./event-pump.js";
 import { generateTaskHandoff } from "../handoff/generate.js";
-import { loadHarnessDefaults } from "../config/harness-defaults.js";
+import { loadHarnessDefaults, assignmentFor } from "../config/harness-defaults.js";
+import { decideClear } from "../domain/clear-policy.js";
 import { loadReviewProfiles, profileFor as profileForReview } from "../config/review-profiles.js";
 import { evaluateReview, rankFindings, diffFindings, FINDING_VERDICTS } from "../domain/review.js";
 import {
@@ -759,7 +760,16 @@ export function createSupervisor({
     return (event) => {
       if (event?.type === "approval.request") recordApprovalAsk(runId, event);
       else if (event?.type === "approval.withdrawn") withdrawApprovalAsk(runId, event);
-      else if (event?.type === "turn.end") writeTurnDigest(runId);
+      else if (event?.type === "turn.end") {
+        writeTurnDigest(runId);
+        // Rule 5, Phase 8: "always" (the four utility-runner roles) fires here, once per turn — not
+        // assumed satisfied by "a utility run is one-shot", because nothing in this runtime actually
+        // stops an operator from `resume()`ing or sending a second turn to one (verified: no such
+        // restriction exists before writing this). Fire-and-forget, same convention as
+        // `writeTurnDigest`'s own unawaited call just above.
+        applyClearPolicyForRun(runId, "turn-end")
+          .catch((err) => logger.warn?.(`[supervisor] clear-policy: turn-end for run ${runId} failed (non-fatal): ${err.message}`));
+      }
     };
   }
 
@@ -1326,6 +1336,105 @@ export function createSupervisor({
     if (!adapter.clearContext) return { runId, harnessId, supported: false };
     const ack = await adapter.clearContext(runId);
     return { runId, harnessId, supported: true, ack };
+  }
+
+  /**
+   * PLAN.md §8 Rule 5 (Phase 8, item 39's remaining half) — resolve the `clearPolicy` that actually
+   * applies to a worker's role on a task, via `config/harness-defaults.js`'s own `assignmentFor`.
+   *
+   * The CONFIG vocabulary (`reviewer1`/`reviewer2`/`parentReviewer`) is not quite the workflow-profile
+   * vocabulary a `workers.role` row holds (`coder`/`reviewer`/`parentReviewer`) — `derivedSlotFor` (below,
+   * in the review path) already solves exactly this translation, so this reuses the SAME
+   * assignment-record-first, stable-nickname-order fallback rather than inventing a second mechanism.
+   * (Unlike `derivedSlotFor`, this does NOT rename `parentReviewer` to `"parent"` — that rename is
+   * §13's review-quorum vocabulary, not `harness-defaults.json`'s.)
+   */
+  function configSlotForWorker(taskId, worker) {
+    const record = readAssignmentRecord(taskId);
+    const assigned = record?.slots?.find((sl) => sl.workerId === worker.workerId)?.configSlot;
+    if (assigned) return assigned;
+    if (worker.role !== "reviewer") return worker.role;
+    const reviewers = database
+      .prepare(`SELECT worker_id AS workerId, nickname FROM workers WHERE task_id = ? AND role = 'reviewer'`)
+      .all(taskId)
+      .sort((a, b) => String(a.nickname ?? a.workerId).localeCompare(String(b.nickname ?? b.workerId)));
+    const idx = reviewers.findIndex((r) => r.workerId === worker.workerId);
+    return idx <= 0 ? "reviewer1" : `reviewer${idx + 1}`;
+  }
+
+  /**
+   * Best-effort, non-fatal clear for one run — gated by `domain/clear-policy.js`'s pure decision and the
+   * target adapter's own declared `capabilities().clearContext`. Never throws: matching the
+   * `taskHandoff(...)` try/catch already sitting beside every real trigger call site this is invoked
+   * from, a clearing failure must never fail the transition/verdict/turn it is attached to.
+   */
+  async function maybeClearRun(runId, { clearPolicy, trigger }) {
+    try {
+      const { adapter } = routeOrThrow(runId);
+      const clearContextCapability = adapter.capabilities?.()?.clearContext ?? false;
+      const decision = decideClear({ clearPolicy, trigger, clearContextCapability });
+      if (!decision.clear) return { runId, cleared: false, reason: decision.reason };
+      const result = await clearContext(runId);
+      return { runId, cleared: true, result };
+    } catch (err) {
+      logger.warn?.(`[supervisor] clear-policy: could not clear run ${runId} (trigger "${trigger}"): ${err.message}`);
+      return { runId, cleared: false, reason: err.message };
+    }
+  }
+
+  /**
+   * Apply `trigger` to every OPEN run belonging to a worker of one of `roles` on `taskId` — the function
+   * every real trigger call site below calls, fire-and-forget (`.catch()`, never `await`ed from a
+   * transition/verdict path), same "a background write must never block or fail the thing that triggered
+   * it" convention `writeTurnDigest`/`mcpPool.detach(...).catch(...)` already use in this file.
+   *
+   * See `domain/clear-policy.js`'s own header for exactly which triggers this runtime raises and why the
+   * others (a change-request round concluding, since `awaiting-review` -> `fixing` is not automatically
+   * driven yet) are not wired here — this function does not guess at call sites that do not exist.
+   */
+  async function applyClearPolicy(taskId, { roles, trigger }) {
+    const workers = database
+      .prepare(`SELECT worker_id AS workerId, nickname, role FROM workers WHERE task_id = ?`)
+      .all(taskId)
+      .filter((w) => roles.includes(w.role));
+    if (!workers.length) return [];
+    const config = loadHarnessDefaults({ stateDir: stateDirOf() });
+    const task = database.prepare(`SELECT team_id FROM tasks WHERE id = ?`).get(taskId);
+    const results = [];
+    for (const worker of workers) {
+      const configSlot = configSlotForWorker(taskId, worker);
+      const clearPolicy = assignmentFor(config, configSlot, { teamId: task?.team_id ?? null })?.clearPolicy;
+      if (!clearPolicy) continue;
+      const openRunIds = database
+        .prepare(`SELECT run_id AS runId FROM runs WHERE worker_id = ? AND ended_at IS NULL`)
+        .all(worker.workerId)
+        .map((r) => r.runId);
+      for (const runId of openRunIds) results.push(await maybeClearRun(runId, { clearPolicy, trigger }));
+    }
+    return results;
+  }
+
+  /**
+   * The single-run shape `applyClearPolicy` doesn't fit: the "always" policy's real trigger
+   * (`onEventHook`'s `turn.end`) already has a `runId` in hand and no reason to re-derive every OTHER
+   * open run for that worker's task — `applyClearPolicy` is task-scoped because its own triggers
+   * (`state-transition`/`review-round-concluded`) are task events with no run of their own to start
+   * from. Same resolution chain (`configSlotForWorker` + `assignmentFor`), just entered from a run
+   * instead of a task.
+   */
+  async function applyClearPolicyForRun(runId, trigger) {
+    const workerId = workerIdForRun(database, runId);
+    if (!workerId) return { runId, cleared: false, reason: "no worker found for this run" };
+    const worker = database
+      .prepare(`SELECT worker_id AS workerId, nickname, role, task_id AS taskId FROM workers WHERE worker_id = ?`)
+      .get(workerId);
+    if (!worker?.taskId) return { runId, cleared: false, reason: "worker has no task" };
+    const config = loadHarnessDefaults({ stateDir: stateDirOf() });
+    const task = database.prepare(`SELECT team_id FROM tasks WHERE id = ?`).get(worker.taskId);
+    const configSlot = configSlotForWorker(worker.taskId, worker);
+    const clearPolicy = assignmentFor(config, configSlot, { teamId: task?.team_id ?? null })?.clearPolicy;
+    if (!clearPolicy) return { runId, cleared: false, reason: `no clearPolicy configured for slot "${configSlot}"` };
+    return maybeClearRun(runId, { clearPolicy, trigger });
   }
 
   async function resume(runId) {
@@ -2403,6 +2512,14 @@ export function createSupervisor({
     try { taskHandoff(taskId, { reason: "state-transition" }); } catch (err) {
       logger.warn?.(`[supervisor] approveTask ${taskId}: handoff regeneration failed (non-fatal): ${err.message}`);
     }
+    // Rule 5, Phase 8: the coder's own "state-transition" moment, AND the only round-concluding event
+    // this runtime actually implements (`awaiting-review` -> `approved` means no more rounds) — see
+    // `domain/clear-policy.js`'s header for why a change-request round ending is NOT wired here (nothing
+    // drives `awaiting-review` -> `fixing` automatically yet).
+    applyClearPolicy(taskId, { roles: ["coder"], trigger: "state-transition" })
+      .catch((err) => logger.warn?.(`[supervisor] approveTask ${taskId}: coder clear-policy failed (non-fatal): ${err.message}`));
+    applyClearPolicy(taskId, { roles: ["reviewer", "parentReviewer"], trigger: "review-round-concluded" })
+      .catch((err) => logger.warn?.(`[supervisor] approveTask ${taskId}: reviewer clear-policy failed (non-fatal): ${err.message}`));
     return { taskId, approved: true, status };
   }
 
@@ -2622,6 +2739,10 @@ export function createSupervisor({
     try { taskHandoff(taskId, { reason: "state-transition" }); } catch (err) {
       logger.warn?.(`[supervisor] assignTask ${taskId}: handoff regeneration failed (non-fatal): ${err.message}`);
     }
+    // Rule 5, Phase 8: deliberately NOT an `applyClearPolicy` call site, unlike `approveTaskLocked`'s and
+    // `mergeTask`'s otherwise-identical `taskHandoff` calls. Every run this transition could apply to
+    // (`started`) was spawned in THIS SAME call, moments ago — a brand-new process has no context to
+    // clear, so wiring this site would be a call that always resolves to nothing, not a real trigger.
 
     return { taskId, plan, ...report };
   }
@@ -3141,6 +3262,11 @@ export function createSupervisor({
     try { taskHandoff(taskId, { reason: "state-transition" }); } catch (err) {
       logger.warn?.(`[supervisor] mergeTask ${taskId}: handoff regeneration failed (non-fatal): ${err.message}`);
     }
+    // Rule 5, Phase 8: the coder's own run, if still open at merge time, gets one last state-transition
+    // clear — `maybeClearRun` is a no-op if there is nothing open to clear, so this costs nothing when
+    // the coder's run already ended before the merge (the common case).
+    applyClearPolicy(taskId, { roles: ["coder"], trigger: "state-transition" })
+      .catch((err) => logger.warn?.(`[supervisor] mergeTask ${taskId}: coder clear-policy failed (non-fatal): ${err.message}`));
     return { taskId, merged: true, approvalId, from: task.state };
   }
 

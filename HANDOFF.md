@@ -1,4 +1,4 @@
-# Handoff — custom-team-dashboard (updated 2026-09-13, forty-sixth pass — read this
+# Handoff — custom-team-dashboard (updated 2026-09-14, forty-eighth pass — read this
 whole header before doing anything else in a fresh session).
 
 **Forty-sixth pass, same day (2026-09-13) — a full review of every uncommitted/untracked change,
@@ -871,6 +871,61 @@ item 22 before trusting item 17's own "honest limitation" wording, which this co
 117 suites unaffected (all fixes, no new files). The other 4 findings from this same review (worktree
 claim/repo-branch binding, the crashed-claim deadlock, discard-vs-start racing assignment, forced discard
 of clean uncommitted work) were explicitly NOT covered by item 22 — **now fixed, item 24, same day.**)
+
+## Forty-eighth pass, 2026-09-14 — Phase 8's clear-policy DECISION logic (item 39's remaining half)
+
+Item 39 (2026-09-13) built the SCHEMA half only — `config/harness-defaults.js`'s `clearPolicy` field per
+role, validated against `CLEAR_POLICIES`. Nothing read it. This pass built the decision module and wired
+it for real.
+
+**Investigated before writing any code** (same discipline the two prior review passes used):
+- `domain/task-states.js`'s state machine plus every `recordTransition(...)` call site in
+  `runtime/supervisor.js` — found that only THREE of the seven call sites also regenerate a tier-3
+  handoff (`approveTaskLocked`'s success path, `assignTask`'s compensation path, `mergeTask`) — the auto
+  block/unblock sites do not. Rule 5's own argument ("clearing is cheap BECAUSE a handoff exists to
+  reload from") ties clearing directly to those three, not to every `recordTransition` call.
+- Checked `assignTask`'s own handoff site specifically and found every run it could apply to was spawned
+  moments earlier in the SAME call — a brand-new process has nothing to clear, so this site is
+  deliberately NOT wired (documented in place in the code, not silently skipped).
+- Checked how a review "round" actually concludes: `round` is a caller-supplied integer
+  (`recordReviewVerdict`), and the ONLY round-concluding event this runtime drives is `approveTaskLocked`'s
+  success path. `awaiting-review` -> `fixing` (a change-request round ending) is a legal edge in
+  `domain/task-states.js` but nothing in `runtime/supervisor.js` transitions a task there automatically —
+  so `per-review-round`'s OTHER half has no real event to hook yet. Not wired; flagged as future work once
+  that transition itself exists, not invented against a hypothetical.
+- Checked whether a utility ("always") role's run is structurally one-shot (no second turn possible) —
+  it is NOT: nothing stops `resume()`/`sendInput()` reaching one a second time, so `always` needed a real,
+  per-turn trigger rather than being satisfiable by architecture alone.
+- Checked `on-demand`: the `clearContext(runId)` wire command already exists and callable directly — that
+  already IS "on demand". No automatic trigger should ever fire it, and none does.
+
+**Built:**
+- `domain/clear-policy.js` — pure `decideClear({ clearPolicy, trigger, clearContextCapability })`, mapping
+  each of the four policies to the one real trigger found above (`state-transition`,
+  `review-round-concluded`, `turn-end`, `demand`), refusing when the target harness's own
+  `capabilities().clearContext` is falsy. `domain/test/clear-policy.test.js`: 8 pure cases, all four
+  policies against all four triggers plus the capability gate.
+- Wired into `runtime/supervisor.js`: `configSlotForWorker` (reuses `derivedSlotFor`'s own
+  assignment-record-first, stable-nickname-order mechanism, without its "parent" rename), `maybeClearRun`
+  (best-effort, non-fatal, gated by the adapter's declared capability), `applyClearPolicy` (task-scoped,
+  for `approveTaskLocked`/`mergeTask`) and `applyClearPolicyForRun` (single-run, for the pump's `turn.end`
+  hook). Every automatic call is fire-and-forget (`.catch()`, never awaited from a transition/verdict/turn
+  path) — matching `writeTurnDigest`'s and `mcpPool.detach(...).catch(...)`'s existing convention in this
+  same file.
+- `runtime/test/clear-policy.test.js` — 3 real-process wiring cases: approving a task clears the coder's
+  own open run AND a reviewer's open run, and never touches a bystander coder's unrelated run on a
+  different task; a utility role's run is cleared on its own `turn.end` with no task-level trigger at all;
+  a harness declaring no `clearContext` support is never called regardless of policy. Verified: case 1
+  fails with a real 5-second timeout against the pre-wiring code (confirmed by temporarily reverting
+  `runtime/supervisor.js`'s changes and re-running), restored, passes.
+- `ROADMAP.md`'s Phase 8 checkbox flipped `[~]` -> `[x]`; `PLAN.md`'s Rule 5 annotated "BUILT 2026-09-14".
+
+Full `npm test`: exit 0, twice in a row (one standalone re-run of
+`adapters/claude-code/test/test-claude-code-adapter.mjs` needed once, due to a pre-existing intermittent
+flake in that suite's `turn.end status: completed` case — confirmed clean, unrelated to this pass).
+
+**Not committed yet** — check `git status`/`git log` for the current state before trusting this note to
+stay in sync with a later session.
 
 Read this first in a new session. It tells you what's real, what's fixed, what's
 still broken, and exactly what to do next, without re-reading the whole prior

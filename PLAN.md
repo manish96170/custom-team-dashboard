@@ -685,6 +685,14 @@ rhythm:
 "utility":   { "clearPolicy": "always" }              // one operation per invocation, state in its journal
 ```
 
+**BUILT 2026-09-14** — schema 2026-09-13 (item 39), decision logic 2026-09-14: `domain/clear-policy.js`
+(pure `decideClear`) wired into `runtime/supervisor.js` at the real trigger call sites this runtime
+implements (`approveTaskLocked`/`mergeTask` for the two state-transition-shaped policies, the pump's own
+`turn.end` for `always`; `on-demand` needed nothing new — the `clearContext(runId)` wire command already
+was "on demand"). Full mechanism and what's deliberately not wired yet (a change-request round's own
+conclusion, since nothing drives `awaiting-review` -> `fixing` automatically) is in `ROADMAP.md`'s Phase 8
+entry and `domain/clear-policy.js`'s own header.
+
 **Rule 6 — the CTO must be cheap and mostly deterministic.** It is resident, so its
 model is a standing cost. Every registry query/mutation expressible as a typed command
 *is* a command (section 4, section 16) — the model is invoked for routing and advice,

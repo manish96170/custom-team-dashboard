@@ -720,15 +720,31 @@ built correctly the first time, not a bug to patch in throwaway spike code.
 - [ ] Cheap resident model by default (`cto` role in `harness-defaults.json`), with
       single-decision escalation to a stronger model rather than running high-effort
       resident all day.
-- [~] Clear policies per role (PLAN.md section 8, Rule 5) — **SCHEMA done, 2026-09-13, item 39;
-      decision logic NOT built.** `config/harness-defaults.js`'s `CLEAR_POLICIES` vocabulary
-      (`on-state-transition`/`per-review-round`/`on-demand`/`always`) and a `clearPolicy` field on
-      every `BUILT_IN_DEFAULTS` role entry, validated on load (a value outside the vocabulary now
-      throws, matching this file's own "malformed file throws" rule — it did NOT before this fix).
-      Nothing yet reads `clearPolicy` to actually call `clearContext()`/`resume()` at the right
-      moment — no `domain/clear-policy.js` decision module exists. That module, proven against
-      real `clearContext` behavior from Phase 0b, is the remaining, NOT-yet-started half of this
-      checkbox.
+- [x] Clear policies per role (PLAN.md section 8, Rule 5) — **SCHEMA done 2026-09-13 (item 39);
+      DECISION LOGIC built 2026-09-14.** `domain/clear-policy.js` is the pure decision half (a
+      `decideClear({clearPolicy, trigger, clearContextCapability})` function, unit-tested against all
+      four policies × all four triggers), wired into `runtime/supervisor.js` at the REAL trigger call
+      sites this runtime actually implements — found by reading the code, not invented:
+      `on-state-transition`/`per-review-round` both fire from `approveTaskLocked`'s success path
+      (the same moment it already regenerates a tier-3 handoff — Rule 5's own argument is that
+      clearing is cheap BECAUSE that handoff exists), `on-state-transition` fires once more from
+      `mergeTask`, and `always` fires from the pump's own `turn.end` event (verified first that a
+      utility run is NOT structurally one-shot — nothing stops an operator calling `resume()`/
+      `sendInput()` on one a second time, so this could not be skipped as already-satisfied).
+      `on-demand` needed no automatic wiring — the `clearContext(runId)` wire command already IS
+      "on demand". One deliberately-NOT-wired site, documented in place: `assignTask`'s own
+      handoff-triggering transition always follows a brand-new spawn, so there is never anything to
+      clear there. And one policy this runtime cannot yet trigger automatically: `per-review-round`'s
+      OTHER half (a change-request round concluding) has no real event to hook, since nothing drives
+      `awaiting-review` -> `fixing` automatically today — wiring it is future work once that
+      transition itself exists, not a gap in this module. Every automatic clear call is fire-and-forget
+      and gated on the target adapter's own `capabilities().clearContext`, never fatal to the
+      transition/verdict/turn it is attached to. Verified: `domain/test/clear-policy.test.js` (8 pure
+      cases) plus `runtime/test/clear-policy.test.js` (3 real-process wiring cases — a coder's and a
+      reviewer's run genuinely cleared on approval, a bystander's unrelated run never touched, a
+      utility run cleared on its own turn.end, a no-`clearContext`-capability harness never called at
+      all); the wiring case was confirmed to fail (timeout) against the pre-wiring code before being
+      restored. Full `npm test`: exit 0, twice in a row.
 - [ ] Wire the "clean vs. kill" distinction (PLAN.md section 7) as an explicit rule the
       CTO follows, never inferred from a loose paraphrase.
 
