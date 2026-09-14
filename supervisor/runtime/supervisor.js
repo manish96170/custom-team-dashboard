@@ -107,6 +107,7 @@ import { createEventPump } from "./event-pump.js";
 import { generateTaskHandoff } from "../handoff/generate.js";
 import { loadHarnessDefaults, assignmentFor } from "../config/harness-defaults.js";
 import { decideClear } from "../domain/clear-policy.js";
+import { classifySessionAction } from "../domain/session-intent.js";
 import { loadReviewProfiles, profileFor as profileForReview } from "../config/review-profiles.js";
 import { evaluateReview, rankFindings, diffFindings, FINDING_VERDICTS } from "../domain/review.js";
 import {
@@ -1123,12 +1124,18 @@ export function createSupervisor({
    * review-consolidated-2026-09-14.md finding 1: every entry this builds also carries `--allow-tools`,
    * bounding the pooled server's tool surface to exactly what `ROLE_MCP_TOOL_ALLOWLIST` declares for
    * this role — attaching to a pool no longer means reaching its ENTIRE tool surface.
+   *
+   * `undeliveredNeeds` (finding 4) names every declared need that did NOT end up with a real,
+   * deliverable `mcpServersForConfig` entry — no registered pool config, the attach itself throwing, or
+   * `canDeliverMcpConfig` being false. `start()`/`resume()` use this to decide whether to refuse rather
+   * than silently hand a role no tool at all.
    */
   async function attachMcpPoolsForRole(role, { principalId, canDeliverMcpConfig, harnessId, workerId } = {}) {
     const mcpAttachmentIds = [];
     const mcpServersForConfig = {};
+    const undeliveredNeeds = [];
     const declaredMcpNeeds = ROLE_MCP_NEEDS[role] ?? [];
-    if (!declaredMcpNeeds.length) return { mcpAttachmentIds, mcpServersForConfig };
+    if (!declaredMcpNeeds.length) return { mcpAttachmentIds, mcpServersForConfig, undeliveredNeeds };
     const registeredConfigs = {};
     for (const name of declaredMcpNeeds) {
       if (poolConfigFor(name, { stateDir: stateDirOf() })) registeredConfigs[name] = name;
@@ -1136,10 +1143,11 @@ export function createSupervisor({
     const manifest = manifestForRole(role, { registeredConfigs });
     if (manifest.missing.length) {
       logger.warn?.(`[supervisor] role "${role}" declares MCP need(s) [${manifest.missing.join(", ")}] with no registered pool config`);
+      undeliveredNeeds.push(...manifest.missing);
     }
     for (const poolName of manifest.pools) {
       const poolConfig = poolConfigFor(poolName, { stateDir: stateDirOf() });
-      if (!poolConfig) continue; // already warned above via `manifest.missing`
+      if (!poolConfig) continue; // already warned + recorded above via `manifest.missing`
       try {
         const attached = await mcpPool.attach(poolName, poolConfig, { principalId: principalId ?? null, runId: null });
         mcpAttachmentIds.push(attached.attachmentId);
@@ -1148,16 +1156,20 @@ export function createSupervisor({
           const args = [MCP_STDIO_PROXY_PATH, "--socket", attached.socketPath];
           if (allowedTools.length) args.push("--allow-tools", allowedTools.join(","));
           mcpServersForConfig[poolName] = { command: process.execPath, args };
-        } else if (!canDeliverMcpConfig) {
-          logger.warn?.(`[supervisor] harness ${harnessId} cannot deliver an mcpConfig (mcpConfigDelivery: false) — run for ${workerId} attaches to pool "${poolName}" for bookkeeping only, with no usable tool`);
+        } else {
+          if (!canDeliverMcpConfig) {
+            logger.warn?.(`[supervisor] harness ${harnessId} cannot deliver an mcpConfig (mcpConfigDelivery: false) — run for ${workerId} attaches to pool "${poolName}" for bookkeeping only, with no usable tool`);
+          }
+          undeliveredNeeds.push(poolName);
         }
       } catch (err) {
-        // Non-fatal: a utility-task run that can't attach to its declared pool still starts (it just
-        // won't have that tool), logged rather than failing the whole run/resume over a pooling concern.
+        // Non-fatal at the ATTACH level — a run that can't attach still gets a chance to start/resume
+        // in degraded mode if the caller opts in; `start()`/`resume()` decide whether that's allowed.
         logger.warn?.(`[supervisor] run for ${workerId} could not attach to mcp pool "${poolName}": ${err.message}`);
+        undeliveredNeeds.push(poolName);
       }
     }
-    return { mcpAttachmentIds, mcpServersForConfig };
+    return { mcpAttachmentIds, mcpServersForConfig, undeliveredNeeds };
   }
 
   async function start({ harnessId, workerId, spec }) {
@@ -1218,13 +1230,31 @@ export function createSupervisor({
     // delivered tool surface would have no approval prompt in front of it at all. Skip entirely.
     const workerRow = database.prepare(`SELECT role FROM workers WHERE worker_id = ?`).get(workerId);
     const mcpAttach = spec.isPreflight
-      ? { mcpAttachmentIds: [], mcpServersForConfig: {} }
+      ? { mcpAttachmentIds: [], mcpServersForConfig: {}, undeliveredNeeds: [] }
       : await attachMcpPoolsForRole(workerRow?.role, {
         principalId: workerPrincipal?.id ?? null,
         canDeliverMcpConfig: adapter.capabilities?.()?.mcpConfigDelivery === "file-or-json-string",
         harnessId, workerId,
       });
     const mcpAttachmentIds = mcpAttach.mcpAttachmentIds;
+    // review-consolidated-2026-09-14.md finding 4: a role with a declared MCP need used to start
+    // completely normally even when that need went entirely undelivered — the worker's own instructions
+    // still told it to use the tool, silently. FAIL CLOSED BY DEFAULT (owner decision, 2026-09-14):
+    // refuse before ever spawning the adapter's process, unless the caller explicitly opts into the
+    // degraded run with `spec.allowDegradedMcp: true`. Whatever DID attach must still be detached —
+    // nothing here should be left resident for a run that never starts.
+    if (mcpAttach.undeliveredNeeds.length && !spec.allowDegradedMcp) {
+      for (const attachmentId of mcpAttachmentIds) {
+        mcpPool.detach(attachmentId).catch((detachErr) => {
+          logger.warn?.(`[supervisor] mcp-pool detach ${attachmentId} after refusing undelivered-MCP start for ${workerId} failed (best-effort): ${detachErr.message}`);
+        });
+      }
+      throw new Error(
+        `start: role "${workerRow?.role}" declares MCP need(s) [${mcpAttach.undeliveredNeeds.join(", ")}] that could `
+        + "not be delivered — refusing rather than starting a tool-less run silently; pass "
+        + "spec.allowDegradedMcp: true to start anyway with no tool for the undelivered need(s)",
+      );
+    }
     if (Object.keys(mcpAttach.mcpServersForConfig).length) {
       spec = { ...spec, mcpConfig: [...(spec.mcpConfig ? [].concat(spec.mcpConfig) : []), JSON.stringify({ mcpServers: mcpAttach.mcpServersForConfig })] };
     }
@@ -1339,6 +1369,55 @@ export function createSupervisor({
   }
 
   /**
+   * clearContext / resume — Group 4 built the adapter surface; this is the routing Group 5
+   * owes it. Both are routed through `harnessOf`, so both work on a run created before
+   * this supervisor process existed.
+   *
+   * Neither is uniform across harnesses and this does not pretend otherwise (PLAN.md
+   * section 4): Claude Code's clear mints a new session id, OpenCode's only summarizes.
+   * The adapter's own ack is passed back verbatim rather than flattened into a boolean.
+   */
+  async function clearContext(runId) {
+    const { harnessId, adapter } = routeOrThrow(runId);
+    if (!adapter.clearContext) return { runId, harnessId, supported: false };
+    const ack = await adapter.clearContext(runId);
+    return { runId, harnessId, supported: true, ack };
+  }
+
+  /**
+   * resetSession(runId, { requestedAction, explicitKillConfirmed, respawnSpec }) — Phase 8, PLAN.md §7's
+   * clean-vs-kill rule ENFORCED, not just declared: this is the one real call site
+   * `domain/session-intent.js`'s pure decision was built for.
+   *
+   * `requestedAction: "kill-respawn"` without `explicitKillConfirmed: true` is refused down to a soft
+   * clear — same "never infer destructive intent from a loose signal" guarantee §7's own prose states,
+   * enforced structurally here rather than left as an unconsulted pure function.
+   *
+   * A respawn needs a NEW process, which needs a spec — this function does not attempt to reconstruct
+   * one from the ended run's own history (a genuinely separate, harder problem: `runs` does not persist
+   * the full original `spec`, only `prompt`). The caller must supply `respawnSpec: { harnessId, workerId,
+   * spec }` for the kill-respawn path; a `clear` never needs one. Missing it on an authorized kill is a
+   * caller error, refused rather than guessed at.
+   */
+  async function resetSession(runId, { requestedAction, explicitKillConfirmed, respawnSpec = null } = {}) {
+    const decision = classifySessionAction({ requestedAction, explicitKillConfirmed });
+    if (decision.action === "clear") {
+      const result = await clearContext(runId);
+      return { runId, action: "clear", ...(decision.refused ? { refused: decision.refused } : {}), result };
+    }
+    // decision.action === "kill-respawn", and only reachable with explicitKillConfirmed === true.
+    if (!respawnSpec?.harnessId || !respawnSpec?.workerId || !respawnSpec?.spec) {
+      throw new Error(
+        "resetSession: an authorized kill-respawn requires respawnSpec: { harnessId, workerId, spec } — "
+        + "this function does not reconstruct a respawn spec from the ended run's own history",
+      );
+    }
+    const stopped = await stop(runId);
+    const started = await start(respawnSpec);
+    return { runId, action: "kill-respawn", stopped, started };
+  }
+
+  /**
    * PLAN.md §8 Rule 5 (Phase 8, item 39's remaining half) — resolve the `clearPolicy` that actually
    * applies to a worker's role on a task, via `config/harness-defaults.js`'s own `assignmentFor`.
    *
@@ -1437,7 +1516,7 @@ export function createSupervisor({
     return maybeClearRun(runId, { clearPolicy, trigger });
   }
 
-  async function resume(runId) {
+  async function resume(runId, { allowDegradedMcp = false } = {}) {
     const { harnessId, adapter } = routeOrThrow(runId);
     // review-sol-2026-09-13.md finding 8's remaining half: `resume` had NO task-state awareness at all —
     // it would happily reopen a CLOSED run whose task is already terminal, putting a `merged`/`cancelled`
@@ -1477,7 +1556,23 @@ export function createSupervisor({
         canDeliverMcpConfig: adapter.capabilities?.()?.mcpConfigDelivery === "file-or-json-string",
         harnessId, workerId: resumeWorkerId,
       })
-      : { mcpAttachmentIds: [], mcpServersForConfig: {} };
+      : { mcpAttachmentIds: [], mcpServersForConfig: {}, undeliveredNeeds: [] };
+    // review-consolidated-2026-09-14.md finding 4: same fail-closed-by-default posture as `start()` —
+    // a resumed generation must not silently lose its declared tool either. Detach whatever attached
+    // before refusing; nothing should be left resident for a resume that never happens.
+    if (resumeMcpAttach.undeliveredNeeds.length && !allowDegradedMcp) {
+      for (const attachmentId of resumeMcpAttach.mcpAttachmentIds) {
+        mcpPool.detach(attachmentId).catch((detachErr) => {
+          logger.warn?.(`[supervisor] mcp-pool detach ${attachmentId} after refusing undelivered-MCP resume for ${runId} failed (best-effort): ${detachErr.message}`);
+        });
+      }
+      return {
+        ok: false, refused: "mcp-required-unavailable",
+        error: `resume: role "${resumeWorkerRow?.role}" declares MCP need(s) [${resumeMcpAttach.undeliveredNeeds.join(", ")}] `
+          + "that could not be delivered for the new generation — refusing rather than resuming a tool-less run "
+          + "silently; pass { allowDegradedMcp: true } to resume anyway with no tool for the undelivered need(s)",
+      };
+    }
     const specOverride = Object.keys(resumeMcpAttach.mcpServersForConfig).length
       ? { mcpConfig: [JSON.stringify({ mcpServers: resumeMcpAttach.mcpServersForConfig })] }
       : undefined;
@@ -2595,7 +2690,7 @@ export function createSupervisor({
    * failure: a caller that gets an exception cannot tell which half succeeded, and here that difference is
    * the whole point.
    */
-  async function assignTask(taskId, { overrides = {}, actor = "operator", idempotencyKey = null, cwd = null } = {}) {
+  async function assignTask(taskId, { overrides = {}, actor = "operator", idempotencyKey = null, cwd = null, allowDegradedMcp = false } = {}) {
     if (!taskId) throw new Error("assignTask: taskId is required");
     const task = database.prepare(`SELECT id, title, type, team_id, state, worktree_id FROM tasks WHERE id = ?`).get(taskId);
     if (!task) throw new Error(`assignTask: no such task ${taskId}`);
@@ -2690,6 +2785,11 @@ export function createSupervisor({
             prompt: instructionForRole(slot.role, task) ?? `Task ${taskId} (${task.type ?? "task"}), role ${slot.role}.`,
             ...(slot.model ? { model: slot.model } : {}),
             ...(slot.effort ? { effort: slot.effort } : {}),
+            // review-consolidated-2026-09-14.md finding 4: passed through from assignTask's own caller
+            // so a real operator/CTO can explicitly accept a degraded (tool-less) utility run rather than
+            // assignTask's per-slot compensation silently swallowing the refusal as an ordinary
+            // "start-failed" — the SAME opt-in `start()` itself requires, not a second mechanism.
+            allowDegradedMcp,
           },
         });
         started.push({ ...slot, runId });
@@ -2755,7 +2855,7 @@ export function createSupervisor({
    * in front of `assignTask` — the same idempotency, partial-start compensation and terminal-task guard
    * apply, because this calls it rather than reimplementing any part of it.
    */
-  async function createUtilityTask({ type, title, teamId = null, actor = "operator", overrides = {}, cwd = null } = {}) {
+  async function createUtilityTask({ type, title, teamId = null, actor = "operator", overrides = {}, cwd = null, allowDegradedMcp = false } = {}) {
     if (!type) throw new Error("createUtilityTask: type is required");
     if (!title) throw new Error("createUtilityTask: title is required");
     const roles = rolesFor(type);
@@ -2770,7 +2870,7 @@ export function createSupervisor({
     const workerId = `w-${type}-${randomUUID().slice(0, 6)}`;
     createTask(database, { id: taskId, title, type, teamId });
     createWorker(database, { workerId, nickname: role, role, teamId, taskId });
-    const assigned = await assignTask(taskId, { actor, overrides, ...(cwd ? { cwd } : {}) });
+    const assigned = await assignTask(taskId, { actor, overrides, ...(cwd ? { cwd } : {}), allowDegradedMcp });
     return { taskId, workerId, role, ...assigned };
   }
 
@@ -4054,7 +4154,15 @@ export function createSupervisor({
       interrupt: async (cmd) => ({ id: cmd.id, ok: true, ...(await interrupt(cmd.runId)) }),
       stop: async (cmd) => ({ id: cmd.id, ok: true, ...(await stop(cmd.runId)) }),
       clearContext: async (cmd) => ({ id: cmd.id, ok: true, ...(await clearContext(cmd.runId)) }),
-      resume: async (cmd) => ({ id: cmd.id, ok: true, ...(await resume(cmd.runId)) }),
+      resume: async (cmd) => ({ id: cmd.id, ok: true, ...(await resume(cmd.runId, { allowDegradedMcp: cmd.allowDegradedMcp === true })) }),
+      // PLAN.md §7's clean-vs-kill rule, enforced (Phase 8) — see `resetSession`'s own doc comment.
+      resetSession: async (cmd) => ({
+        id: cmd.id, ok: true,
+        ...(await resetSession(cmd.runId, {
+          requestedAction: cmd.requestedAction, explicitKillConfirmed: cmd.explicitKillConfirmed === true,
+          respawnSpec: cmd.respawnSpec ?? null,
+        })),
+      }),
       reap: async (cmd) => ({ id: cmd.id, ok: true, ...(await reap(cmd.runId)) }),
       list: async (cmd) => ({ id: cmd.id, ok: true, runs: list() }),
       orphans: async (cmd) => ({
@@ -4459,6 +4567,7 @@ export function createSupervisor({
           actor: cmd._principal?.id ?? cmd.actor ?? "operator",
           idempotencyKey: cmd.idempotencyKey ?? null,
           ...(cmd.cwd ? { cwd: cmd.cwd } : {}),
+          allowDegradedMcp: cmd.allowDegradedMcp === true,
         }),
       }),
       // The utility-task lane's dispatch convenience (§16.2, item 13's own "not built" note) — one call
@@ -4471,6 +4580,7 @@ export function createSupervisor({
             type: cmd.type, title: cmd.title, teamId: cmd.teamId ?? null,
             actor: cmd._principal?.id ?? cmd.actor ?? "operator",
             overrides: cmd.overrides ?? {}, cwd: cmd.cwd ?? null,
+            allowDegradedMcp: cmd.allowDegradedMcp === true,
           });
           return { id: cmd.id, ok: true, ...result };
         } catch (err) {
@@ -4574,6 +4684,7 @@ export function createSupervisor({
     sendInput,
     interrupt,
     clearContext,
+    resetSession,
     resume,
     reap,
     list,

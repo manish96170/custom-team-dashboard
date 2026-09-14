@@ -79,12 +79,17 @@
 > resurrect a deliberately deleted worktree, new migration `0017_worktree_claim_op_and_stamp.sql`; real
 > socket-readiness verification instead of `existsSync` alone; a concurrent-attach timing mismatch;
 > confirmed-kill-before-drop-ownership teardown everywhere; `chmod 0600` sockets; preflight no longer
-> attaches MCP pools at all). **2 deferred by explicit judgment call** (fail-open MCP delivery — the blast
-> radius shrank once the tool surface got bounded, so refusing outright is now a real product-scope
-> decision, not a clear bug; the sibling-repo-dependent test's silent skip — made loud, not fully closed).
-> **1 left alone** (a fail-open git-diff default the code already documents as deliberate). Full detail,
-> per finding, in HANDOFF.md's top header. `npm test`: exit 0, twice in a row, no flake. This batch was
-> committed and pushed as `0ae6cf2`.
+> attaches MCP pools at all). **2 deferred at the time by explicit judgment call, both RESOLVED later the
+> same day** (2026-09-14): owner decision on fail-open MCP delivery — fail closed by default, an
+> `allowDegradedMcp` opt-in for `start()`/`resume()`/`assignTask()`/`createUtilityTask()`, with every
+> existing test that relied on the old fail-open path updated to opt in explicitly; and the sibling-repo-
+> dependent test's silent skip closed for real with a genuine sibling-independent fixture
+> (`runtime/test/_fixture-mcp-socket-server.js` + `mcp-pool-wiring-fixture.test.js`) proving the exact
+> same end-to-end mechanism with no dependency on `../leo-mcp`. **1 left alone** (a fail-open git-diff
+> default the code already documents as deliberate). **All 14 findings from this review are now resolved
+> — 13 fixed, 1 correctly left alone.** Full detail, per finding, in HANDOFF.md's "Fiftieth pass" entry.
+> `npm test`: exit 0, twice in a row, no flake. This batch was committed and pushed as `0ae6cf2`; the
+> findings-4/9 fix is a later, separate batch — check `git status`/`git log` for current commit state.
 
 
 Order matters here — each phase either de-risks an unknown or is a hard dependency for
@@ -714,12 +719,39 @@ built correctly the first time, not a bug to patch in throwaway spike code.
       posting stays backlog until `callerIdentity` genuinely exists to gate it.
 
 ## Phase 8 — CTO
-- [ ] Typed commands first — every registry query/mutation expressible as a command
+- [x] Typed commands first — every registry query/mutation expressible as a command
       *is* one; the model is invoked for routing and advice only (PLAN.md section 8,
-      Rule 6).
-- [ ] Cheap resident model by default (`cto` role in `harness-defaults.json`), with
+      Rule 6). **INVESTIGATED 2026-09-14, found already true — no code needed.** This
+      already exists in full: `domain/capabilities.js`'s `COMMAND_CAPABILITIES` +
+      `runtime/supervisor.js`'s `authorizedCommandHandlers()` IS "every mutation
+      expressible as a typed command" — 47+ commands (`assignTask`/`approveTask`/
+      `mergeTask`/`clearContext`/`resetSession`/etc.), each capability-gated, coverage
+      enforced by `assertCoversCommands()` (`runtime/test/authorization.test.js` case
+      2). What does NOT exist, confirmed by reading the code rather than assumed: any
+      place a human/CTO instruction in natural language gets ROUTED to one of these —
+      `tuiChat`'s own handler refuses `cmd.target === "cto"` outright with "the CTO
+      agent does not exist yet (PLAN.md section 2, Phase 6) — this bar is wired, its
+      recipient is not." Building that routing layer needs a real LLM-call
+      integration point this codebase has never built — a much bigger, separate
+      feature than this checkbox implies, and not attempted here. This checkbox is
+      "typed commands first" (done); the model-routing half belongs to Phase 6 (the
+      CTO agent itself), not this one.
+- [~] Cheap resident model by default (`cto` role in `harness-defaults.json`), with
       single-decision escalation to a stronger model rather than running high-effort
-      resident all day.
+      resident all day. **PARTIAL, 2026-09-14 — the cheap-resident default already
+      existed; the escalation PRIMITIVE is now built, but has no real caller yet.**
+      Confirmed by grep: a `cto` role is never actually instantiated as a real
+      worker/run anywhere in this runtime (Phase 6 is unbuilt, same finding as the
+      item above) — so there is no real CTO run to escalate FROM today. Built the
+      pure decision half anyway, since it stands on its own: `domain/cto-model.js`'s
+      `resolveModelForDecision({baseModel, baseEffort, escalate, escalateModel,
+      escalateEffort})` — `escalate: false` returns the resident default unchanged
+      (Rule 6's "mostly deterministic" holds by construction); `escalate: true`
+      requires a named `escalateModel` (refuses to guess "a stronger model") and
+      returns it for exactly one call. Unit-tested (`domain/test/cto-model.test.js`,
+      4 cases), no `runtime/supervisor.js` wiring — wiring it to a CTO run that
+      doesn't exist would be building on nothing. The future CTO runtime (Phase 6)
+      calls this once it exists; that wiring is the honest remaining gap, not faked.
 - [x] Clear policies per role (PLAN.md section 8, Rule 5) — **SCHEMA done 2026-09-13 (item 39);
       DECISION LOGIC built 2026-09-14.** `domain/clear-policy.js` is the pure decision half (a
       `decideClear({clearPolicy, trigger, clearContextCapability})` function, unit-tested against all
@@ -745,8 +777,32 @@ built correctly the first time, not a bug to patch in throwaway spike code.
       utility run cleared on its own turn.end, a no-`clearContext`-capability harness never called at
       all); the wiring case was confirmed to fail (timeout) against the pre-wiring code before being
       restored. Full `npm test`: exit 0, twice in a row.
-- [ ] Wire the "clean vs. kill" distinction (PLAN.md section 7) as an explicit rule the
-      CTO follows, never inferred from a loose paraphrase.
+- [x] Wire the "clean vs. kill" distinction (PLAN.md section 7) as an explicit rule the
+      CTO follows, never inferred from a loose paraphrase. **BUILT 2026-09-14.**
+      Section 7's own prose ("kill + respawn... never inferred from a loose
+      paraphrase") maps to a STRUCTURED-signal decision, not a natural-language
+      classifier — confirmed no NL parser exists anywhere in this codebase (same
+      finding as the "typed commands" item above) before building this as
+      `domain/session-intent.js`'s `classifySessionAction({requestedAction,
+      explicitKillConfirmed})`: a `"kill-respawn"` request is refused down to `"clear"`
+      unless `explicitKillConfirmed` is the literal boolean `true` (a truthy-but-not-
+      `true` value like the string `"true"` or `1` is treated as unconfirmed, never
+      coerced). ENFORCED, not just declared: `runtime/supervisor.js`'s new
+      `resetSession(runId, {requestedAction, explicitKillConfirmed, respawnSpec})` is
+      the one real call site — an unconfirmed kill calls `clearContext`, never
+      `stop`+`start`; a confirmed one requires the caller to supply `respawnSpec`
+      (this function does not reconstruct a spec from the ended run's own history —
+      `runs` never persisted the full original spec, a separate problem left open).
+      Wired as a real, capability-gated wire command (`resetSession` ->
+      `"run:clear"` in `domain/capabilities.js`, coverage-checked). Verified:
+      `domain/test/session-intent.test.js` (5 pure cases) plus
+      `runtime/test/session-intent.test.js` (4 real-process wiring cases — an
+      unconfirmed kill-respawn leaves the original process alive; a confirmed one
+      genuinely stops the original and spawns a NEW process; an authorized kill with
+      no `respawnSpec` is refused and the original is left untouched, not stopped
+      with nothing to replace it; a plain reset behaves exactly like `clearContext`),
+      the wiring case verified to fail against the pre-fix code first (a bypassed
+      decision let an unconfirmed kill-respawn actually kill) before being restored.
 
 ## Phase 9 — Slack outbound
 *(**The bridge now has its own build plan**: `../team-slack-bridge/PLAN.md`, written 2026-09-09, 682 lines. It

@@ -135,7 +135,9 @@ await runTest("clear-policy wiring", async () => {
       createTask(db, { id: utilityTaskId, title: "push it", type: "git-push-task" });
       createWorker(db, { workerId: "w-util", nickname: "git-push-runner", role: "git-push-runner", taskId: utilityTaskId });
 
-      const started = await supervisor.start({ harnessId: "fake", workerId: "w-util", spec: { cwd: stateDir, prompt: "push" } });
+      // review-consolidated-2026-09-14.md finding 4: this fake harness can't deliver an mcpConfig; this
+      // case is about the "always" clear trigger, not MCP delivery, so it opts into the degraded run.
+      const started = await supervisor.start({ harnessId: "fake", workerId: "w-util", spec: { cwd: stateDir, prompt: "push", allowDegradedMcp: true } });
       // The fake child runs its first turn immediately on spawn — this IS the "always" trigger, not a
       // second, manufactured one.
       await waitFor(() => clearCalls.includes(started.runId), { what: "the utility run to be cleared on its own turn.end (always)" });
@@ -156,7 +158,8 @@ await runTest("clear-policy wiring", async () => {
       await s2.boot();
       createTask(db, { id: "t-noclear", title: "no clear support", type: "git-push-task" });
       createWorker(db, { workerId: "w-noclear", nickname: "git-push-runner", role: "git-push-runner", taskId: "t-noclear" });
-      const started = await s2.start({ harnessId: "fake", workerId: "w-noclear", spec: { cwd: stateDir, prompt: "push" } });
+      // review-consolidated-2026-09-14.md finding 4: same reason as case 2 above.
+      const started = await s2.start({ harnessId: "fake", workerId: "w-noclear", spec: { cwd: stateDir, prompt: "push", allowDegradedMcp: true } });
       await waitFor(() => db.prepare(`SELECT 1 FROM event_log WHERE run_id = ? AND type = 'turn.end'`).get(started.runId), { what: "no-clear run's turn.end" });
       // A settling window, not a wait-for-truth: this asserts an ABSENCE, so there is no positive event
       // to wait for — give the fire-and-forget hook time to have run (and refused) before checking.

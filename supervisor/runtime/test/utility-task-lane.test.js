@@ -119,8 +119,11 @@ await runTest("utility-task lane", async () => {
     // + assignTask, in the right order, with the right role — and the started run's prompt is REAL
     // instruction text (finding 16.2's other gap), not the generic "Task t1 (type), role x." sentence.
     {
+      // review-consolidated-2026-09-14.md finding 4: the fake harness can't deliver an mcpConfig, so
+      // this case (about dispatch + real prompt text, not MCP delivery) opts into the degraded run.
       const dispatched = await supervisor.createUtilityTask({
         type: "git-push-task", title: "push the hotfix", overrides: { "git-push-runner": { harnessId: "fake" } }, cwd: stateDir,
+        allowDegradedMcp: true,
       });
       assert.equal(dispatched.role, "git-push-runner");
       assert.equal(dispatched.assigned, true, JSON.stringify(dispatched));

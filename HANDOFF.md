@@ -518,28 +518,26 @@ new findings sol did not report.** Every finding was independently verified with
   header all corrected in place with dated SUPERSEDED notes, and this file's own stale "Not yet actioned"
   heading (above) fixed too.
 
-**Deferred, by explicit judgment call, not fixed unilaterally:**
+**Deferred at the time, by explicit judgment call — both later resolved by owner decision, see the
+"Fiftieth pass" entry below:**
 - **Finding 4 (medium) — required MCP delivery still fails open** (a role with a declared need but no
-  deliverable pool still gets an ordinary successful start, just with no tool). After finding 1's fix,
-  the blast radius of failing open is far smaller (no tool vs. no bounded tool, not the full 27-tool
-  surface) — refusing the start outright is a real product-scope decision (would need an explicit
-  `allowDegradedMcp` opt-in and touches existing tests that assume a normal successful start for a
-  utility role), not a clear bug fix. Flagged for a real decision, same posture as findings 12/13 from
-  the earlier review.
+  deliverable pool still gets an ordinary successful start, just with no tool). Flagged as needing a real
+  product decision rather than a unilateral fix. **RESOLVED 2026-09-14, later the same day: fail closed
+  by default, `allowDegradedMcp` opt-in — see "Fiftieth pass" below.**
 - **Finding 9 (medium) — the only end-to-end proof that MCP delivery works (`mcp-pool-wiring.test.js`
   case 7) silently disappears when the private `../leo-mcp` sibling repo is absent**, with `npm test`
-  still reporting green. A full sibling-independent fixture reproducing leo-mcp's own tool surface was
-  judged out of scope for this pass; the skip message was made loud (a hard-to-miss stderr banner) as the
-  minimum honest fix, but the underlying coverage gap (this suite's cases are conditional on one
-  developer's directory layout) is not closed.
+  still reporting green. The skip message was made loud as an interim fix; the full sibling-independent
+  fixture was judged out of scope for THIS pass. **CLOSED 2026-09-14, later the same day: a real
+  sibling-independent fixture now proves the same mechanism unconditionally — see "Fiftieth pass" below.**
 - **Finding 13 (low) — `changedPathsFor`/`currentHeadFor` fail open on a `git diff` error**, which the
   code's own comments already document as deliberate. Not touched — the review's own report treats this
   as a narrow objection about not DISTINGUISHING "nothing changed" from "git could not answer," not a
-  claim that the fail-open default itself was an oversight.
+  claim that the fail-open default itself was an oversight. Still not touched; still not a defect.
 
-**Every one of THIS review's 14 findings is now resolved** — 11 fixed, 2 deferred by explicit judgment
-call (findings 4, 9), 1 left alone as already-deliberate (finding 13). New migration this pass:
-`0017_worktree_claim_op_and_stamp.sql` (additive, no backfill needed). Committed and pushed as `0ae6cf2`.
+**Every one of THIS review's 14 findings is now resolved** — 13 fixed (11 in this pass, 2 more — findings
+4 and 9 — in the "Fiftieth pass" below), 1 left alone as already-deliberate (finding 13). New migration
+this pass: `0017_worktree_claim_op_and_stamp.sql` (additive, no backfill needed). Committed and pushed as
+`0ae6cf2`.
 
 **IMPORTANT META-NOTE for whoever reads this next**: this pass's own conversation context was
 compacted/rewound partway through — items 27-38 below were done and documented BEFORE the rewind
@@ -926,6 +924,64 @@ flake in that suite's `turn.end status: completed` case — confirmed clean, unr
 
 Committed and pushed as `a307ae6`.
 
+## Forty-ninth pass, 2026-09-14 — Phase 8's three remaining checkboxes: typed commands, model escalation, clean-vs-kill
+
+Investigated all three before writing any code (same discipline as the clear-policy pass above):
+
+- **Typed commands first.** Checked whether this already exists before assuming it needed building —
+  it does: `domain/capabilities.js`'s `COMMAND_CAPABILITIES` + `runtime/supervisor.js`'s
+  `authorizedCommandHandlers()` already make every mutation a capability-gated typed command
+  (coverage-enforced, `runtime/test/authorization.test.js` case 2). The real gap is a natural-language
+  ROUTING layer to these commands — confirmed absent: `tuiChat`'s own handler refuses
+  `cmd.target === "cto"` with "the CTO agent does not exist yet." Not built — that needs a real LLM-call
+  integration point this codebase has never had, a separate feature from this checkbox, not a patch.
+  No code change; `ROADMAP.md`'s checkbox flipped `[ ]` -> `[x]` with this finding recorded in place.
+- **Cheap resident model + single-decision escalation.** Confirmed by grep (`role: 'cto'`/`role === 'cto'`
+  across `runtime/`, `domain/`, `config/`) that a `cto` role is never actually instantiated as a real
+  worker/run anywhere — Phase 6 (the CTO agent) is unbuilt, same root cause as the item above. Built the
+  pure decision half that stands on its own regardless: `domain/cto-model.js`'s
+  `resolveModelForDecision({baseModel, baseEffort, escalate, escalateModel, escalateEffort})` —
+  `escalate: false` returns the resident default unchanged; `escalate: true` requires a named
+  `escalateModel` (throws rather than guessing "a stronger model") and returns it for one call only.
+  4 unit cases (`domain/test/cto-model.test.js`). No `runtime/supervisor.js` wiring — there is no real
+  CTO run yet to escalate from; wiring it once Phase 6 exists is the honest remaining gap.
+- **Clean-vs-kill, PLAN.md §7.** "Kill + respawn... never inferred from a loose paraphrase" maps to a
+  STRUCTURED decision, not an NL classifier (no parser exists anywhere in this codebase, confirmed by the
+  same grep as the item above). Built `domain/session-intent.js`'s `classifySessionAction({requestedAction,
+  explicitKillConfirmed})`: refuses `"kill-respawn"` down to `"clear"` unless `explicitKillConfirmed` is
+  the literal boolean `true` — a truthy-but-not-`true` value (`"true"` the string, `1`) is treated as
+  unconfirmed, never coerced. ENFORCED, not just declared: new `runtime/supervisor.js` function
+  `resetSession(runId, {requestedAction, explicitKillConfirmed, respawnSpec})` is the one real call site
+  — an unconfirmed/ambiguous kill calls `clearContext`, never `stop`+`start`; a confirmed one requires the
+  caller to supply `respawnSpec` (this function does not reconstruct a spawn spec from the ended run's
+  own history — `runs` never persisted the full original `spec`, only `prompt` — a separate, harder
+  problem left open, not silently worked around). Wired as a real, capability-gated wire command
+  (`resetSession` -> `"run:clear"`, `domain/capabilities.js`, coverage-checked by the same test as
+  above — 47 commands now, was 46). Verified: `domain/test/session-intent.test.js` (5 pure cases) plus
+  `runtime/test/session-intent.test.js` (4 real-process wiring cases: an unconfirmed kill-respawn leaves
+  generation 1's real process alive; a confirmed one genuinely stops generation 1 and spawns a
+  genuinely NEW process for generation 2; an authorized kill with no `respawnSpec` is refused and
+  generation 1 is left untouched, not stopped with nothing to replace it; a plain reset behaves exactly
+  like `clearContext`). The wiring case was verified to fail (a bypassed decision let an unconfirmed
+  kill-respawn actually happen) against the pre-fix code before being restored.
+
+`ROADMAP.md`'s three Phase 8 checkboxes updated to match exactly (`[x]`, `[~]`, `[x]`); `PLAN.md`'s
+relevant sections annotated "built 2026-09-14" where a real mechanism now exists.
+
+This pass ran CONCURRENTLY with a separate pass fixing `codexdoc/review-consolidated-2026-09-14.md`
+findings 4 and 9 (MCP-delivery fail-open + the sibling-repo test-skip) — deliberately touched a disjoint
+region of `runtime/supervisor.js` (everything after `clearContext`, before the pre-existing `resume`) to
+avoid a merge conflict with that pass's own edits to the `attachMcpPoolsForRole`/`start()`/`resume()`
+region. `npm test` showed one failure in `mcp-pool-wiring.test.js` at the time of this pass's own
+verification — traced to that CONCURRENT pass's own in-progress test case (its own code comment cites
+"review-consolidated-2026-09-14.md finding 2"), not to anything in this pass; not this pass's to fix.
+Every test file this pass owns (`domain/test/session-intent.test.js`, `domain/test/cto-model.test.js`,
+`runtime/test/session-intent.test.js`, plus the untouched `runtime/test/clear-policy.test.js` and
+`runtime/test/authorization.test.js` as regression checks) passes standalone.
+
+Not committed — leaving that to whoever is coordinating both concurrent passes, once the other one lands
+and the shared `npm test` run is clean end to end.
+
 Read this first in a new session. It tells you what's real, what's fixed, what's
 still broken, and exactly what to do next, without re-reading the whole prior
 conversation.
@@ -1073,6 +1129,55 @@ is a thing a reasonable person would simplify away:
   explicitly. Do not let a future note claim otherwise.
 - **Every idempotency key is claimed before the side effect**, not after. And test it concurrently: a
   sequential pair of calls passes even when the claim is in the wrong place.
+
+## Fiftieth pass, 2026-09-14 — the forty-seventh pass's two deferred findings, now fixed by explicit decision
+
+Findings 4 and 9 from `codexdoc/review-consolidated-2026-09-14.md` (the forty-seventh pass, above) were
+deferred there as needing a real product decision. The owner made that decision: **fail closed by
+default, allow an explicit opt-in.**
+
+- **Finding 4 — required MCP delivery still failed open** (a role with a declared MCP need but no
+  deliverable pool still got an ordinary successful start, silently, with no tool). Fixed: `start()` now
+  checks a new `undeliveredNeeds` field `attachMcpPoolsForRole` reports (any declared need with no
+  registered config, a failed attach, or a harness that can't deliver `mcpConfigDelivery`) and REFUSES
+  before ever calling `adapter.start()` — detaching whatever did attach first — unless the caller passes
+  `spec.allowDegradedMcp: true`. `resume()` gets the identical check via a new `{ allowDegradedMcp }`
+  option, closing the same gap finding 2 (the forty-seventh pass) fixed for stale sockets but not for
+  outright non-delivery. The refusal is a thrown `Error` from `start()` (matching every existing caller's
+  own try/catch contract — `assignTask`'s per-slot compensation loop, the wire `start:` handler — checked
+  before writing it, not assumed) and an `{ ok: false, refused: "mcp-required-unavailable" }` return from
+  `resume()` (matching its own existing `task-terminal` refusal shape). `assignTask`/`createUtilityTask`
+  and their wire handlers thread `allowDegradedMcp` through from the real caller, so a real operator/CTO
+  has the same opt-in a test does. Every existing test that exercised the OLD fail-open bookkeeping-only
+  path on a harness that can't deliver (`runtime/test/assignment.test.js` case 11,
+  `runtime/test/utility-task-lane.test.js` case 5, `runtime/test/clear-policy.test.js` cases 2 and 3,
+  `runtime/test/mcp-pool-wiring.test.js` cases 1, 4, and 6) now passes `allowDegradedMcp: true` explicitly,
+  each with a comment naming why. New cases 9-10 in `mcp-pool-wiring.test.js` prove the refusal itself for
+  both `start()` and `resume()`, and that the opt-in restores the exact old degraded behavior — reverting
+  the refusal (temporarily, verified) makes both fail for the right reason before being restored.
+- **Finding 9 — the only end-to-end proof that MCP delivery works silently disappeared without the
+  private `../leo-mcp` sibling repo**, with `npm test` still reporting green. Fixed with a genuinely
+  sibling-independent proof, not just a louder skip: new `runtime/test/_fixture-mcp-socket-server.js` is a
+  small repo-local server speaking the exact same wire protocol (newline-delimited JSON-RPC over a Unix
+  socket, `LEO_MCP_SOCKET_PATH`) leo-mcp's real `server-socket.js` does, advertising 3 fake tools
+  (including `git_push`, so `ROLE_MCP_TOOL_ALLOWLIST`'s existing `git-push-runner` entry filters it for
+  real). New `runtime/test/mcp-pool-wiring-fixture.test.js` registers this fixture as the `leo-mcp` pool
+  config through the REAL resolution path (`config/mcp-pools.js`'s `poolConfigFor` reading a real
+  `<stateDir>/mcp-pools.json` this test writes itself — no test-only branch added to any real code) and
+  proves the full mechanism end to end against it: `mcp-pool.js` spawning it, `attach()` returning a real
+  live `socketPath`, `start()` building the exact `mcp-stdio-proxy.js` argv, and that proxy round-tripping
+  a real `tools/list` AND correctly refusing a disallowed `tools/call` — all without `../leo-mcp` existing.
+  Verified directly: temporarily hid the real sibling repo on disk and re-ran both the new fixture test
+  (still PASSED, 3/3 cases) and the existing sibling-dependent test (still SKIPPED loudly, as designed) —
+  restored the sibling afterward. The existing `leo-mcp`-dependent cases in `mcp-pool-wiring.test.js` are
+  untouched; this is added coverage, not a replacement.
+
+Full `npm test` (from `supervisor/`): exit 0, twice in a row, no flake (one full-suite run mid-pass caught
+a genuinely unrelated failure from concurrent work-in-progress elsewhere in the tree on a separate Phase 8
+item — confirmed unrelated by re-running once that work had landed, and by running every file this pass
+actually touched standalone). **Findings 4 and 9 are now FIXED, not deferred** — of the forty-seventh
+pass's 14 findings, only finding 13 remains intentionally untouched (the code's own comments already
+document that fail-open as deliberate, and the review itself calls it a narrow objection, not a defect).
 
 ## Group 1's two blocking migration bugs are now FIXED (2026-09-05, third pass)
 

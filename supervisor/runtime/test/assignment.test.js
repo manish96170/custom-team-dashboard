@@ -370,8 +370,13 @@ await runTest("harness/model assignment", async () => {
       const preview = supervisor.assignmentPreview("t-util");
       assert.deepEqual(preview.slots.map((s) => s.role), ["git-push-runner"]);
 
+      // review-consolidated-2026-09-14.md finding 4: the fake harness declares no `mcpConfigDelivery`,
+      // so a git-push-runner's declared `leo-mcp` need can never be delivered here — `assignTask` now
+      // fails closed on that by default. This case is about the utility-task lane reaching `assignTask`
+      // at all, not about MCP delivery, so it opts into the degraded run explicitly.
       const res = await supervisor.assignTask("t-util", {
         overrides: { "git-push-runner": { harnessId: "fake" } }, actor: "tester", cwd: stateDir,
+        allowDegradedMcp: true,
       });
       assert.equal(res.assigned, true, `a real run must actually start for a utility task; got ${JSON.stringify(res)}`);
       assert.equal(res.started.length, 1);

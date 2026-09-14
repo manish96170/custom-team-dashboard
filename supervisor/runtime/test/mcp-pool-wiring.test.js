@@ -83,7 +83,10 @@ await runTest("mcp-pool wiring", async () => {
       supervisor = createSupervisor({ db, adapters: { fake: harness }, logger: quiet, askSweepIntervalMs: 0 });
       await supervisor.boot();
 
-      const started = await supervisor.start({ harnessId: "fake", workerId: "w-git", spec: { cwd: stateDir, prompt: "push" } });
+      // review-consolidated-2026-09-14.md finding 4: this fake harness declares no `mcpConfigDelivery`,
+      // so `leo-mcp` can never be delivered here — this case is specifically ABOUT that bookkeeping-only
+      // degraded path (see its own assertion below), so it opts in explicitly rather than being refused.
+      const started = await supervisor.start({ harnessId: "fake", workerId: "w-git", spec: { cwd: stateDir, prompt: "push", allowDegradedMcp: true } });
       const runId1 = started.runId;
       const child = harness._runs.get(runId1);
       // Corrected 2026-09-11 (`codexdoc/review-luna-2026-09-11.md` finding 2): `spec.mcpConfig` is a
@@ -136,9 +139,11 @@ await runTest("mcp-pool wiring", async () => {
       supervisor = createSupervisor({ db, adapters: { fake: harness }, logger: quiet, askSweepIntervalMs: 0 });
       await supervisor.boot();
 
+      // review-consolidated-2026-09-14.md finding 4: same reason as case 1 — this fake harness cannot
+      // deliver an mcpConfig, and this case is about the ATTACH concurrency, not delivery.
       const [a, b] = await Promise.all([
-        supervisor.start({ harnessId: "fake", workerId: "w-a", spec: { cwd: stateDir, prompt: "push a" } }),
-        supervisor.start({ harnessId: "fake", workerId: "w-b", spec: { cwd: stateDir, prompt: "push b" } }),
+        supervisor.start({ harnessId: "fake", workerId: "w-a", spec: { cwd: stateDir, prompt: "push a", allowDegradedMcp: true } }),
+        supervisor.start({ harnessId: "fake", workerId: "w-b", spec: { cwd: stateDir, prompt: "push b", allowDegradedMcp: true } }),
       ]);
       const pools = db.prepare(`SELECT * FROM mcp_pool WHERE name = 'leo-mcp'`).all();
       assert.equal(pools.length, 1, "two concurrent attachers of the SAME config must share one pool row");
@@ -219,8 +224,12 @@ await runTest("mcp-pool wiring", async () => {
       supervisor = createSupervisor({ db, adapters: { fake: harness }, logger: quiet, askSweepIntervalMs: 0 });
       await supervisor.boot();
 
+      // review-consolidated-2026-09-14.md finding 4: without this opt-in, `start()` would refuse BEFORE
+      // ever reaching `adapter.start()` (this fake harness can't deliver an mcpConfig either) — that
+      // would still throw, but for the WRONG reason, never exercising the throw-cleanup path this case
+      // actually tests.
       await assert.rejects(
-        supervisor.start({ harnessId: "fake", workerId: "w-git", spec: { cwd: stateDir, prompt: "push" } }),
+        supervisor.start({ harnessId: "fake", workerId: "w-git", spec: { cwd: stateDir, prompt: "push", allowDegradedMcp: true } }),
         /adapter.start\(\) deliberately fails/,
       );
 
@@ -374,6 +383,85 @@ await runTest("mcp-pool wiring", async () => {
       await supervisor.stop(started.runId);
     } finally {
       try { proxy?.stdin?.end(); } catch { /* best effort */ }
+      try { await supervisor?.shutdown?.({ timeoutMs: 3000 }); } catch { /* best-effort */ }
+      try { closeDb(db); } catch { /* already closed */ }
+      rmScratchDir(stateDir);
+    }
+  }
+
+  // ── 9, 10 ────────────────────────────────────────────────────────────────────────
+  // review-consolidated-2026-09-14.md finding 4: the fail-closed default itself, for both start() and
+  // resume() — a declared-but-undeliverable MCP need must REFUSE rather than silently start/resume a
+  // tool-less run, unless the caller explicitly opts in with allowDegradedMcp.
+  {
+    const stateDir = makeScratchDir("supervisor-mcp-pool-fail-closed");
+    let db;
+    let supervisor;
+    try {
+      db = openDb({ stateDir });
+      upsertHarness(db, { id: "fake", displayName: "Fake Harness" });
+      createTask(db, { id: "t1", title: "fail-closed MCP delivery", type: "git-push-task" });
+      createWorker(db, { workerId: "w-git", nickname: "git-1", role: "git-push-runner", taskId: "t1" });
+
+      // This harness declares no mcpConfigDelivery, so git-push-runner's declared leo-mcp need can never
+      // be delivered — every case below exercises that exact undeliverable condition.
+      const harness = createFakeHarness({ label: "mcp-pool-fail-closed" });
+      supervisor = createSupervisor({ db, adapters: { fake: harness }, logger: quiet, askSweepIntervalMs: 0 });
+      await supervisor.boot();
+
+      // ── 9 ──────────────────────────────────────────────────────────────────────────
+      await assert.rejects(
+        supervisor.start({ harnessId: "fake", workerId: "w-git", spec: { cwd: stateDir, prompt: "push" } }),
+        /declares MCP need\(s\) \[leo-mcp\].*could not be delivered.*allowDegradedMcp/s,
+        "start() without allowDegradedMcp must refuse a role with an undeliverable declared MCP need",
+      );
+      assert.equal(harness._runs.size, 0, "the refusal must happen BEFORE adapter.start() ever spawns a process");
+      const poolAfterRefusal = db.prepare(`SELECT * FROM mcp_pool WHERE name = 'leo-mcp'`).get();
+      const attachmentAfterRefusal = poolAfterRefusal
+        ? db.prepare(`SELECT * FROM mcp_pool_attachments WHERE pool_id = ?`).get(poolAfterRefusal.id)
+        : null;
+      if (attachmentAfterRefusal) {
+        assert.ok(attachmentAfterRefusal.detached_at, "any attachment made before the refusal must be detached, not leaked");
+      }
+      console.log("  9. start() refuses a role with an undeliverable declared MCP need, detaches whatever attached, and spawns nothing — unless allowDegradedMcp: true opts in");
+
+      // Same setup, WITH the opt-in: succeeds, degraded (no mcpConfig), matching the existing case 1
+      // bookkeeping-only shape — proves the opt-in actually restores the old behavior, not just that the
+      // refusal exists.
+      const degraded = await supervisor.start({ harnessId: "fake", workerId: "w-git", spec: { cwd: stateDir, prompt: "push", allowDegradedMcp: true } });
+      assert.ok(degraded.runId, "allowDegradedMcp: true must let the same undeliverable-MCP role start anyway");
+      const degradedChild = harness._runs.get(degraded.runId);
+      assert.equal(degradedChild.spec?.mcpConfig, undefined, "the degraded run must still get no mcpConfig — allowDegradedMcp changes the REFUSAL, not the delivery");
+
+      // ── 10 ─────────────────────────────────────────────────────────────────────────
+      // A NATURAL end, not `supervisor.stop()` — this fake harness's `stop()` deletes the run entirely
+      // (matching a real "torn down for good" stop), which would make `resume()` legitimately unable to
+      // find it regardless of this fix; ending naturally is what leaves a run resumable at all (see
+      // case 8's own comment above, same technique).
+      const degradedEnded = new Promise((resolve, reject) => {
+        const deadline = Date.now() + 5000;
+        const check = setInterval(() => {
+          if (harness._runs.get(degraded.runId)?.ended) { clearInterval(check); resolve(); return; }
+          if (Date.now() > deadline) { clearInterval(check); reject(new Error("degraded run never naturally ended within 5s")); }
+        }, 20);
+      });
+      harness._runs.get(degraded.runId).child.stdin.write(`${JSON.stringify({ type: "exit" })}\n`);
+      await degradedEnded;
+      await assert.rejects(
+        (async () => {
+          const refusal = await supervisor.resume(degraded.runId);
+          if (refusal.ok === false) throw new Error(refusal.error);
+          throw new Error(`expected a refusal, got ${JSON.stringify(refusal)}`);
+        })(),
+        /declares MCP need\(s\) \[leo-mcp\].*could not be delivered.*allowDegradedMcp/s,
+        "resume() without allowDegradedMcp must refuse the exact same way start() does",
+      );
+      const resumedDegraded = await supervisor.resume(degraded.runId, { allowDegradedMcp: true });
+      assert.equal(resumedDegraded.resumed, true, `resume() with allowDegradedMcp: true must succeed anyway, got ${JSON.stringify(resumedDegraded)}`);
+      console.log("  10. resume() refuses the same undeliverable-MCP condition by default, and the same allowDegradedMcp opt-in restores the old degraded behavior");
+
+      await supervisor.stop(degraded.runId);
+    } finally {
       try { await supervisor?.shutdown?.({ timeoutMs: 3000 }); } catch { /* best-effort */ }
       try { closeDb(db); } catch { /* already closed */ }
       rmScratchDir(stateDir);

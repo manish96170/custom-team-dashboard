@@ -154,6 +154,11 @@ export const COMMAND_CAPABILITIES = Object.freeze({
   stop: "run:stop",
   clearContext: "run:clear",
   resume: "run:resume",
+  // PLAN.md §7's clean-vs-kill rule enforced (Phase 8, added 2026-09-14) — a "kill-respawn" request
+  // needs the SAME capability as a plain clear; `domain/session-intent.js`'s own refusal (unconfirmed
+  // kill -> forced soft clear) is what stands between this capability and the destructive path, not a
+  // second, more privileged capability. Revisit if a future pass wants kill-respawn gated more tightly.
+  resetSession: "run:clear",
   reap: "run:reap",
   answerAsk: "ask:answer",
   tuiChat: "run:input",

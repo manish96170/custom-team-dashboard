@@ -522,7 +522,14 @@ not after.
   should not imply otherwise.
 - **Kill + respawn** (destructive — loses anything not yet persisted) only happens on
   an explicit, unambiguous instruction (e.g. "kill and restart Purus"), never inferred
-  from a loose paraphrase.
+  from a loose paraphrase. **BUILT 2026-09-14** (Phase 8): `domain/session-intent.js`'s
+  `classifySessionAction` is the structured-signal decision (a caller must pass the
+  literal boolean `explicitKillConfirmed: true`, never a coerced truthy value, to
+  authorize the destructive path — anything else resolves to a soft clear), enforced
+  by `runtime/supervisor.js`'s `resetSession(runId, {...})`, a real, capability-gated
+  wire command. The NATURAL-LANGUAGE half of this rule ("kill and restart Purus"
+  parsed as an instruction) is NOT built — no NL routing exists in this codebase yet
+  (Phase 6, the CTO agent, is unbuilt); this closes the structural half only.
 - **Hiding a team/session** from the top bar (via chat, e.g. "hide Vite Migration") is a
   view filter only — `hiddenFromTopBar: true` — never a delete.
 - **Escalation ("ask") is the approval control plane, not a notification nicety — this
@@ -699,6 +706,15 @@ model is a standing cost. Every registry query/mutation expressible as a typed c
 not bookkeeping. `cto: { harnessId, model, effort }` in `harness-defaults.json` defaults
 to a cheap model, with the ability to escalate a single decision to a stronger one
 rather than running a high-effort model resident all day.
+
+**INVESTIGATED 2026-09-14 (Phase 8).** "Every mutation is a typed command" — CONFIRMED already true:
+`domain/capabilities.js`'s `COMMAND_CAPABILITIES` + `runtime/supervisor.js`'s `authorizedCommandHandlers()`
+already make every mutation a capability-gated typed command. What is genuinely missing is the
+model-routing half ("the model is invoked for routing and advice") — no natural-language entrypoint
+exists anywhere (`tuiChat` refuses `cmd.target === "cto"` outright, "the CTO agent does not exist yet") —
+that is Phase 6 (the CTO agent), not built here. The escalation PRIMITIVE is built: `domain/cto-model.js`'s
+`resolveModelForDecision`, pure, tested — but with no real CTO run yet to call it, since Phase 6 doesn't
+exist. Both gaps trace to the same root cause: the CTO role has no runtime presence yet.
 
 **Rule 7 — admission control.** `maxConcurrentSessions`, a launch throttle, and
 per-role defaults biased toward cheaper models with explicit opt-in required for
