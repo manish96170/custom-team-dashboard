@@ -83,8 +83,8 @@
 > radius shrank once the tool surface got bounded, so refusing outright is now a real product-scope
 > decision, not a clear bug; the sibling-repo-dependent test's silent skip — made loud, not fully closed).
 > **1 left alone** (a fail-open git-diff default the code already documents as deliberate). Full detail,
-> per finding, in HANDOFF.md's top header. `npm test`: exit 0, twice in a row, no flake. This batch is not
-> yet committed — check `git status` for current state.
+> per finding, in HANDOFF.md's top header. `npm test`: exit 0, twice in a row, no flake. This batch was
+> committed and pushed as `0ae6cf2`.
 
 
 Order matters here — each phase either de-risks an unknown or is a hard dependency for

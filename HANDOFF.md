@@ -539,7 +539,7 @@ new findings sol did not report.** Every finding was independently verified with
 
 **Every one of THIS review's 14 findings is now resolved** — 11 fixed, 2 deferred by explicit judgment
 call (findings 4, 9), 1 left alone as already-deliberate (finding 13). New migration this pass:
-`0017_worktree_claim_op_and_stamp.sql` (additive, no backfill needed).
+`0017_worktree_claim_op_and_stamp.sql` (additive, no backfill needed). Committed and pushed as `0ae6cf2`.
 
 **IMPORTANT META-NOTE for whoever reads this next**: this pass's own conversation context was
 compacted/rewound partway through — items 27-38 below were done and documented BEFORE the rewind
