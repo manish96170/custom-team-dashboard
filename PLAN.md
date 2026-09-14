@@ -1562,6 +1562,11 @@ the supervisor, or any existing agent.
 
 ## 18. Obsidian vault projection (backlog, cheap once the supervisor exists)
 
+**BASIC TIER BUILT 2026-09-14** (`supervisor/runtime/vault-projector.js` + `supervisor/config/
+vault-projector.js`, ROADMAP.md's Phase 10) — every non-negotiable in this section's closing
+paragraph checked and verified directly, not just declared; see ROADMAP.md's Phase 10 entry for the
+full per-non-negotiable evidence. Mid/advanced tiers below remain backlog, unbuilt.
+
 Not a new subsystem — the natural consumer of a decision section 3 already forces: once
 SQLite is truth, JSON/markdown exports are *projections*, and a markdown projection with
 YAML frontmatter is an Obsidian vault.

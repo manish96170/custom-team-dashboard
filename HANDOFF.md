@@ -1237,6 +1237,63 @@ times out waiting for a row that nothing writes yet — restored). Full `npm tes
 classification, the self-DM gates — team-slack-bridge PLAN.md §4.2, this dashboard's PLAN.md §14.2-14.4).
 ROADMAP.md's Phase 9 checklist is otherwise closed; see it for the per-bullet detail.
 
+## Fifty-second pass, 2026-09-14 — Phase 10: Obsidian vault projection (basic tier)
+
+`db/migrations/0001_initial.sql`'s `teams`/`tasks`/`workers` tables have no credential-shaped column at
+all — checked directly before writing a single query, not assumed. Built the basic tier PLAN.md §18 and
+ROADMAP.md's Phase 10 describe: **strictly read-only, strictly derived**, one markdown file per team/
+task/worker plus `Dashboard.md`, off by default.
+
+- `config/vault-projector.js` — same shape as `config/slack-notifications.js`. Disabled by default; the
+  default `vaultPath` (`<state dir>/vault`) is never inside this repo's own working tree, by construction
+  — the "git-ignored" non-negotiable holds without relying on a `.gitignore` line an operator could
+  delete. `isInsideSyncedFolder()` refuses (throws, unless `allowSyncedFolder: true`) an enabled config
+  whose vault path resolves under a real default sync root (`~/Dropbox`, `~/Google Drive`, `~/My Drive`,
+  `~/OneDrive`, `~/Library/Mobile Documents` for iCloud) — a real prefix match against `os.homedir()`,
+  verified NOT to false-positive on a mere substring (`~/NotDropboxAtAll` is not `~/Dropbox`).
+- `runtime/vault-projector.js` — `createVaultProjector().project()`: queries `teams`/`tasks`/`workers`
+  with EVERY column named explicitly (never `SELECT *`, the same discipline `domain/mcp-manifest.js`'s
+  `ROLE_MCP_TOOL_ALLOWLIST` already established this session), never touches `principals` (where token
+  hashes actually live) at all, and projects only a COUNT of open asks per task — never `asks.question`'s
+  own free text, and never `runs.prompt_preview` for a live orphan's listing either. PLAN.md §18's own
+  "keep tier-1 transcripts out of the vault" warning applied at its strictest for this tier: no prompt/
+  transcript content of any kind is projected. Regenerates FULLY on every debounced trigger rather than
+  incrementally — a deleted task's note is actually removed (`pruneStale`), not left stale, which is what
+  makes "strictly derived" true rather than aspirational.
+- Wired into `runtime/supervisor.js` at ONE point: `authorizedCommandHandlers()`'s success path (the
+  single choke point every wire command already passes through), calling a debounced `scheduleProject()`
+  — not at each individual mutation call site (`createTask`/`recordTransition`/etc.), which would need a
+  reminder added every time a new one is built. Deliberately unconditional on which command ran: the
+  projector's own render is a full, idempotent regeneration, so scheduling one extra debounce for a
+  read-only command costs nothing and is simpler than maintaining a "which commands actually mutate" list
+  that could drift. **Documented limit, not silently accepted**: a caller holding the supervisor object
+  directly (most existing tests, any future in-process caller) bypasses this hook entirely — the vault
+  only reflects real WIRE commands automatically. `boot()` also projects once immediately when enabled
+  (an operator restarting the daemon should see current state without waiting for the first command), and
+  `shutdown()` cancels any pending scheduled projection before the database closes underneath it.
+
+**Every non-negotiable verified directly, not just declared** (ROADMAP.md's Phase 10 entry has the full
+per-item detail): a real principal token hash and a real ask question containing an obvious secret-shaped
+string were inserted into the DB, the vault regenerated, and every written file grepped for both — neither
+appeared (`runtime/test/vault-projector.test.js` cases 4-5). A disabled projector never creates the vault
+directory at all, even after a real wire command and a real wait past the debounce window
+(`vault-projector-wiring.test.js` case 1). `shutdown()` cancelling a pending projection was verified with a
+5-second debounce and a 5.5-second wait past it — confirmed nothing fired against the closed database
+(case 4).
+
+Every new behavior verified to fail against the pre-fix code first (the wiring test's case 2, reverted:
+times out waiting for a projection nothing schedules yet — restored; the pure module's disabled-guard
+case, same revert-and-restore cycle). Full `npm test`: exit 0. Ran concurrently with the forty-ninth pass
+(Phase 8's CTO rules) and the fiftieth/fifty-first passes (findings 4/9, Phase 9) in separate forks against
+the same working tree — stayed entirely inside `config/vault-projector.js`, `runtime/vault-projector.js`,
+and new test files, touching `runtime/supervisor.js` only at the single hook point described above, to
+avoid collision with the other concurrent passes' own edits to that file.
+
+**Not built, explicitly out of scope for this pass, per PLAN.md §18's own tiering**: mid tier (tier-3
+handoffs/tier-2 digests as notes, auto-generated daily timelines) and advanced tier (read-only Kanban,
+per-team Dataview views, narrow presentation-field write-back). ROADMAP.md's Phase 10 checklist is now
+fully closed for the basic tier it actually asked for.
+
 ## Group 1's two blocking migration bugs are now FIXED (2026-09-05, third pass)
 
 The previous handoff opened with "fix these before Group 5." Done. Group 5 is now

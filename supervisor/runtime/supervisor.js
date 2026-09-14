@@ -103,6 +103,8 @@ import { loadResources } from "../config/resources.js";
 import { loadProtectedBranches } from "../config/protected-branches.js";
 import { loadSlackNotifications } from "../config/slack-notifications.js";
 import { createSlackOutboxDrain } from "./slack-outbox.js";
+import { loadVaultProjectorConfig } from "../config/vault-projector.js";
+import { createVaultProjector } from "./vault-projector.js";
 import { runFightLoop, resolvePushDestination } from "../agents/git-create-push.js";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
@@ -191,6 +193,9 @@ export function createSupervisor({
   // real minutes, and so the sweep can be driven deterministically instead of by a timer.
   askGraceMs = ASK_AUTO_CLOSE_GRACE_MS,
   askSweepIntervalMs = 30_000,
+  // Phase 10: injectable for the same reason — a test should not have to wait a real second to see a
+  // debounced projection land.
+  vaultProjectorDebounceMs = 1000,
   /**
    * How a tier-2 turn digest is produced (PLAN.md section 8, Rule 4).
    *
@@ -242,6 +247,14 @@ export function createSupervisor({
   const slackOutbox = createSlackOutboxDrain({
     db: database, logger,
     loadConfig: (opts) => loadSlackNotifications({ ...opts, stateDir: stateDirOf() }),
+  });
+
+  // ROADMAP.md Phase 10 (Obsidian vault projection, basic tier). Same "declare, don't cache" closure
+  // reasoning as `slackOutbox` just above.
+  const vaultProjector = createVaultProjector({
+    db: database, logger,
+    loadConfig: (opts) => loadVaultProjectorConfig({ ...opts, stateDir: stateDirOf() }),
+    debounceMs: vaultProjectorDebounceMs,
   });
 
   /**
@@ -347,6 +360,12 @@ export function createSupervisor({
     // this process to happen to still be alive later — boot is one of the places that has to drain it,
     // same as the ask/lease sweeps just above.
     if (sweepAsksOnBoot) slackOutbox.drain().catch((err) => logger.warn?.(`[supervisor] boot slack-outbox drain failed (non-fatal): ${err.message}`));
+    // Phase 10: project once at boot too (not just on the next command) — an operator who enables the
+    // vault and restarts the daemon should see current state immediately, not only after the first
+    // mutating command lands. Best-effort, same posture as every other boot-time side effect here.
+    if (sweepAsksOnBoot) {
+      try { vaultProjector.project(); } catch (err) { logger.warn?.(`[supervisor] boot vault projection failed (non-fatal): ${err.message}`); }
+    }
     if (askSweepIntervalMs > 0 && !askSweepTimer) {
       askSweepTimer = setInterval(() => {
         sweepAsks(); sweepLeases();
@@ -2227,6 +2246,20 @@ export function createSupervisor({
             outcome: result?.ok === false ? "failed" : "done",
             detail: result?.ok === false ? String(result.error).slice(0, 500) : null,
           });
+          // ROADMAP.md Phase 10 (Obsidian vault projection): every authorized, successful mutating
+          // command passes through exactly this one point — the single choke point every command
+          // handler already goes through, so hooking the debounced "something may have changed, project
+          // again soon" signal HERE (rather than at each individual mutation site, e.g. `createTask`/
+          // `recordTransition`) means a future command never needs its own reminder to keep the vault
+          // current. Deliberately unconditional on which command it was — the projector's own render is
+          // a full, idempotent regeneration from current DB state, so scheduling one extra debounce for
+          // a read-only command (e.g. `list`) costs nothing and is simpler than maintaining a "which
+          // commands actually mutate" list here that could silently drift out of date. Known limit,
+          // documented rather than silently accepted: a caller holding the supervisor object directly
+          // (most tests, in-process callers) can mutate WITHOUT going through this wrapper at all — the
+          // vault will not reflect that until the next command that DOES pass through here, or the next
+          // explicit `vaultProjector.scheduleProject()` call.
+          if (result?.ok !== false) vaultProjector.scheduleProject();
           return result;
         } catch (err) {
           journalAppend(database, {
@@ -3127,6 +3160,9 @@ export function createSupervisor({
       clearInterval(askSweepTimer);
       askSweepTimer = null;
     }
+    // Same reasoning for the vault projector's own debounce timer — a pending scheduled projection must
+    // not fire against a database this function is about to close underneath it.
+    vaultProjector.dispose();
 
     // Two budgets, not one shared clock. Previously the pump wait and the whole shutdown
     // raced independent timers of comparable length, so a genuinely stuck consumer could

@@ -863,10 +863,43 @@ Socket Mode listener, mention classification, the self-DM gates) — this phase'
 outside the terminal — graph view as team topology, a `Dashboard.md` status file, live orphans
 listed beside it, off by default — but sequenced after the slice so the projector is not
 rewritten while the workflow is still changing shape. See PLAN.md section 18.)*
-- [ ] Read-only, strictly derived `vault-projector` (PLAN.md section 18) — basic tier:
-      one file per team/task/worker with frontmatter + wikilinks.
-- [ ] Confirm the non-negotiables: git-ignored, redacted before write, never inside a
-      synced folder without explicit opt-in, fully disable-able.
+- [x] Read-only, strictly derived `vault-projector` (PLAN.md section 18) — basic tier:
+      one file per team/task/worker with frontmatter + wikilinks. **BUILT 2026-09-14**:
+      `runtime/vault-projector.js` (a real DB-to-markdown projector, full regeneration on every
+      debounced trigger — stale entity files ARE removed, not just added-to, so the vault stays
+      strictly derived rather than accumulating dead notes) + `config/vault-projector.js`. Wired
+      into the ONE choke point every wire command already passes through
+      (`authorizedCommandHandlers()`'s success path, `runtime/supervisor.js`) rather than each
+      individual mutation site — a debounced `scheduleProject()` there, plus one immediate
+      `project()` at boot. Known, documented limit: an in-process caller holding the supervisor
+      object directly (most existing tests) bypasses this hook entirely; the vault only reflects
+      real WIRE commands automatically.
+- [x] Confirm the non-negotiables: git-ignored, redacted before write, never inside a
+      synced folder without explicit opt-in, fully disable-able. **CONFIRMED 2026-09-14, each one
+      checked, not asserted:**
+      - *Git-ignored*: the default `vaultPath` (`<state dir>/vault`, i.e. `~/.custom-team-dashboard/
+        supervisor/vault`) is never inside this repo's working tree at all, by construction — moot
+        rather than relying on a `.gitignore` rule an operator could delete.
+      - *Redacted before write*: checked the real schema first (`db/migrations/0001_initial.sql`)
+        — `teams`/`tasks`/`workers` have NO credential-shaped column at all. The projector's own
+        queries name every column explicitly (never `SELECT *`) and never touch `principals` (where
+        token hashes actually live) or `asks.question`/`runs.prompt_preview` (the two genuinely
+        free-text fields this schema has) — only a COUNT of open asks is projected, never any ask's
+        text; a live orphan is shown by pid/pgid/cwd/timestamps, never by what it was asked to do.
+        Verified directly: a test inserts a real principal token hash and a real ask question
+        containing an obvious secret-shaped string, regenerates, and greps every written file for
+        both — neither appears (`runtime/test/vault-projector.test.js` cases 4-5).
+      - *Never inside a synced folder without explicit opt-in*: `config/vault-projector.js`'s loader
+        refuses (throws) an enabled config whose `vaultPath` resolves under a real, well-known
+        default sync root (`~/Dropbox`, `~/Google Drive`, `~/My Drive`, `~/OneDrive`, `~/Library/
+        Mobile Documents` for iCloud) unless `allowSyncedFolder: true` is set — a real prefix match
+        against `os.homedir()`, not an unfalsifiable "we detect sync folders" claim.
+      - *Fully disable-able, off by default*: the built-in default is `enabled: false`; while
+        disabled, `project()` returns immediately and touches the filesystem not at all — verified
+        directly: the vault directory never even gets created (case 1), and a real wire command
+        through the real supervisor changes nothing observable either (wiring case 1).
+      Mid/advanced tiers (tier-3 handoffs as notes, Kanban view, presentation-field write-back) are
+      explicitly NOT built — out of scope for this pass, per PLAN.md §18's own tiering.
 
 ## Phase 11 — Conservative harness onboarding
 - [ ] Register pre-installed, versioned adapters that declare a capability matrix and
