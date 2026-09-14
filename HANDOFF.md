@@ -924,8 +924,7 @@ Full `npm test`: exit 0, twice in a row (one standalone re-run of
 `adapters/claude-code/test/test-claude-code-adapter.mjs` needed once, due to a pre-existing intermittent
 flake in that suite's `turn.end status: completed` case — confirmed clean, unrelated to this pass).
 
-**Not committed yet** — check `git status`/`git log` for the current state before trusting this note to
-stay in sync with a later session.
+Committed and pushed as `a307ae6`.
 
 Read this first in a new session. It tells you what's real, what's fixed, what's
 still broken, and exactly what to do next, without re-reading the whole prior
