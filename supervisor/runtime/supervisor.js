@@ -97,9 +97,12 @@ import {
   setAttachmentRunId,
   listOpenAttachmentsForRun,
   MAX_LEASE_TTL_MS,
+  writeOutboxEvent,
 } from "../db/index.js";
 import { loadResources } from "../config/resources.js";
 import { loadProtectedBranches } from "../config/protected-branches.js";
+import { loadSlackNotifications } from "../config/slack-notifications.js";
+import { createSlackOutboxDrain } from "./slack-outbox.js";
 import { runFightLoop, resolvePushDestination } from "../agents/git-create-push.js";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
@@ -232,6 +235,14 @@ export function createSupervisor({
   // PLAN.md §21.1, wired into a real start/end path 2026-09-11. One manager per supervisor process,
   // same lifetime as `pump` — its `_liveChildren` map is only meaningful for THIS process's own spawns.
   const mcpPool = createMcpPool({ db: database, logger });
+  // ROADMAP.md Phase 9 (Slack outbound), 2026-09-14. `loadConfig` re-reads `stateDirOf()` on every drain
+  // tick, same "declare, don't cache" contract `config/mcp-pools.js`'s own `poolConfigFor` already keeps
+  // — this is a closure over the function, not its return value, so it stays correct even though
+  // `stateDirOf` itself is defined further down this same constructor.
+  const slackOutbox = createSlackOutboxDrain({
+    db: database, logger,
+    loadConfig: (opts) => loadSlackNotifications({ ...opts, stateDir: stateDirOf() }),
+  });
 
   /**
    * Where this supervisor's state directory is.
@@ -332,8 +343,15 @@ export function createSupervisor({
     // waiter, and re-using `askSweepTimer`'s interval rather than starting a second one is deliberate —
     // this codebase's own review rule against building a mechanism that already exists a few lines away.
     const leasesSwept = sweepAsksOnBoot ? sweepLeases() : 0;
+    // Same reuse, same reasoning, Phase 9: an outbox row written right before a crash must not wait for
+    // this process to happen to still be alive later — boot is one of the places that has to drain it,
+    // same as the ask/lease sweeps just above.
+    if (sweepAsksOnBoot) slackOutbox.drain().catch((err) => logger.warn?.(`[supervisor] boot slack-outbox drain failed (non-fatal): ${err.message}`));
     if (askSweepIntervalMs > 0 && !askSweepTimer) {
-      askSweepTimer = setInterval(() => { sweepAsks(); sweepLeases(); }, askSweepIntervalMs);
+      askSweepTimer = setInterval(() => {
+        sweepAsks(); sweepLeases();
+        slackOutbox.drain().catch((err) => logger.warn?.(`[supervisor] slack-outbox drain failed (non-fatal): ${err.message}`));
+      }, askSweepIntervalMs);
       // Bookkeeping must not be the reason a process refuses to exit.
       askSweepTimer.unref?.();
     }
@@ -2615,6 +2633,20 @@ export function createSupervisor({
       .catch((err) => logger.warn?.(`[supervisor] approveTask ${taskId}: coder clear-policy failed (non-fatal): ${err.message}`));
     applyClearPolicy(taskId, { roles: ["reviewer", "parentReviewer"], trigger: "review-round-concluded" })
       .catch((err) => logger.warn?.(`[supervisor] approveTask ${taskId}: reviewer clear-policy failed (non-fatal): ${err.message}`));
+    // ROADMAP.md Phase 9 (Slack outbound): "task state transition to approved/merged posts a summary" —
+    // via the outbox, never a synchronous call (that's the whole point of the table). Best-effort, same
+    // convention as the handoff/clear-policy writes just above: a failure to WRITE the outbox row must
+    // never fail the approval itself, and delivery is a separate, later concern `slack-outbox.js` owns.
+    try {
+      const t = database.prepare(`SELECT title FROM tasks WHERE id = ?`).get(taskId);
+      writeOutboxEvent(database, {
+        id: `outbox-approve-${taskId}-${Date.now()}`,
+        eventType: "task-approved",
+        payload: { taskId, title: t?.title ?? null, actor },
+      });
+    } catch (err) {
+      logger.warn?.(`[supervisor] approveTask ${taskId}: outbox write failed (non-fatal): ${err.message}`);
+    }
     return { taskId, approved: true, status };
   }
 
@@ -3348,7 +3380,7 @@ export function createSupervisor({
    */
   function mergeTask(taskId, { actor = "owner", approvalId = null } = {}) {
     if (!taskId) throw new Error("mergeTask: taskId is required");
-    const task = database.prepare(`SELECT id, state FROM tasks WHERE id = ?`).get(taskId);
+    const task = database.prepare(`SELECT id, state, title FROM tasks WHERE id = ?`).get(taskId);
     if (!task) throw new Error(`mergeTask: no such task ${taskId}`);
     recordTransition(database, {
       id: `tr-merge-${taskId}-${Date.now()}`,
@@ -3367,6 +3399,16 @@ export function createSupervisor({
     // the coder's run already ended before the merge (the common case).
     applyClearPolicy(taskId, { roles: ["coder"], trigger: "state-transition" })
       .catch((err) => logger.warn?.(`[supervisor] mergeTask ${taskId}: coder clear-policy failed (non-fatal): ${err.message}`));
+    // ROADMAP.md Phase 9 — see `approveTaskLocked`'s identical outbox write for the full reasoning.
+    try {
+      writeOutboxEvent(database, {
+        id: `outbox-merge-${taskId}-${Date.now()}`,
+        eventType: "task-merged",
+        payload: { taskId, title: task.title ?? null, actor },
+      });
+    } catch (err) {
+      logger.warn?.(`[supervisor] mergeTask ${taskId}: outbox write failed (non-fatal): ${err.message}`);
+    }
     return { taskId, merged: true, approvalId, from: task.state };
   }
 

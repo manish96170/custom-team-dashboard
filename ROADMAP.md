@@ -804,25 +804,59 @@ built correctly the first time, not a bug to patch in throwaway spike code.
       the wiring case verified to fail against the pre-fix code first (a bypassed
       decision let an unconfirmed kill-respawn actually kill) before being restored.
 
-## Phase 9 — Slack outbound
+## Phase 9 — Slack outbound — **OUTBOUND HALF BUILT, 2026-09-14**
 *(**The bridge now has its own build plan**: `../team-slack-bridge/PLAN.md`, written 2026-09-09, 682 lines. It
 covers four surfaces over one core — direct CLI, MCP server, Claude Code skill, and this dashboard's
 `slack-message` agent — plus a **locked-down remote profile**. Read it before starting this phase; it is where
 the Slack-side decisions now live, and it was written against PLAN.md §14 so the two do not drift.)*
-- [ ] Bot-only posting (PLAN.md section 14.5).
-- [ ] `outbox` table consumer (PLAN.md section 3) with dedup + retry + failure
-      isolation — not a direct synchronous call from the state machine.
-- [ ] Task state transition to `approved`/`merged` posts a summary to a configured
-      channel via `team-slack-bridge`.
-- [ ] **The bridge must be idempotent, because this consumer retries.** Its plan §4.1 adds an
-      `idempotencyKey` + local ledger for exactly this reason: without it, our retry is a duplicate-message
-      generator. Same lesson as the assignment path — claim the key BEFORE the side effect.
-- [ ] **Two separately-callable posting paths, never one function with a boolean.** Our capability vocabulary
-      already has `slack:post-bot` and `slack:post-as-user`, and the second is in the SENSITIVE class needing a
-      second signature. A capability that cannot be granted separately cannot be gated separately.
-- [ ] **A `requests` row must carry `{channel, thread_ts}`** so an accepted review-request can be answered back
-      into its originating thread. Open question 5 in the bridge's plan; confirm our schema records it and add
-      it if not.
+- [x] Bot-only posting (PLAN.md section 14.5). `config/slack-notifications.js` has no `asUser` field at
+      all — not merely defaulted false, the option does not exist in this config's shape — and
+      `runtime/slack-outbox.js`'s drain never passes `--as-user` to the bridge CLI. This phase's posting
+      path (the daemon itself, no human/worker in the loop) is exactly the shape §14.5 says must stay bot-
+      only until a real `callerIdentity` mechanism exists.
+- [x] `outbox` table consumer with dedup + retry + failure isolation — not a direct synchronous call.
+      `runtime/slack-outbox.js`'s `drain()`, hooked into the SAME sweep timer `sweepAsks`/`sweepLeases`
+      already use (reused, not a second timer — this codebase's own review rule). Retry is safe because
+      the SAME `outbox.id` is passed as `team-slack-bridge`'s own `--idempotency-key` on every attempt —
+      measured, not assumed: read `../team-slack-bridge/core/post.js`/`core/ledger.js` directly before
+      relying on this; the bridge claims a key in its own `node:sqlite` ledger BEFORE calling Slack and
+      returns the previous result on a repeat, so this side never builds a second ledger.
+- [x] Task state transition to `approved`/`merged` posts a summary to a configured channel via
+      `team-slack-bridge`. `approveTaskLocked`/`mergeTask` each write a real `outbox` row on their
+      success path (`writeOutboxEvent`, best-effort/non-fatal, same convention as the adjacent
+      `taskHandoff`/`applyClearPolicy` calls) — delivery is a fully separate, later concern the drain owns.
+- [x] **The bridge must be idempotent, because this consumer retries.** Confirmed real and used, not
+      re-implemented — see the outbox-consumer bullet above.
+- [~] **Two separately-callable posting paths, never one function with a boolean.** Investigated: the
+      capability vocabulary (`slack:post-bot`/`slack:post-as-user`, the second SENSITIVE) already
+      satisfies this for the UTILITY-LANE path (a `slack-runner` role calling leo-mcp's `slack_post` tool
+      during a run) — that path was never a single function with a boolean to begin with. This phase's
+      OWN new path (the automatic outbox consumer) is bot-only only, with no as-user branch at all, so
+      the "two separately-gated paths" question doesn't arise there either. Left `[~]` rather than `[x]`
+      because the bridge's OWN `--as-user` flag and this dashboard's `callerIdentity` mechanism
+      (PLAN.md §14.5) are still backlog — this bullet is fully satisfied for what exists today, not for
+      the as-user path that doesn't exist yet.
+- [x] **A `requests` row must carry `{channel, thread_ts}`.** `channel` already existed (migration 0001);
+      new migration `0018_requests_thread_ts.sql` adds `thread_ts` (additive, no backfill — every
+      existing row predates Slack inbound entirely, so NULL is the honest value). Inbound answering
+      itself (actually USING this column) is unbuilt and explicitly backlog per that table's own header
+      comment ("Slack inbound only (backlog per PLAN.md section 13.2)") — this closes the schema gap
+      only, per this bullet's own wording ("confirm our schema records it and add it if not").
+
+Verified end to end, never touching the real Slack API from a test: `runtime/test/slack-outbox.test.js`
+(5 cases, a repo-local fixture CLI with zero network-capable imports — retry, dedup via the SAME
+idempotency key, an unrecognized event type left undelivered forever rather than silently dropped) and
+`runtime/test/slack-outbox-wiring.test.js` (3 cases, the real `approveTask`/`mergeTask` success paths
+through a real supervisor, delivered by the real sweep timer with no manual drain call, and a genuinely
+disabled-by-default install that writes but never delivers). One additional smoke test,
+`slack-outbox-real-cli-smoke.test.js`, invokes the REAL `team-slack-bridge` binary but only via its own
+`--dry-run` flag — read `core/post.js` directly: `dryRun` returns before the token check and before any
+network call, so this is provably incapable of reaching Slack regardless of what credentials happen to be
+configured on the machine running it. `npm test`: exit 0, twice in a row.
+
+**Not built this pass, explicitly backlog**: Slack INBOUND (PLAN.md §14/team-slack-bridge PLAN.md §4.2 —
+Socket Mode listener, mention classification, the self-DM gates) — this phase's own heading says
+"outbound"; inbound was never in scope here and remains its own, larger, separately-decided piece of work.
 
 ## Phase 10 — Obsidian vault projection
 *(timing confirmed 2026-09-06: after the Phase 2 vertical slice. Wanted early for a picture

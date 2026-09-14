@@ -2234,3 +2234,45 @@ export function setAttachmentRunId(db, attachmentId, runId) {
 export function listOpenAttachmentsForRun(db, runId) {
   return db.prepare(`SELECT id FROM mcp_pool_attachments WHERE run_id = ? AND detached_at IS NULL`).all(runId).map((r) => r.id);
 }
+
+// ── outbox (PLAN.md section 3, ROADMAP.md Phase 9 — Slack outbound, 2026-09-14) ─────────────────────
+//
+// Append-only producer/consumer split, same shape `agent_journal`/`event_log` already use elsewhere in
+// this schema: `runtime/supervisor.js` WRITES a row on a real transition (never posts synchronously —
+// ROADMAP.md's own words: "delivered through an outbox, not a synchronous call"); `runtime/
+// slack-outbox.js` DRAINS undelivered rows on its own schedule. A crash between the two leaves an
+// undelivered row for the next drain to pick up — `team-slack-bridge`'s own idempotency ledger (keyed by
+// this row's `id`, passed as `--idempotency-key`) is what makes that retry safe rather than a duplicate
+// post.
+
+/** Write one outbox event. `id` is the caller's — `runtime/supervisor.js` mints it so the SAME id can
+ *  double as the idempotency key handed to `team-slack-bridge`, one identity for both jobs rather than
+ *  a second key nothing else needs. */
+export function writeOutboxEvent(db, { id, eventType, payload, now } = {}) {
+  if (!id) throw new Error("writeOutboxEvent: id is required");
+  if (!eventType) throw new Error("writeOutboxEvent: eventType is required");
+  db.prepare(
+    `INSERT INTO outbox (id, event_type, payload_json, delivered, created_at) VALUES (?, ?, ?, 0, ?)`,
+  ).run(id, eventType, payload !== undefined ? JSON.stringify(payload) : null, now ?? nowIso());
+  return { id };
+}
+
+/** Every event still awaiting delivery, oldest first — a drain's own input set, same "read the real
+ *  undelivered set, don't trust an in-memory queue that doesn't survive a restart" reasoning `listOpenRuns`
+ *  already documents for reconciliation. */
+export function listUndeliveredOutboxEvents(db) {
+  return db.prepare(`SELECT * FROM outbox WHERE delivered = 0 ORDER BY created_at`).all().map((r) => ({
+    id: r.id,
+    eventType: r.event_type,
+    payload: r.payload_json ? JSON.parse(r.payload_json) : null,
+    createdAt: r.created_at,
+  }));
+}
+
+/** Mark one event delivered. Idempotent at the SQL level (an already-delivered row's second UPDATE is a
+ *  harmless no-op, `changes === 0`) — a drain that races itself (should not happen, single-writer daemon,
+ *  but cheap to make true regardless) never double-reports. */
+export function markOutboxDelivered(db, id) {
+  const info = db.prepare(`UPDATE outbox SET delivered = 1 WHERE id = ? AND delivered = 0`).run(id);
+  return { updated: info.changes === 1 };
+}

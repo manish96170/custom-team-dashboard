@@ -1179,6 +1179,64 @@ actually touched standalone). **Findings 4 and 9 are now FIXED, not deferred** �
 pass's 14 findings, only finding 13 remains intentionally untouched (the code's own comments already
 document that fail-open as deliberate, and the review itself calls it a narrow objection, not a defect).
 
+## Fifty-first pass, 2026-09-14 — Phase 9: Slack outbound (the OUTBOUND half only)
+
+Ran concurrently with the forty-ninth/fiftieth passes' own work (Phase 8's remaining checkboxes, and
+findings 4/9's fix), in files neither touched — no conflicts.
+
+**What was measured before anything was built**: `../team-slack-bridge` (the sibling repo) exists on
+disk. Its `post.js` CLI already accepts `--channel`/`--text`/`--thread-ts`/`--idempotency-key`/
+`--dry-run`/`--json`, and `core/post.js`/`core/ledger.js` already implement a real, `node:sqlite`-backed
+idempotency ledger: a key is claimed BEFORE Slack is ever called, and a repeat key returns the previous
+result rather than posting again. **This meant the dashboard side needed no ledger of its own** — passing
+the outbox row's own `id` as `--idempotency-key` on every retry is enough. Also measured: `--dry-run`
+returns before the token check and before any network call (read directly in `core/post.js`) — this is
+what makes one smoke test below provably incapable of reaching Slack, not merely likely to be.
+
+**Built:**
+- `db/migrations/0018_requests_thread_ts.sql` — `requests.thread_ts` (additive; `channel` already existed).
+- `db/index.js`: `writeOutboxEvent`/`listUndeliveredOutboxEvents`/`markOutboxDelivered` — the `outbox`
+  table has existed since migration 0001; nothing wrote to or read from it until now. (Caught by this
+  pass's own test, not shipped blind: `markOutboxDelivered`'s first draft used `UPDATE ... WHERE id = ?`
+  with no `AND delivered = 0` guard, so a second call on an already-delivered row reported `updated: true`
+  again — fixed before the test that exposed it was even finished being written.)
+- `config/slack-notifications.js` — same shape as `config/mcp-pools.js` (declare-don't-validate-path,
+  malformed throws). **Disabled by default** (`enabled: false`, no channel) — unlike `mcp-pools.js`'s real
+  `leo-mcp` built-in, there is no channel a fresh install could possibly know to post to, and "no
+  integration is ever a hard dependency" (PLAN.md §2.10) means the honest default is silence, not a guess.
+  Has no `asUser` field at all, on purpose (see PLAN.md §14.5 annotation below).
+- `runtime/slack-outbox.js` — `createSlackOutboxDrain`'s `drain()`: reads undelivered rows, spawns the
+  bridge CLI (`execFile`, not `spawnManaged` — a short-lived one-shot CLI, not a resident process),
+  bot-only, marks delivered on a real success, leaves undelivered (logged, non-fatal) on failure or an
+  unrecognized `event_type`.
+- `runtime/supervisor.js`: `approveTaskLocked`/`mergeTask` each write a real outbox row on their success
+  path (best-effort try/catch, same convention as the adjacent `taskHandoff`/`applyClearPolicy` calls
+  right next to them). The drain is hooked into the SAME sweep timer `sweepAsks`/`sweepLeases` already
+  use — reused, not a second timer, this codebase's own standing review rule — and also runs once at boot.
+
+**Slack-API safety, the hard requirement for this whole pass**: no test may ever reach the real Slack API.
+Two separate, independently-airtight mechanisms, not one relied on twice:
+1. `runtime/test/_fixture-slack-post-cli.js` — a repo-local stand-in for `post.js` with **zero
+   network-capable imports** (confirmed: its only import is `node:fs`), implementing its OWN tiny JSON-file
+   ledger so retry/dedup semantics are testable without the real bridge OR the real Slack API anywhere in
+   the path. `slack-outbox.test.js`'s 5 cases use only this fixture.
+2. `slack-outbox-real-cli-smoke.test.js` is the ONE test that invokes the REAL bridge binary — but only
+   via `--dry-run`, which (measured above) returns before the token check and before any network call.
+   Skips loudly (same stderr-banner convention finding 9's fix already established) if the sibling repo
+   isn't present.
+
+`runtime/test/slack-outbox-wiring.test.js` (3 cases) proves the end-to-end real path: `approveTask`/
+`mergeTask` writing real rows with the task's real title, delivered by the real sweep timer with no manual
+drain call, and — a separate state dir with no `slack-notifications.json` at all — the row still WRITTEN
+but never delivered across several real sweep ticks, proving producer and consumer are genuinely decoupled.
+
+Every new behavior verified to fail against the pre-fix code first (the wiring test's case 1, reverted:
+times out waiting for a row that nothing writes yet — restored). Full `npm test`: exit 0, twice in a row.
+
+**Not built, explicitly backlog, per this phase's own name**: Slack INBOUND (Socket Mode listener, mention
+classification, the self-DM gates — team-slack-bridge PLAN.md §4.2, this dashboard's PLAN.md §14.2-14.4).
+ROADMAP.md's Phase 9 checklist is otherwise closed; see it for the per-bullet detail.
+
 ## Group 1's two blocking migration bugs are now FIXED (2026-09-05, third pass)
 
 The previous handoff opened with "fix these before Group 5." Done. Group 5 is now

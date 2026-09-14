@@ -1255,6 +1255,13 @@ it's an argument, not a security control.
 check that's easy to describe correctly and easy to implement incorrectly. Refusals are
 logged, never silently dropped, to the agent's append-only task-history log (section 16).
 
+**BUILT 2026-09-14 (ROADMAP.md Phase 9, the outbound half): `config/slack-notifications.js`/
+`runtime/slack-outbox.js` hold this exactly — the module has no `asUser` field at all, not
+merely defaulted false. This is the automatic outbox-driven path (a task's approval/merge
+posting a summary), a different call path from the utility-lane `slack-runner` worker path
+(`domain/capabilities.js`'s `slack:post-bot`/`slack:post-as-user`), and both stay bot-only
+under this same rule.**
+
 ### 14.6 Local gate on DM-reading — the original mechanism doesn't work (backlog)
 
 **The password gate as originally specified is non-functional, not merely unbuilt.**
